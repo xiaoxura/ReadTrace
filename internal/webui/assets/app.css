@@ -902,6 +902,10 @@ h1, h2, h3, h4, p { margin: 0; }
 .qr-frame.expired .qr-overlay { display: flex; }
 .qr-status { font-size: 12.5px; color: var(--text-2); display: flex; align-items: center; gap: 7px; }
 .qr-status .pulse-dot { color: var(--accent); }
+.qr-countdown { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; min-height: 18px; }
+.qr-countdown.urgent { color: var(--amber); }
+.qr-countdown.dead { color: var(--red); }
+.otp-wrap { margin-top: 2px; }
 .qr-confirm-url { font-family: var(--mono); font-size: 10px; color: var(--muted); word-break: break-all; }
 .otp-input { letter-spacing: .5em; text-align: center; font-size: 20px; font-family: var(--mono); }
 

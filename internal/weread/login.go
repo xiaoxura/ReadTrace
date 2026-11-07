@@ -46,9 +46,7 @@ func (c *Client) LoginPoll(ctx context.Context, uid, otp string) (*LoginPoll, er
 
 	q := url.Values{}
 	q.Set("uid", uid)
-	if otp != "" {
-		q.Set("otp", otp)
-	}
+	q.Set("otp", otp)
 
 	var raw map[string]any
 	if _, err := c.doJSON(ctx, http.MethodGet, "/api/auth/getLoginInfo?"+q.Encode(), nil, nil, &raw); err != nil {

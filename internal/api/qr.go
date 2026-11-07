@@ -18,21 +18,23 @@ import (
 
 // qrFlow tracks one QR login attempt.
 type qrFlow struct {
-	UID       string
-	CreatedAt int64
-	ExpiresAt int64
-	Status    string // pending | need_otp | binding | confirmed | expired | failed
-	AccountID int64
-	Error     string
-	PNG       []byte
-	cancel    context.CancelFunc
-	mu        sync.Mutex
+	UID        string
+	CreatedAt  int64
+	ExpiresAt  int64
+	Status     string // pending | need_otp | binding | confirmed | expired | failed
+	AccountID  int64
+	Error      string
+	Logic      string
+	LastPollAt int64
+	PNG        []byte
+	cancel     context.CancelFunc
+	mu         sync.Mutex
 }
 
-func (f *qrFlow) snapshot() (status, errMsg string, accountID, expiresAt int64) {
+func (f *qrFlow) snapshot() (status, errMsg, logic string, accountID, expiresAt, lastPollAt int64) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.Status, f.Error, f.AccountID, f.ExpiresAt
+	return f.Status, f.Error, f.Logic, f.AccountID, f.ExpiresAt, f.LastPollAt
 }
 
 type qrManager struct {
@@ -58,9 +60,11 @@ func (m *qrManager) Start(ctx context.Context) (*qrFlow, error) {
 		return nil, err
 	}
 
-	pollCtx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
+	// WeRead's getLoginInfo long-poll ends after about 55 seconds with
+	// LOGIN_TIMEOUT; the QR itself is only usable for that first window.
+	pollCtx, cancel := context.WithTimeout(context.Background(), 75*time.Second)
 	flow := &qrFlow{
-		UID: uid, CreatedAt: time.Now().Unix(), ExpiresAt: time.Now().Add(6 * time.Minute).Unix(),
+		UID: uid, CreatedAt: time.Now().Unix(), ExpiresAt: time.Now().Add(55 * time.Second).Unix(),
 		Status: "pending", PNG: png, cancel: cancel,
 	}
 	m.mu.Lock()
@@ -118,15 +122,24 @@ func (m *qrManager) poll(ctx context.Context, f *qrFlow) {
 			}
 			continue
 		}
+		m.set(f.UID, func(fl *qrFlow) {
+			fl.Logic = res.LogicCode
+			fl.LastPollAt = time.Now().Unix()
+		})
+		m.log.Info("扫码轮询返回",
+			"succeed", res.Success, "logic", res.LogicCode,
+			"has_token", res.AccessToken != "", "has_vid", res.Vid != "")
 		if res.Success {
 			m.bind(f, res)
 			return
 		}
 		switch strings.ToUpper(res.LogicCode) {
 		case "NEED_OTP":
+			m.log.Info("扫码成功，等待输入双重验证码", "uid", f.UID)
 			m.set(f.UID, func(fl *qrFlow) { fl.Status = "need_otp" })
 			return
 		case "LOGIN_TIMEOUT":
+			m.log.Info("扫码轮询超时，二维码失效", "uid", f.UID)
 			m.set(f.UID, func(fl *qrFlow) { fl.Status = "expired" })
 			return
 		}
@@ -212,8 +225,12 @@ func (m *qrManager) SubmitOTP(uid, code string) error {
 	if f == nil {
 		return fmt.Errorf("二维码已失效，请刷新")
 	}
-	if f.Status != "need_otp" {
-		return fmt.Errorf("当前状态不需要验证码")
+	status, _, _, _, _, _ := f.snapshot()
+	switch status {
+	case "confirmed", "binding":
+		return fmt.Errorf("已经登录成功")
+	case "expired", "failed":
+		return fmt.Errorf("二维码已失效，请刷新后重新扫码")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 70*time.Second)
 	defer cancel()
@@ -221,6 +238,8 @@ func (m *qrManager) SubmitOTP(uid, code string) error {
 	if err != nil {
 		return err
 	}
+	m.log.Info("验证码校验返回", "succeed", res.Success, "logic", res.LogicCode,
+		"has_token", res.AccessToken != "", "has_vid", res.Vid != "")
 	if res.Success {
 		f.cancel()
 		m.bind(f, res)
@@ -260,12 +279,13 @@ func (s *Server) handleQRStart(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, http.StatusBadGateway, "获取二维码失败："+err.Error())
 		return
 	}
-	status0, _, _, expiresAt0 := f.snapshot()
+	status0, _, _, _, expiresAt0, _ := f.snapshot()
 	s.writeJSON(w, http.StatusOK, map[string]any{
-		"id":         f.UID,
-		"qr":         "data:image/png;base64," + base64.StdEncoding.EncodeToString(f.PNG),
-		"expires_at": expiresAt0,
-		"status":     status0,
+		"id":          f.UID,
+		"qr":          "data:image/png;base64," + base64.StdEncoding.EncodeToString(f.PNG),
+		"expires_at":  expiresAt0,
+		"status":      status0,
+		"ttl_seconds": 55,
 	})
 }
 
@@ -276,12 +296,14 @@ func (s *Server) handleQRPoll(w http.ResponseWriter, r *http.Request) {
 		s.writeJSON(w, http.StatusOK, map[string]any{"status": "expired"})
 		return
 	}
-	status, errMsg, accountID, expiresAt := f.snapshot()
+	status, errMsg, logic, accountID, expiresAt, lastPollAt := f.snapshot()
 	resp := map[string]any{
-		"status":     status,
-		"error":      errMsg,
-		"account_id": accountID,
-		"expires_at": expiresAt,
+		"status":       status,
+		"error":        errMsg,
+		"account_id":   accountID,
+		"expires_at":   expiresAt,
+		"logic":        logic,
+		"last_poll_at": lastPollAt,
 	}
 	if status == "confirmed" && accountID > 0 {
 		if acc, err := s.st.GetAccount(accountID); err == nil && acc != nil {

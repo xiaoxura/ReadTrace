@@ -86,11 +86,15 @@ export function startRunDialog({ accountId = 0, onDone } = {}) {
 export function qrLoginDialog({ onDone } = {}) {
   let flowId = null;
   let timer = null;
+  let ticker = null;
+  let expiresAt = 0;
+  let stage = 'pending';
+  let expired = false;
   let done = false;
 
   const { mask, close } = openModal({
     title: '扫码登录微信读书',
-    subtitle: '打开手机微信「扫一扫」，在微信读书中确认登录',
+    subtitle: '打开手机微信「扫一扫」；二维码 55 秒内有效，扫码后手机上会显示 4 位验证码',
     body: `
       <div class="qr-box">
         <div class="qr-frame" data-frame>
@@ -100,14 +104,14 @@ export function qrLoginDialog({ onDone } = {}) {
             <div data-overlay-text>二维码已失效</div>
           </div>
         </div>
+        <div class="qr-countdown" data-countdown>正在获取二维码…</div>
         <div class="qr-status" data-status><span class="pulse-dot"></span>正在获取二维码…</div>
-        <div class="otp-wrap" data-otp hidden style="width:100%;max-width:260px">
-          <div class="hint" style="margin-bottom:8px">手机提示输入验证码时，在此填写</div>
+        <div class="otp-wrap" data-otp style="width:100%;max-width:280px">
+          <div class="hint" style="margin-bottom:8px">扫码后，手机上会显示 4 位验证码，请在此输入</div>
           <input class="input otp-input" data-otp-input maxlength="4" inputmode="numeric" placeholder="0000">
           <button class="btn btn-primary" data-otp-submit style="width:100%;margin-top:8px">提交验证码</button>
         </div>
-        <div class="qr-confirm-url" data-url></div>
-        <div class="hint" style="text-align:center">扫码后请在手机上点击「确认登录」。<br>登录凭据会加密保存在本机。</div>
+        <div class="hint" style="text-align:center">登录凭据会使用本机密钥加密保存。</div>
       </div>`,
     footer: `<button class="btn btn-ghost" data-refresh>${icon('refresh')}刷新二维码</button>
       <button class="btn" data-close>关闭</button>`,
@@ -120,34 +124,70 @@ export function qrLoginDialog({ onDone } = {}) {
   const frame = $('[data-frame]', mask);
   const img = $('[data-qr]', mask);
   const statusEl = $('[data-status]', mask);
+  const countdownEl = $('[data-countdown]', mask);
   const overlayText = $('[data-overlay-text]', mask);
   const otpBox = $('[data-otp]', mask);
-  const urlEl = $('[data-url]', mask);
+  const otpInput = $('[data-otp-input]', mask);
 
   const setStatus = (html, error = false) => {
     statusEl.innerHTML = error ? `${icon('alert')}<span>${escapeHtml(html)}</span>` : `<span class="pulse-dot"></span><span>${escapeHtml(html)}</span>`;
     statusEl.style.color = error ? 'var(--red)' : '';
   };
 
-  const stop = () => clearInterval(timer);
+  const stop = () => {
+    clearInterval(timer);
+    clearInterval(ticker);
+    timer = null;
+    ticker = null;
+  };
+
+  function updateCountdown() {
+    if (done) return;
+    if (stage === 'need_otp') {
+      countdownEl.textContent = '已扫码，请输入手机上的验证码';
+      countdownEl.className = 'qr-countdown';
+      return;
+    }
+    const left = Math.max(0, Math.round(expiresAt - Date.now() / 1000));
+    if (left > 0) {
+      countdownEl.textContent = `二维码 ${left} 秒后失效`;
+      countdownEl.className = `qr-countdown${left <= 10 ? ' urgent' : ''}`;
+      return;
+    }
+    countdownEl.textContent = '二维码已失效';
+    countdownEl.className = 'qr-countdown dead';
+    if (!expired) {
+      expired = true;
+      frame.classList.add('expired');
+      overlayText.textContent = '二维码已失效';
+      setStatus('二维码已失效，请点击刷新', true);
+    }
+  }
 
   async function start() {
     stop();
     done = false;
-    otpBox.hidden = true;
+    expired = false;
+    stage = 'pending';
+    otpInput.value = '';
+    otpBox.style.opacity = '1';
     frame.classList.remove('expired');
     img.removeAttribute('src');
-    urlEl.textContent = '';
+    countdownEl.textContent = '正在获取二维码…';
+    countdownEl.className = 'qr-countdown';
     setStatus('正在获取二维码…');
     try {
       const res = await api.qrStart();
       flowId = res.id;
       img.src = res.qr;
-      urlEl.textContent = `二维码有效期 6 分钟 · ${res.id.slice(0, 18)}…`;
+      expiresAt = res.expires_at || (Date.now() / 1000 + 55);
+      updateCountdown();
       setStatus('等待微信扫码…');
-      timer = setInterval(check, 1300);
+      ticker = setInterval(updateCountdown, 1000);
+      timer = setInterval(check, 1200);
     } catch (e) {
       setStatus(e.message, true);
+      countdownEl.textContent = '';
     }
   }
 
@@ -157,11 +197,17 @@ export function qrLoginDialog({ onDone } = {}) {
       const res = await api.qrPoll(flowId);
       switch (res.status) {
         case 'pending':
-          setStatus('等待微信扫码…');
+          if (!expired) setStatus('等待微信扫码…');
           break;
         case 'need_otp':
-          otpBox.hidden = false;
-          setStatus('请输入手机上的验证码');
+          stage = 'need_otp';
+          expired = false;
+          frame.classList.remove('expired');
+          overlayText.textContent = '二维码已失效';
+          otpBox.style.opacity = '1';
+          updateCountdown();
+          setStatus('已扫码，请输入手机上的 4 位验证码');
+          otpInput.focus();
           break;
         case 'binding':
           setStatus('已扫码，正在绑定账号…');
@@ -171,6 +217,8 @@ export function qrLoginDialog({ onDone } = {}) {
           done = true;
           frame.classList.add('expired');
           overlayText.textContent = '登录成功';
+          countdownEl.textContent = '登录成功';
+          countdownEl.className = 'qr-countdown';
           const acc = res.account;
           setStatus('登录成功，正在刷新账号…');
           await refreshAccounts();
@@ -181,8 +229,12 @@ export function qrLoginDialog({ onDone } = {}) {
         }
         case 'expired':
           stop();
+          expired = true;
+          ticker = null;
           frame.classList.add('expired');
           overlayText.textContent = '二维码已失效';
+          countdownEl.textContent = '二维码已失效';
+          countdownEl.className = 'qr-countdown dead';
           setStatus('二维码已失效，请刷新重试', true);
           break;
         case 'failed':
@@ -209,8 +261,10 @@ export function qrLoginDialog({ onDone } = {}) {
     setLoading(btn, true);
     try {
       await api.qrOtp(flowId, code);
-      toast('验证成功', 'ok');
-      otpBox.hidden = true;
+      toast('验证成功，正在登录…', 'ok');
+      stage = 'binding';
+      otpInput.value = '';
+      setStatus('验证成功，正在绑定账号…');
       check();
     } catch (e) {
       toast(e.message, 'error');
