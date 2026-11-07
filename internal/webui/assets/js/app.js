@@ -196,53 +196,20 @@ function onGlobalEvent(ev) {
   }
 }
 
-function authHTML(mode, info) {
+function authHTML(mode) {
   const setup = mode === 'setup';
-  const site = escapeHtml(info.site_name || '读时');
-  return `<div class="auth">
-    <div class="auth-art">
-      <div class="auth-brand">
-        <div class="brand-mark">${icon('bookOpen')}</div>
-        <div class="brand-text">
-          <div class="brand-name">${site}</div>
-          <div class="brand-sub">ReadPilot</div>
-        </div>
-      </div>
-      <div class="auth-quote">
-        <h1>把阅读<br>变成每天<em>自动发生</em><br>的小事。</h1>
-        <p>扫码绑定微信读书，实时查看阅读进度、连续天数与历史趋势。所有数据留在你自己的设备上。</p>
-      </div>
-      <div class="auth-foot">
-        <span>单文件部署</span><span>SQLite 加密存储</span><span>实时面板</span>
-      </div>
-      <div class="rings"><span></span><span></span><span></span><span></span></div>
-    </div>
-    <div class="auth-panel">
-      <form class="auth-card" id="auth-form" autocomplete="off">
-        <h2>${setup ? '初始化面板' : '欢迎回来'}</h2>
-        <p class="sub">${setup ? '设置一个管理密码，用于保护本地面板。' : `登录「${site}」继续管理你的阅读。`}</p>
-        <div class="auth-error" id="auth-error">${icon('alert')}<span></span></div>
-        ${setup ? `<div class="field">
-          <label class="label">站点名称 <span class="opt">可选</span></label>
-          <input class="input" id="site-name" placeholder="读时" maxlength="40">
-        </div>` : ''}
-        <div class="field">
-          <label class="label">管理密码</label>
-          <input class="input" id="password" type="password" placeholder="${setup ? '至少 6 位' : '输入管理密码'}"
-            autocomplete="${setup ? 'new-password' : 'current-password'}" autofocus>
-        </div>
-        ${setup ? `<div class="field">
-          <label class="label">确认密码</label>
-          <input class="input" id="password2" type="password" placeholder="再次输入" autocomplete="new-password">
-        </div>` : ''}
-        <button class="btn btn-primary" id="auth-submit" type="submit" style="width:100%;margin-top:6px">
-          ${icon(setup ? 'shield' : 'key')}${setup ? '创建并进入' : '登录'}
-        </button>
-        <p class="auth-note">
-          ${setup ? '此密码仅用于保护本面板，不是微信读书密码。' : '忘记密码？删除数据目录中的 wxread.db 会重置面板（账号数据也会丢失）。'}
-        </p>
-      </form>
-    </div>
+  return `<div class="auth-minimal">
+    <form class="auth-minimal-form" id="auth-form" autocomplete="off">
+      <div class="auth-error" id="auth-error">${icon('alert')}<span></span></div>
+      ${setup ? `<input class="input auth-input" id="site-name" placeholder="站点名称（可选）" maxlength="40">` : ''}
+      <input class="input auth-input" id="password" type="password"
+        placeholder="${setup ? '设置管理密码（至少 6 位）' : '管理密码'}"
+        autocomplete="${setup ? 'new-password' : 'current-password'}" autofocus>
+      ${setup ? `<input class="input auth-input" id="password2" type="password" placeholder="确认密码" autocomplete="new-password">` : ''}
+      <button class="btn btn-primary auth-submit" id="auth-submit" type="submit">
+        ${setup ? '创建并进入' : '登录'}
+      </button>
+    </form>
   </div>`;
 }
 
@@ -250,7 +217,7 @@ function showAuth(mode, info = {}) {
   authActive = true;
   if (es) { es.close(); es = null; }
   document.title = `${info.site_name || '读时'} · ReadPilot`;
-  $('#app').innerHTML = authHTML(mode, info);
+  $('#app').innerHTML = authHTML(mode);
 
   const form = $('#auth-form');
   const errBox = $('#auth-error');
