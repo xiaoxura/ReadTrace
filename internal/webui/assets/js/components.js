@@ -87,14 +87,13 @@ export function qrLoginDialog({ onDone } = {}) {
   let flowId = null;
   let timer = null;
   let ticker = null;
-  let expiresAt = 0;
+  let startedAt = 0;
   let stage = 'pending';
-  let expired = false;
   let done = false;
 
   const { mask, close } = openModal({
     title: '扫码登录微信读书',
-    subtitle: '打开手机微信「扫一扫」；二维码 55 秒内有效，扫码后手机上会显示 4 位验证码',
+    subtitle: '打开手机微信「扫一扫」，建议在 1 分钟内扫码；若手机显示 4 位验证码，请在下方输入。',
     body: `
       <div class="qr-box">
         <div class="qr-frame" data-frame>
@@ -107,11 +106,11 @@ export function qrLoginDialog({ onDone } = {}) {
         <div class="qr-countdown" data-countdown>正在获取二维码…</div>
         <div class="qr-status" data-status><span class="pulse-dot"></span>正在获取二维码…</div>
         <div class="otp-wrap" data-otp style="width:100%;max-width:280px">
-          <div class="hint" style="margin-bottom:8px">扫码后，手机上会显示 4 位验证码，请在此输入</div>
+          <div class="hint" style="margin-bottom:8px">如果手机显示 4 位验证码，请在此输入；显示「登录成功」则无需填写。</div>
           <input class="input otp-input" data-otp-input maxlength="4" inputmode="numeric" placeholder="0000">
           <button class="btn btn-primary" data-otp-submit style="width:100%;margin-top:8px">提交验证码</button>
         </div>
-        <div class="hint" style="text-align:center">登录凭据会使用本机密钥加密保存。</div>
+        <div class="hint" style="text-align:center">如果手机显示「登录成功」，面板通常会在几秒内自动完成绑定；<br>超过 10 秒仍无反应，请刷新二维码重试。登录凭据会加密保存在本机。</div>
       </div>`,
     footer: `<button class="btn btn-ghost" data-refresh>${icon('refresh')}刷新二维码</button>
       <button class="btn" data-close>关闭</button>`,
@@ -144,30 +143,23 @@ export function qrLoginDialog({ onDone } = {}) {
   function updateCountdown() {
     if (done) return;
     if (stage === 'need_otp') {
-      countdownEl.textContent = '已扫码，请输入手机上的验证码';
+      countdownEl.textContent = '已扫码，请按手机提示操作';
       countdownEl.className = 'qr-countdown';
       return;
     }
-    const left = Math.max(0, Math.round(expiresAt - Date.now() / 1000));
-    if (left > 0) {
-      countdownEl.textContent = `二维码 ${left} 秒后失效`;
-      countdownEl.className = `qr-countdown${left <= 10 ? ' urgent' : ''}`;
+    const elapsed = Math.max(0, Math.floor(Date.now() / 1000 - startedAt));
+    if (elapsed < 5) {
+      countdownEl.textContent = '二维码已生成，等待扫码…';
+      countdownEl.className = 'qr-countdown';
       return;
     }
-    countdownEl.textContent = '二维码已失效';
-    countdownEl.className = 'qr-countdown dead';
-    if (!expired) {
-      expired = true;
-      frame.classList.add('expired');
-      overlayText.textContent = '二维码已失效';
-      setStatus('二维码已失效，请点击刷新', true);
-    }
+    countdownEl.textContent = `已等待 ${elapsed} 秒`;
+    countdownEl.className = elapsed >= 120 ? 'qr-countdown urgent' : 'qr-countdown';
   }
 
   async function start() {
     stop();
     done = false;
-    expired = false;
     stage = 'pending';
     otpInput.value = '';
     otpBox.style.opacity = '1';
@@ -180,7 +172,7 @@ export function qrLoginDialog({ onDone } = {}) {
       const res = await api.qrStart();
       flowId = res.id;
       img.src = res.qr;
-      expiresAt = res.expires_at || (Date.now() / 1000 + 55);
+      startedAt = Date.now() / 1000;
       updateCountdown();
       setStatus('等待微信扫码…');
       ticker = setInterval(updateCountdown, 1000);
@@ -197,13 +189,10 @@ export function qrLoginDialog({ onDone } = {}) {
       const res = await api.qrPoll(flowId);
       switch (res.status) {
         case 'pending':
-          if (!expired) setStatus('等待微信扫码…');
+          setStatus('等待微信扫码…');
           break;
         case 'need_otp':
           stage = 'need_otp';
-          expired = false;
-          frame.classList.remove('expired');
-          overlayText.textContent = '二维码已失效';
           otpBox.style.opacity = '1';
           updateCountdown();
           setStatus('已扫码，请输入手机上的 4 位验证码');
@@ -229,8 +218,6 @@ export function qrLoginDialog({ onDone } = {}) {
         }
         case 'expired':
           stop();
-          expired = true;
-          ticker = null;
           frame.classList.add('expired');
           overlayText.textContent = '二维码已失效';
           countdownEl.textContent = '二维码已失效';

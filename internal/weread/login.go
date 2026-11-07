@@ -75,10 +75,10 @@ func (c *Client) LoginPoll(ctx context.Context, uid, otp string) (*LoginPoll, er
 		}
 	}
 	if out.Vid == "" {
-		out.Vid = pickString(raw, "webLoginVid", "vid", "web_login_vid")
+		out.Vid = findString(raw, "webLoginVid", "vid", "web_login_vid")
 	}
 	if out.AccessToken == "" {
-		out.AccessToken = pickString(raw, "accessToken", "access_token", "skey")
+		out.AccessToken = findString(raw, "accessToken", "access_token", "skey")
 	}
 	if out.ErrMsg == "" {
 		out.ErrMsg = pickString(raw, "errMsg", "msg")

@@ -60,11 +60,12 @@ func (m *qrManager) Start(ctx context.Context) (*qrFlow, error) {
 		return nil, err
 	}
 
-	// WeRead's getLoginInfo long-poll ends after about 55 seconds with
-	// LOGIN_TIMEOUT; the QR itself is only usable for that first window.
-	pollCtx, cancel := context.WithTimeout(context.Background(), 75*time.Second)
+	// getLoginInfo long-polls for ~55s and then returns LOGIN_TIMEOUT. That is
+	// only one poll window, not a dead QR: keep an active poll going so a scan
+	// at any time is picked up immediately.
+	pollCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	flow := &qrFlow{
-		UID: uid, CreatedAt: time.Now().Unix(), ExpiresAt: time.Now().Add(55 * time.Second).Unix(),
+		UID: uid, CreatedAt: time.Now().Unix(), ExpiresAt: time.Now().Add(10 * time.Minute).Unix(),
 		Status: "pending", PNG: png, cancel: cancel,
 	}
 	m.mu.Lock()
@@ -139,9 +140,10 @@ func (m *qrManager) poll(ctx context.Context, f *qrFlow) {
 			m.set(f.UID, func(fl *qrFlow) { fl.Status = "need_otp" })
 			return
 		case "LOGIN_TIMEOUT":
-			m.log.Info("扫码轮询超时，二维码失效", "uid", f.UID)
-			m.set(f.UID, func(fl *qrFlow) { fl.Status = "expired" })
-			return
+			// Not an expired QR — just the end of this long-poll window.
+			// Immediately start the next poll so a scan is never missed.
+			m.log.Info("扫码轮询窗口结束，继续等待扫码", "uid", f.UID)
+			continue
 		}
 		if !sleep(ctx, 900*time.Millisecond) {
 			return
@@ -213,7 +215,7 @@ func (m *qrManager) fail(f *qrFlow, msg string) {
 }
 
 func (m *qrManager) expire(uid string) {
-	time.Sleep(10 * time.Minute)
+	time.Sleep(15 * time.Minute)
 	m.mu.Lock()
 	delete(m.flows, uid)
 	m.mu.Unlock()
@@ -285,7 +287,7 @@ func (s *Server) handleQRStart(w http.ResponseWriter, r *http.Request) {
 		"qr":          "data:image/png;base64," + base64.StdEncoding.EncodeToString(f.PNG),
 		"expires_at":  expiresAt0,
 		"status":      status0,
-		"ttl_seconds": 55,
+		"ttl_seconds": 600,
 	})
 }
 
