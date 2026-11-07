@@ -1,0 +1,201 @@
+package store
+
+import (
+	"database/sql"
+	"encoding/json"
+	"fmt"
+)
+
+const accountCols = `id, name, vid, nickname, avatar, status, last_error, last_check_at,
+	default_minutes, tick_seconds, book_id, book_title, chapter_id, chapter_title,
+	mode, push_channel_id, created_at, updated_at,
+	CASE WHEN payload_enc IS NOT NULL AND length(payload_enc) > 0 THEN 1 ELSE 0 END`
+
+func scanAccount(sc interface{ Scan(...any) error }) (*Account, error) {
+	var a Account
+	var hasPayload int
+	err := sc.Scan(&a.ID, &a.Name, &a.Vid, &a.Nickname, &a.Avatar, &a.Status, &a.LastError,
+		&a.LastCheckAt, &a.DefaultMinutes, &a.TickSeconds, &a.BookID, &a.BookTitle,
+		&a.ChapterID, &a.ChapterTitle, &a.Mode, &a.PushChannelID, &a.CreatedAt, &a.UpdatedAt,
+		&hasPayload)
+	if err != nil {
+		return nil, err
+	}
+	a.HasPayload = hasPayload == 1
+	return &a, nil
+}
+
+// ListAccounts returns all accounts ordered by creation time.
+func (s *Store) ListAccounts() ([]Account, error) {
+	rows, err := s.db.Query(`SELECT ` + accountCols + ` FROM accounts ORDER BY id ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Account{}
+	for rows.Next() {
+		a, err := scanAccount(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *a)
+	}
+	return out, rows.Err()
+}
+
+// GetAccount returns one account.
+func (s *Store) GetAccount(id int64) (*Account, error) {
+	a, err := scanAccount(s.db.QueryRow(`SELECT `+accountCols+` FROM accounts WHERE id = ?`, id))
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return a, err
+}
+
+// CreateAccount inserts an account with its encrypted secrets.
+func (s *Store) CreateAccount(a Account, cookies map[string]string, payload map[string]any) (int64, error) {
+	if a.Status == "" {
+		a.Status = "active"
+	}
+	if a.DefaultMinutes <= 0 {
+		a.DefaultMinutes = 30
+	}
+	if a.TickSeconds <= 0 {
+		a.TickSeconds = 30
+	}
+	if a.Mode == "" {
+		a.Mode = "stable"
+	}
+	ck, err := s.sealJSON(cookies)
+	if err != nil {
+		return 0, err
+	}
+	pl, err := s.sealJSON(payload)
+	if err != nil {
+		return 0, err
+	}
+	if len(cookies) == 0 {
+		ck = nil
+	}
+	if len(payload) == 0 {
+		pl = nil
+	}
+	ts := now()
+	res, err := s.db.Exec(`INSERT INTO accounts
+		(name, vid, nickname, avatar, cookie_enc, payload_enc, status, last_error, last_check_at,
+		 default_minutes, tick_seconds, book_id, book_title, chapter_id, chapter_title, mode,
+		 push_channel_id, created_at, updated_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		a.Name, a.Vid, a.Nickname, a.Avatar, ck, pl, a.Status, a.LastError, a.LastCheckAt,
+		a.DefaultMinutes, a.TickSeconds, a.BookID, a.BookTitle, a.ChapterID, a.ChapterTitle,
+		a.Mode, a.PushChannelID, ts, ts)
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+// UpdateAccount updates editable settings.
+func (s *Store) UpdateAccount(a Account) error {
+	_, err := s.db.Exec(`UPDATE accounts SET
+		name = ?, default_minutes = ?, tick_seconds = ?, book_id = ?, book_title = ?,
+		chapter_id = ?, chapter_title = ?, mode = ?, push_channel_id = ?, updated_at = ?
+		WHERE id = ?`,
+		a.Name, a.DefaultMinutes, a.TickSeconds, a.BookID, a.BookTitle, a.ChapterID,
+		a.ChapterTitle, a.Mode, a.PushChannelID, now(), a.ID)
+	return err
+}
+
+// UpdateIdentity refreshes nickname/avatar after a login.
+func (s *Store) UpdateIdentity(id int64, vid, nickname, avatar string) error {
+	_, err := s.db.Exec(`UPDATE accounts SET vid = ?, nickname = ?, avatar = ?, updated_at = ? WHERE id = ?`,
+		vid, nickname, avatar, now(), id)
+	return err
+}
+
+// SetAccountStatus records the last validation result.
+func (s *Store) SetAccountStatus(id int64, status, lastErr string, checkAt int64) error {
+	_, err := s.db.Exec(`UPDATE accounts SET status = ?, last_error = ?, last_check_at = ?, updated_at = ? WHERE id = ?`,
+		status, lastErr, checkAt, now(), id)
+	return err
+}
+
+// SaveCookies replaces the stored cookie jar.
+func (s *Store) SaveCookies(id int64, cookies map[string]string) error {
+	ck, err := s.sealJSON(cookies)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`UPDATE accounts SET cookie_enc = ?, updated_at = ? WHERE id = ?`, ck, now(), id)
+	return err
+}
+
+// SavePayload replaces the captured read template.
+func (s *Store) SavePayload(id int64, payload map[string]any) error {
+	pl, err := s.sealJSON(payload)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`UPDATE accounts SET payload_enc = ?, updated_at = ? WHERE id = ?`, pl, now(), id)
+	return err
+}
+
+// AccountSecrets decrypts the cookie jar and payload template.
+func (s *Store) AccountSecrets(id int64) (map[string]string, map[string]any, error) {
+	var ckEnc, plEnc []byte
+	err := s.db.QueryRow(`SELECT cookie_enc, payload_enc FROM accounts WHERE id = ?`, id).Scan(&ckEnc, &plEnc)
+	if err == sql.ErrNoRows {
+		return nil, nil, fmt.Errorf("账号不存在")
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	cookies := map[string]string{}
+	payload := map[string]any{}
+	if len(ckEnc) > 0 {
+		if err := s.openJSON(ckEnc, &cookies); err != nil {
+			return nil, nil, fmt.Errorf("解密 Cookie 失败: %w", err)
+		}
+	}
+	if len(plEnc) > 0 {
+		if err := s.openJSON(plEnc, &payload); err != nil {
+			return nil, nil, fmt.Errorf("解密模板失败: %w", err)
+		}
+	}
+	return cookies, payload, nil
+}
+
+// DeleteAccount removes the account and all of its runs, logs and schedules.
+func (s *Store) DeleteAccount(id int64) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec(`DELETE FROM run_logs WHERE run_id IN (SELECT id FROM runs WHERE account_id = ?)`, id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM runs WHERE account_id = ?`, id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM schedules WHERE account_id = ?`, id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM accounts WHERE id = ?`, id); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// DeletePayload removes the captured template without touching the account.
+func (s *Store) DeletePayload(id int64) error {
+	_, err := s.db.Exec(`UPDATE accounts SET payload_enc = NULL, updated_at = ? WHERE id = ?`, now(), id)
+	return err
+}
+
+// MarshalCookies is a helper for logging-free cookie serialization.
+func MarshalCookies(ck map[string]string) string {
+	b, _ := json.Marshal(ck)
+	return string(b)
+}

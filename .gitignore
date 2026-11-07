@@ -1,0 +1,21 @@
+# 运行数据
+/data/
+*.db
+*.db-shm
+*.db-wal
+secret.key
+
+# 本地临时文件
+/.tmp/
+/tmp/
+/scratch/
+
+# 构建产物
+/wxread-panel
+/wxread-panel.exe
+/dist/
+
+# 编辑器
+.idea/
+.vscode/
+.DS_Store
