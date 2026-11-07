@@ -1,7 +1,7 @@
 async function request(path, { method = 'GET', body } = {}) {
   const headers = {};
   if (body !== undefined) headers['Content-Type'] = 'application/json';
-  if (method !== 'GET') headers['X-Requested-With'] = 'wxread-panel';
+  if (method !== 'GET') headers['X-Requested-With'] = 'readtrace';
 
   let res;
   try {

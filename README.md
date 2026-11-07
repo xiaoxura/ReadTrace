@@ -1,8 +1,10 @@
-# 读时 · ReadPilot
+# 阅迹 · ReadTrace
 
-> 一个单文件、可自托管的微信读书阅读面板。扫码登录，实时看进度，自动跑定时，把阅读时长和数据都留在自己手里。
+> 每一次阅读，都留下痕迹。
 
-原版 [findmover/wxread](https://github.com/findmover/wxread) 用环境变量 + 控制台日志 + 一次性定时任务完成“刷时长”，好用但看不见、管不住、不好排错。读时把它重做成一个带可视化面板的常驻服务：**Go 单二进制 + SQLite + 内嵌前端**，打开浏览器就能管理账号、看实时进度、查历史趋势、配推送与定时任务。
+一个单文件、可自托管的微信读书阅读面板。扫码登录，实时看进度，自动跑定时，把阅读时长和数据都留在自己手里。
+
+原版 [findmover/wxread](https://github.com/findmover/wxread) 用环境变量 + 控制台日志 + 一次性定时任务完成“刷时长”，好用但看不见、管不住、不好排错。阅迹把它重做成一个带可视化面板的常驻服务：**Go 单二进制 + SQLite + 内嵌前端**，打开浏览器就能管理账号、看实时进度、查历史趋势、配推送与定时任务。
 
 ![总览](docs/screenshots/dashboard.png)
 
@@ -10,7 +12,7 @@
 
 ## 为什么重做
 
-| 能力 | findmover/wxread | 读时 · ReadPilot |
+| 能力 | findmover/wxread | 阅迹 · ReadTrace |
 | --- | --- | --- |
 | 部署形态 | Python 脚本 / GitHub Action / Docker | **单个二进制**，内嵌前端，无需 Node/Python |
 | 配置方式 | 环境变量 / config.py | **可视化面板**，配置存 SQLite |
@@ -62,26 +64,26 @@
 
 ```bash
 # Linux / macOS
-./build.sh 1.0.0
+./build.sh 1.1.0
 
 # Windows PowerShell
-.\build.ps1 -Version 1.0.0
+.\build.ps1 -Version 1.1.0
 ```
 
 也可以直接用发布页的二进制，或在项目根目录执行：
 
 ```bash
-go build -trimpath -ldflags "-s -w -X main.version=1.0.0" -o wxread-panel ./cmd/wxread-panel
+go build -trimpath -ldflags "-s -w -X main.version=1.1.0" -o readtrace ./cmd/readtrace
 ```
 
 ### 2. 启动
 
 ```bash
 # Windows
-.\wxread-panel.exe
+.\readtrace.exe
 
 # Linux / macOS
-./wxread-panel
+./readtrace
 ```
 
 默认监听 `http://127.0.0.1:8720` 并自动打开浏览器。首次访问会要求设置管理密码——**这不是微信读书密码**，只用于保护面板。
@@ -113,16 +115,16 @@ go build -trimpath -ldflags "-s -w -X main.version=1.0.0" -o wxread-panel ./cmd/
 | `-version` | | 输出版本号 |
 | `-reset-password` | | 清除面板密码（下次启动重新初始化），账号数据保留 |
 
-对应环境变量：`WXREAD_ADDR`、`WXREAD_DATA`、`WXREAD_LOG_LEVEL`。
+对应环境变量：`READTRACE_ADDR`、`READTRACE_DATA`、`READTRACE_LOG_LEVEL`。旧版的 `WXREAD_*` 仍会自动识别，`wxread.db` 也会在首次启动时重命名为 `readtrace.db`。
 
 示例：
 
 ```bash
 # 局域网 NAS 上运行
-WXREAD_ADDR=0.0.0.0:8720 WXREAD_DATA=/volume1/docker/readpilot ./wxread-panel -no-open
+READTRACE_ADDR=0.0.0.0:8720 READTRACE_DATA=/volume1/docker/readtrace ./readtrace -no-open
 
 # 忘记面板密码
-./wxread-panel -reset-password -data ./data
+./readtrace -reset-password -data ./data
 ```
 
 ---
@@ -133,8 +135,8 @@ WXREAD_ADDR=0.0.0.0:8720 WXREAD_DATA=/volume1/docker/readpilot ./wxread-panel -n
 
 ```
 data/
-├── wxread.db      # SQLite：账号、运行记录、日志、定时任务、推送渠道、设置
-├── wxread.db-wal  # SQLite WAL
+├── readtrace.db      # SQLite：账号、运行记录、日志、定时任务、推送渠道、设置
+├── readtrace.db-wal  # SQLite WAL
 └── secret.key     # 本地 AES-256-GCM 主密钥（32 字节）
 ```
 
@@ -152,27 +154,27 @@ data/
 
 ### Windows 开机自启
 
-将 `wxread-panel.exe` 放入一个固定目录，创建一个快捷方式放到 `shell:startup`：
+将 `readtrace.exe` 放入一个固定目录，创建一个快捷方式放到 `shell:startup`：
 
 ```
-目标： "C:\ReadPilot\wxread-panel.exe" -data "C:\ReadPilot\data"
-起始位置： C:\ReadPilot
+目标： "C:\ReadTrace\readtrace.exe" -data "C:\ReadTrace\data"
+起始位置： C:\ReadTrace
 ```
 
-或者用任务计划程序，触发器设为“登录时”，操作指向 exe，参数 `-data "C:\ReadPilot\data" -no-open`。
+或者用任务计划程序，触发器设为“登录时”，操作指向 exe，参数 `-data "C:\ReadTrace\data" -no-open`。
 
 ### Linux systemd
 
 ```ini
 [Unit]
-Description=ReadPilot
+Description=ReadTrace
 After=network.target
 
 [Service]
 Type=simple
-User=readpilot
-WorkingDirectory=/opt/readpilot
-ExecStart=/opt/readpilot/wxread-panel -addr 127.0.0.1:8720 -data /opt/readpilot/data -no-open
+User=readtrace
+WorkingDirectory=/opt/readtrace
+ExecStart=/opt/readtrace/readtrace -addr 127.0.0.1:8720 -data /opt/readtrace/data -no-open
 Restart=always
 RestartSec=3
 
@@ -182,7 +184,7 @@ WantedBy=multi-user.target
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable --now readpilot
+sudo systemctl enable --now readtrace
 ```
 
 ### Docker / NAS
@@ -222,7 +224,7 @@ location / {
 - `sg = sha256(ts + rn + KEY)`
 - `s = cal_hash("k=v&..." 按 key 排序、URL 编码)`
 
-读时用 Go 复刻了同一套签名逻辑（见 `internal/weread/sign.go`），并附带与官方 Python 实现逐字节对照的单元测试。
+阅迹用 Go 复刻了同一套签名逻辑（见 `internal/weread/sign.go`），并附带与官方 Python 实现逐字节对照的单元测试。
 
 单次心跳流程：
 
@@ -275,13 +277,13 @@ location / {
 ### 端口被占用
 
 ```bash
-./wxread-panel -addr 127.0.0.1:8721
+./readtrace -addr 127.0.0.1:8721
 ```
 
 ### 忘记面板密码
 
 ```bash
-./wxread-panel -reset-password -data ./data
+./readtrace -reset-password -data ./data
 ```
 
 然后重新启动，按首次初始化流程设置新密码。账号与历史数据不会丢失。
@@ -306,13 +308,13 @@ go test ./...
 go vet ./...
 
 # 开发模式（前端是内嵌静态资源，改完 JS/CSS 需要重新 build）
-go run ./cmd/wxread-panel -addr 127.0.0.1:8720 -data ./data
+go run ./cmd/readtrace -addr 127.0.0.1:8720 -data ./data
 ```
 
 目录结构：
 
 ```
-cmd/wxread-panel/      入口：参数、启动、优雅退出
+cmd/readtrace/      入口：参数、启动、优雅退出
 internal/api/          HTTP API、认证、SSE、扫码流程
 internal/engine/       阅读心跳引擎、事件中心
 internal/sched/        cron 调度

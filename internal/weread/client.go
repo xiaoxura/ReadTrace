@@ -231,6 +231,16 @@ func (c *Client) UserInfo(ctx context.Context, ck Cookies, vid string) (nickname
 	return findString(raw, "name", "nickName", "nickname"), findString(raw, "avatar", "avatarUrl", "avatar_url")
 }
 
+// CurrentVID looks up the user id bound to a cookie jar. It is used as a
+// fallback when the login response only carries an access token.
+func (c *Client) CurrentVID(ctx context.Context, ck Cookies) string {
+	var raw any
+	if _, err := c.doJSON(ctx, http.MethodGet, "/web/user", ck, nil, &raw); err != nil {
+		return ""
+	}
+	return findScalar(raw, "userVid", "vid", "webLoginVid")
+}
+
 // Warmup visits the home page so the server can hand out auxiliary cookies
 // (fingerprint, tracking) that the read endpoint may expect.
 func (c *Client) Warmup(ctx context.Context, ck Cookies) {
@@ -257,6 +267,11 @@ func (c *Client) Warmup(ctx context.Context, ck Cookies) {
 
 func toInt(v any) int {
 	switch x := v.(type) {
+	case bool:
+		if x {
+			return 1
+		}
+		return 0
 	case float64:
 		return int(x)
 	case int:
@@ -307,6 +322,12 @@ func pickString(m map[string]any, keys ...string) string {
 // findString walks a decoded JSON value and returns the first string value
 // matching one of the candidate keys.
 func findString(v any, keys ...string) string {
+	return findScalar(v, keys...)
+}
+
+// findScalar is like findString but also accepts numeric values, which some
+// login payloads use for user ids.
+func findScalar(v any, keys ...string) string {
 	want := make(map[string]struct{}, len(keys))
 	for _, k := range keys {
 		want[k] = struct{}{}
@@ -316,10 +337,22 @@ func findString(v any, keys ...string) string {
 		switch x := cur.(type) {
 		case map[string]any:
 			for k, val := range x {
-				if _, ok := want[k]; ok {
-					if s, ok := val.(string); ok && s != "" {
+				if _, ok := want[k]; !ok {
+					continue
+				}
+				switch s := val.(type) {
+				case string:
+					if s != "" {
 						return s
 					}
+				case float64:
+					return strconv.FormatInt(int64(s), 10)
+				case json.Number:
+					return s.String()
+				case int64:
+					return strconv.FormatInt(s, 10)
+				case int:
+					return strconv.Itoa(s)
 				}
 			}
 			for _, val := range x {

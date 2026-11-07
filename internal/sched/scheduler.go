@@ -9,8 +9,8 @@ import (
 
 	"github.com/robfig/cron/v3"
 
-	"wxread-panel/internal/engine"
-	"wxread-panel/internal/store"
+	"readtrace/internal/engine"
+	"readtrace/internal/store"
 )
 
 // Scheduler owns the cron instance and its schedule entries.

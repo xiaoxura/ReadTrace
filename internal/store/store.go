@@ -11,7 +11,7 @@ import (
 
 	_ "modernc.org/sqlite"
 
-	"wxread-panel/internal/secure"
+	"readtrace/internal/secure"
 )
 
 // Store wraps the SQLite database and the at-rest encryption box.

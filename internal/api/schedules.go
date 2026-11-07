@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"wxread-panel/internal/store"
+	"readtrace/internal/store"
 )
 
 func normalizeCron(expr string) string {

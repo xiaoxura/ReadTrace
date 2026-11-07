@@ -8,7 +8,7 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 
-	"wxread-panel/internal/secure"
+	"readtrace/internal/secure"
 )
 
 const (
@@ -16,7 +16,7 @@ const (
 	keySiteName     = "site_name"
 	keyTimezone     = "timezone"
 
-	sessionCookieName = "wxread_session"
+	sessionCookieName = "readtrace_session"
 	sessionTTL        = 30 * 24 * time.Hour
 )
 
@@ -61,7 +61,7 @@ func (s *Server) newSession(w http.ResponseWriter, r *http.Request) error {
 func (s *Server) siteName() string {
 	v, _ := s.st.GetSetting(keySiteName)
 	if strings.TrimSpace(v) == "" {
-		return "读时"
+		return "阅迹"
 	}
 	return v
 }

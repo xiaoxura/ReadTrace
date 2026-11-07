@@ -1,0 +1,22 @@
+[Unit]
+Description=ReadTrace - self-hosted WeRead reading dashboard
+After=network.target
+
+[Service]
+Type=simple
+User=readtrace
+Group=readtrace
+WorkingDirectory=/opt/readtrace
+ExecStart=/opt/readtrace/readtrace -addr 127.0.0.1:8720 -data /opt/readtrace/data -no-open
+Restart=always
+RestartSec=3
+
+# Hardening (optional, adjust to your paths)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/readtrace/data
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

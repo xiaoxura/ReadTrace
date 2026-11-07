@@ -1,4 +1,4 @@
-module wxread-panel
+module readtrace
 
 go 1.26.0
 

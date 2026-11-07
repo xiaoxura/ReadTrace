@@ -13,6 +13,8 @@ secret.key
 # 构建产物
 /wxread-panel
 /wxread-panel.exe
+/readtrace
+/readtrace.exe
 /dist/
 
 # 编辑器

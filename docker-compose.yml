@@ -1,8 +1,8 @@
 services:
-  readpilot:
+  readtrace:
     build: .
-    image: readpilot:latest
-    container_name: readpilot
+    image: readtrace:latest
+    container_name: readtrace
     restart: unless-stopped
     ports:
       - "8720:8720"

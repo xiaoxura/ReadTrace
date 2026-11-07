@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"wxread-panel/internal/store"
+	"readtrace/internal/store"
 )
 
 func (s *Server) resolveAccount(id int64) (*store.Account, error) {

@@ -1,4 +1,4 @@
-// Command wxread-panel runs the ReadPilot dashboard: a single-binary web UI
+// Command readtrace runs the ReadTrace dashboard: a single-binary web UI
 // that keeps WeRead reading sessions alive and visualizes the results.
 package main
 
@@ -20,23 +20,23 @@ import (
 	"time"
 	_ "time/tzdata" // embed the IANA database so -trimpath builds still resolve zones
 
-	"wxread-panel/internal/api"
-	"wxread-panel/internal/engine"
-	"wxread-panel/internal/notify"
-	"wxread-panel/internal/sched"
-	"wxread-panel/internal/secure"
-	"wxread-panel/internal/store"
-	"wxread-panel/internal/webui"
-	"wxread-panel/internal/weread"
+	"readtrace/internal/api"
+	"readtrace/internal/engine"
+	"readtrace/internal/notify"
+	"readtrace/internal/sched"
+	"readtrace/internal/secure"
+	"readtrace/internal/store"
+	"readtrace/internal/webui"
+	"readtrace/internal/weread"
 )
 
 var version = "dev"
 
 func main() {
-	addr := flag.String("addr", envOr("WXREAD_ADDR", "127.0.0.1:8720"), "监听地址，例如 127.0.0.1:8720 或 0.0.0.0:8720")
-	dataDir := flag.String("data", envOr("WXREAD_DATA", "data"), "数据目录（SQLite 与密钥）")
+	addr := flag.String("addr", envAny([]string{"READTRACE_ADDR", "WXREAD_ADDR"}, "127.0.0.1:8720"), "监听地址，例如 127.0.0.1:8720 或 0.0.0.0:8720")
+	dataDir := flag.String("data", envAny([]string{"READTRACE_DATA", "WXREAD_DATA"}, "data"), "数据目录（SQLite 与密钥）")
 	noOpen := flag.Bool("no-open", false, "启动后不自动打开浏览器")
-	level := flag.String("log-level", envOr("WXREAD_LOG_LEVEL", "info"), "日志级别 debug/info/warn/error")
+	level := flag.String("log-level", envAny([]string{"READTRACE_LOG_LEVEL", "WXREAD_LOG_LEVEL"}, "info"), "日志级别 debug/info/warn/error")
 	showVersion := flag.Bool("version", false, "输出版本号")
 	resetPassword := flag.Bool("reset-password", false, "清除面板管理密码（下次启动重新设置）")
 	flag.Parse()
@@ -70,7 +70,7 @@ func run(addr, dataDir string, openBrowser bool, logger *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("初始化加密密钥失败: %w", err)
 	}
-	st, err := store.Open(filepath.Join(dataDir, "wxread.db"), box)
+	st, err := store.Open(dbFilePath(dataDir), box)
 	if err != nil {
 		return err
 	}
@@ -83,7 +83,7 @@ func run(addr, dataDir string, openBrowser bool, logger *slog.Logger) error {
 
 	// Seed defaults on first run.
 	if v, _ := st.GetSetting("site_name"); strings.TrimSpace(v) == "" {
-		_ = st.SetSetting("site_name", "读时")
+		_ = st.SetSetting("site_name", "阅迹")
 	}
 	tzName, _ := st.GetSetting("timezone")
 	if strings.TrimSpace(tzName) == "" {
@@ -121,7 +121,7 @@ func run(addr, dataDir string, openBrowser bool, logger *slog.Logger) error {
 		return fmt.Errorf("监听 %s 失败（端口可能被占用）: %w", addr, err)
 	}
 	url := displayURL(addr)
-	logger.Info("读时 · ReadPilot 已启动",
+	logger.Info("阅迹 · ReadTrace 已启动",
 		"version", version, "url", url, "data", absPath(dataDir),
 		"go", runtime.Version())
 	logger.Info("首次访问需要设置管理密码；登录后可扫码绑定微信读书账号")
@@ -155,7 +155,7 @@ func resetPanelPassword(dataDir string) error {
 	if err != nil {
 		return err
 	}
-	st, err := store.Open(filepath.Join(dataDir, "wxread.db"), box)
+	st, err := store.Open(dbFilePath(dataDir), box)
 	if err != nil {
 		return err
 	}
@@ -199,6 +199,31 @@ func absPath(p string) string {
 		return p
 	}
 	return abs
+}
+
+func dbFilePath(dataDir string) string {
+	newPath := filepath.Join(dataDir, "readtrace.db")
+	legacy := filepath.Join(dataDir, "wxread.db")
+	if _, err := os.Stat(newPath); errors.Is(err, os.ErrNotExist) {
+		if _, err := os.Stat(legacy); err == nil {
+			_ = os.Rename(legacy, newPath)
+			for _, suffix := range []string{"-wal", "-shm"} {
+				if _, err := os.Stat(legacy + suffix); err == nil {
+					_ = os.Rename(legacy+suffix, newPath+suffix)
+				}
+			}
+		}
+	}
+	return newPath
+}
+
+func envAny(keys []string, def string) string {
+	for _, key := range keys {
+		if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+			return v
+		}
+	}
+	return def
 }
 
 func envOr(key, def string) string {

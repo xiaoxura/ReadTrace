@@ -3,17 +3,19 @@ package api
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/skip2/go-qrcode"
 
-	"wxread-panel/internal/store"
-	"wxread-panel/internal/weread"
+	"readtrace/internal/store"
+	"readtrace/internal/weread"
 )
 
 // qrFlow tracks one QR login attempt.
@@ -117,6 +119,15 @@ func (m *qrManager) poll(ctx context.Context, f *qrFlow) {
 				})
 				return
 			}
+			if errors.Is(err, weread.ErrLoginSessionExpired) {
+				m.log.Warn("扫码会话已失效", "uid", f.UID)
+				m.set(f.UID, func(fl *qrFlow) {
+					if fl.Status == "pending" {
+						fl.Status = "expired"
+					}
+				})
+				return
+			}
 			m.log.Warn("扫码登录轮询失败", "err", err)
 			if !sleep(ctx, 2*time.Second) {
 				return
@@ -127,9 +138,15 @@ func (m *qrManager) poll(ctx context.Context, f *qrFlow) {
 			fl.Logic = res.LogicCode
 			fl.LastPollAt = time.Now().Unix()
 		})
+		cookieNames := make([]string, 0, len(res.Cookies))
+		for k := range res.Cookies {
+			cookieNames = append(cookieNames, k)
+		}
+		sort.Strings(cookieNames)
 		m.log.Info("扫码轮询返回",
 			"succeed", res.Success, "logic", res.LogicCode,
-			"has_token", res.AccessToken != "", "has_vid", res.Vid != "")
+			"has_token", res.AccessToken != "", "has_vid", res.Vid != "",
+			"keys", strings.Join(res.Keys, ","), "cookies", strings.Join(cookieNames, ","))
 		if res.Success {
 			m.bind(f, res)
 			return
@@ -157,11 +174,33 @@ func (m *qrManager) bind(f *qrFlow, res *weread.LoginPoll) {
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 	defer cancel()
 
-	ck := weread.Cookies{"wr_vid": res.Vid, "wr_skey": res.AccessToken}
-	m.wc.Warmup(ctx, ck)
-	nickname, avatar := m.wc.UserInfo(ctx, ck, res.Vid)
+	ck := weread.Cookies{}
+	for k, v := range res.Cookies {
+		ck[k] = v
+	}
+	if res.AccessToken != "" {
+		ck["wr_skey"] = res.AccessToken
+	}
+	vid := res.Vid
+	if vid == "" {
+		vid = ck["wr_vid"]
+	}
 
-	acc, err := m.st.FindAccountByVid(res.Vid)
+	m.wc.Warmup(ctx, ck)
+	if vid == "" {
+		vid = ck["wr_vid"]
+	}
+	if vid == "" {
+		vid = m.wc.CurrentVID(ctx, ck)
+	}
+	if vid == "" {
+		m.fail(f, "登录成功但未获取到用户 ID，请刷新二维码重试")
+		return
+	}
+	ck["wr_vid"] = vid
+	nickname, avatar := m.wc.UserInfo(ctx, ck, vid)
+
+	acc, err := m.st.FindAccountByVid(vid)
 	if err != nil {
 		m.fail(f, "读取账号失败："+err.Error())
 		return
@@ -171,7 +210,7 @@ func (m *qrManager) bind(f *qrFlow, res *weread.LoginPoll) {
 			m.fail(f, "保存登录状态失败："+err.Error())
 			return
 		}
-		_ = m.st.UpdateIdentity(acc.ID, res.Vid, nickname, avatar)
+		_ = m.st.UpdateIdentity(acc.ID, vid, nickname, avatar)
 		_ = m.st.SetAccountStatus(acc.ID, "active", "", time.Now().Unix())
 		m.set(f.UID, func(fl *qrFlow) {
 			fl.Status = "confirmed"
@@ -186,7 +225,7 @@ func (m *qrManager) bind(f *qrFlow, res *weread.LoginPoll) {
 	}
 	id, err := m.st.CreateAccount(store.Account{
 		Name:           name,
-		Vid:            res.Vid,
+		Vid:            vid,
 		Nickname:       nickname,
 		Avatar:         avatar,
 		Status:         "active",

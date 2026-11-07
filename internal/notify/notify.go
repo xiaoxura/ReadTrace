@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"wxread-panel/internal/store"
+	"readtrace/internal/store"
 )
 
 // Sender sends notifications.

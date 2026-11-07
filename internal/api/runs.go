@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"time"
 
-	"wxread-panel/internal/store"
+	"readtrace/internal/store"
 )
 
 func (s *Server) handleRunStart(w http.ResponseWriter, r *http.Request) {

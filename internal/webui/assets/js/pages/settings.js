@@ -105,12 +105,12 @@ export async function renderSettings(ctx) {
         </article>
 
         <article class="card">
-          <div class="card-head"><div><div class="card-title">${icon('bookOpen')}关于读时</div></div></div>
+          <div class="card-head"><div><div class="card-title">${icon('bookOpen')}关于阅迹</div></div></div>
           <p class="hint" style="font-size:12px;line-height:1.8">
-            读时（ReadPilot）是一个单文件、可自托管的微信读书阅读面板。
+            阅迹（ReadTrace）是一个单文件、可自托管的微信读书阅读面板。
             数据全部保存在本地，不需要数据库服务，把二进制和 <code>data/</code> 目录带走即可迁移。
           </p>
-          <div class="hint" style="margin-top:12px">构建：<code>go build -o wxread-panel ./cmd/wxread-panel</code></div>
+          <div class="hint" style="margin-top:12px">构建：<code>go build -o readtrace ./cmd/readtrace</code></div>
         </article>
       </div>
     </div>
@@ -132,7 +132,7 @@ export async function renderSettings(ctx) {
     try {
       const res = await api.updateSettings({ site_name: name, timezone: tz });
       state.tz = res.timezone;
-      document.title = `${name} · ReadPilot`;
+      document.title = `${name} · ReadTrace`;
       toast('站点设置已保存', 'ok');
       ctx.reload();
     } catch (e2) {

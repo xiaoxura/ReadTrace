@@ -110,8 +110,8 @@ function shellHTML(me) {
       <div class="brand">
         <div class="brand-mark">${icon('bookOpen')}</div>
         <div class="brand-text">
-          <div class="brand-name">${escapeHtml(me.site_name || '读时')}</div>
-          <div class="brand-sub">ReadPilot</div>
+          <div class="brand-name">${escapeHtml(me.site_name || '阅迹')}</div>
+          <div class="brand-sub">ReadTrace</div>
         </div>
       </div>
       <div class="nav-section">工作台</div>
@@ -133,7 +133,7 @@ function renderShell(me) {
   authActive = false;
   const app = $('#app');
   app.innerHTML = shellHTML(me);
-  document.title = `${me.site_name || '读时'} · ReadPilot`;
+  document.title = `${me.site_name || '阅迹'} · ReadTrace`;
 
   updateNavCount();
   updateConn(false);
@@ -216,7 +216,7 @@ function authHTML(mode) {
 function showAuth(mode, info = {}) {
   authActive = true;
   if (es) { es.close(); es = null; }
-  document.title = `${info.site_name || '读时'} · ReadPilot`;
+  document.title = `${info.site_name || '阅迹'} · ReadTrace`;
   $('#app').innerHTML = authHTML(mode);
 
   const form = $('#auth-form');

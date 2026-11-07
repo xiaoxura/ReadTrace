@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"wxread-panel/internal/store"
+	"readtrace/internal/store"
 )
 
 var pushTypes = map[string]string{
@@ -152,9 +152,9 @@ func (s *Server) handlePushTest(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
-	content := "如果你收到这条消息，说明「读时」的推送配置已经生效。\n发送时间：" +
+	content := "如果你收到这条消息，说明「阅迹」的推送配置已经生效。\n发送时间：" +
 		time.Now().In(s.timezone()).Format("2006-01-02 15:04:05")
-	if err := s.nt.Send(ctx, *v, "读时 · 测试推送", content); err != nil {
+	if err := s.nt.Send(ctx, *v, "阅迹 · 测试推送", content); err != nil {
 		s.writeErr(w, http.StatusBadGateway, "推送失败："+err.Error())
 		return
 	}

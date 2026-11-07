@@ -10,9 +10,9 @@ import (
 	"sync"
 	"time"
 
-	"wxread-panel/internal/notify"
-	"wxread-panel/internal/store"
-	"wxread-panel/internal/weread"
+	"readtrace/internal/notify"
+	"readtrace/internal/store"
+	"readtrace/internal/weread"
 )
 
 // Progress is the live state of one run.

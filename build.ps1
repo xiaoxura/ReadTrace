@@ -1,6 +1,6 @@
 param(
-    [string]$Version = "1.0.0",
-    [string]$Out = "wxread-panel.exe"
+    [string]$Version = "1.1.0",
+    [string]$Out = "readtrace.exe"
 )
 
 $ErrorActionPreference = "Stop"
@@ -10,7 +10,7 @@ if (-not $go) {
     if (Test-Path $candidate) { $go = $candidate } else { throw "未找到 go，请先安装 Go 1.26+" }
 }
 
-& $go build -trimpath -ldflags "-s -w -X main.version=$Version" -o $Out ./cmd/wxread-panel
+& $go build -trimpath -ldflags "-s -w -X main.version=$Version" -o $Out ./cmd/readtrace
 if ($LASTEXITCODE -ne 0) { throw "构建失败" }
 Write-Host "已生成 $Out（版本 $Version）" -ForegroundColor Green
 Write-Host "运行： .\$Out" -ForegroundColor Cyan

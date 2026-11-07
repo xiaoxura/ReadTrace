@@ -7,8 +7,8 @@ import (
 	"strings"
 	"time"
 
-	"wxread-panel/internal/store"
-	"wxread-panel/internal/weread"
+	"readtrace/internal/store"
+	"readtrace/internal/weread"
 )
 
 func (s *Server) runningAccounts() map[int64]bool {

@@ -16,11 +16,11 @@ import (
 	"strings"
 	"time"
 
-	"wxread-panel/internal/engine"
-	"wxread-panel/internal/notify"
-	"wxread-panel/internal/sched"
-	"wxread-panel/internal/store"
-	"wxread-panel/internal/weread"
+	"readtrace/internal/engine"
+	"readtrace/internal/notify"
+	"readtrace/internal/sched"
+	"readtrace/internal/store"
+	"readtrace/internal/weread"
 )
 
 // Server bundles the HTTP dependencies.
@@ -185,7 +185,7 @@ func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
-			if subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Requested-With")), []byte("wxread-panel")) != 1 {
+			if subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Requested-With")), []byte("readtrace")) != 1 {
 				s.writeErr(w, http.StatusForbidden, "非法请求")
 				return
 			}
