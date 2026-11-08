@@ -164,8 +164,16 @@ func (c *Checker) RunOnce(ctx context.Context) {
 			if acc.Status != "expired" && acc.PushChannelID > 0 {
 				go c.notifyExpired(acc, outcomeErr)
 			}
-		default: // "error": transient trouble — record it but never expire.
-			_ = c.st.SetAccountStatus(acc.ID, acc.Status, "自动检查遇到临时问题："+validateErrString(outcomeErr), time.Now().Unix())
+		default: // "error": transient trouble — log only, never touch the row.
+			// -2003 这类参数错误/网络抖动是临时的，手动检查就能恢复；
+			// 写进 last_error 只会让账号列表反复出现「自动检查遇到临时问题」
+			// 的噪音。保持 last_error 原样（失效账号的真报错不受影响），刷新
+			// last_check_at 即可。
+			c.log.Info("账号自动检查遇到临时错误，本次跳过",
+				"account", acc.Name, "status", acc.Status, "err", validateErrString(outcomeErr))
+			if acc.Status != "expired" {
+				_ = c.st.SetAccountStatus(acc.ID, acc.Status, "", time.Now().Unix())
+			}
 		}
 	}
 	c.log.Info("账号状态自动检查完成", "checked", checked, "active", checked-expired, "expired", expired)

@@ -114,6 +114,17 @@ func TestCheckLoginRunningNoProbe(t *testing.T) {
 	})
 	s := newCheckTestServer(t, mux)
 	id := startTestAccount(t, s)
+	// 新版移除了内置模板兜底：所有模式都需要一份阅读模板作为请求基底。
+	if err := s.st.SetSetting(store.KeyDefaultReadPayload, `{"b":"ce032b305a9bc1ce0b0dd2a","c":"7f632b502707f6ffaa6bf2e"}`); err != nil {
+		t.Fatalf("set default template: %v", err)
+	}
+	// 顺序书单（默认模式）需要书池里有带章节的书。
+	if _, err := s.st.AddPoolItem(store.KindBook, "book1", "测试书", id); err != nil {
+		t.Fatalf("add pool book: %v", err)
+	}
+	if _, err := s.st.AddChapterItem(id, "book1", "chap1", "测试书 · 第一章", 3000); err != nil {
+		t.Fatalf("add pool chapter: %v", err)
+	}
 
 	acc, err := s.st.GetAccount(id)
 	if err != nil || acc == nil {

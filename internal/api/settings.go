@@ -10,6 +10,7 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	"readtrace/internal/checker"
+	"readtrace/internal/store"
 )
 
 func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
@@ -32,6 +33,7 @@ func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 		"started_at":       s.started.Unix(),
 		"check_interval":   interval,
 		"settings":         all,
+		"default_template": mustSetting(s.st, store.KeyDefaultReadPayload),
 	})
 }
 

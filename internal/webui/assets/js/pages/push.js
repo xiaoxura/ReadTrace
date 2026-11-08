@@ -65,7 +65,15 @@ export async function renderPush(ctx) {
       actions: `<button class="btn btn-primary" id="btn-add">${icon('plus')}<span>添加渠道</span></button>`,
     })}
 
-    ${list.length ? `<div class="accounts-grid">${list.map(card).join('')}</div>` : `
+    ${list.length ? `<div class="table-wrap"><table class="table push-table table-wide">
+      <thead><tr>
+        <th style="min-width:220px">渠道</th>
+        <th style="min-width:260px">类型 / 凭据</th>
+        <th style="width:130px">是否启用</th>
+        <th style="width:220px">操作</th>
+      </tr></thead>
+      <tbody>${list.map(card).join('')}</tbody>
+    </table></div>` : `
       <article class="card"><div class="empty" style="padding:54px 20px">
         <div class="empty-ico" style="width:60px;height:60px;border-radius:18px">${icon('bell')}</div>
         <h3>还没有推送渠道</h3>
@@ -132,23 +140,29 @@ export async function renderPush(ctx) {
 
 function card(ch) {
   const meta = TYPES[ch.type] || { label: ch.type, icon: 'bell', color: 'var(--text-2)' };
-  return `<article class="account-card">
-    <div class="account-top">
-      <div class="avatar" style="color:${meta.color}">${icon(meta.icon)}</div>
-      <div style="flex:1;min-width:0">
-        <div class="account-name">${escapeHtml(ch.name)}
-          ${ch.enabled ? '<span class="badge ok">启用中</span>' : '<span class="badge neutral">已停用</span>'}
+  return `<tr>
+    <td>
+      <div style="display:flex;align-items:center;gap:10px;justify-content:center">
+        <div class="avatar" style="width:38px;height:38px;border-radius:11px;color:${meta.color}">${icon(meta.icon)}</div>
+        <div style="min-width:0;text-align:left">
+          <div class="cell-strong">${escapeHtml(ch.name)}</div>
+          <div class="cell-muted">${meta.label}</div>
         </div>
-        <div class="account-sub">${meta.label} · ${summary(ch)}</div>
       </div>
-      <label class="switch" title="${ch.enabled ? '停用' : '启用'}">
+    </td>
+    <td class="cell-muted">${summary(ch) || '—'}</td>
+    <td>
+      <label class="switch" title="${ch.enabled ? '停用渠道' : '启用渠道'}">
         <input type="checkbox" data-toggle="${ch.id}" ${ch.enabled ? 'checked' : ''} aria-label="${ch.enabled ? '停用渠道' : '启用渠道'}"><i></i>
       </label>
-    </div>
-    <div class="account-actions">
-      <button class="btn btn-sm" data-test="${ch.id}">${icon('bell')}测试</button>
-      <button class="btn btn-sm btn-ghost" data-edit="${ch.id}">${icon('edit')}编辑</button>
-      <button class="btn btn-sm btn-ghost btn-icon" data-del="${ch.id}" title="删除" aria-label="删除渠道">${icon('trash')}</button>
-    </div>
-  </article>`;
+      <div class="hint" style="margin-top:4px">${ch.enabled ? '启用中，可收推送' : '已停用'}</div>
+    </td>
+    <td>
+      <div style="display:flex;gap:7px;justify-content:center">
+        <button class="btn btn-sm" data-test="${ch.id}">${icon('bell')}测试</button>
+        <button class="btn btn-sm btn-ghost" data-edit="${ch.id}">${icon('edit')}编辑</button>
+        <button class="btn btn-sm btn-ghost btn-icon" data-del="${ch.id}" title="删除" aria-label="删除渠道">${icon('trash')}</button>
+      </div>
+    </td>
+  </tr>`;
 }

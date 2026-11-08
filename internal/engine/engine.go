@@ -3,11 +3,13 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -30,6 +32,7 @@ type Progress struct {
 	TickSeconds int    `json:"tick_seconds"`
 }
 
+// activeRun struct (excerpt) gains sequential-reading state.
 type activeRun struct {
 	runID     int64
 	accountID int64
@@ -42,9 +45,48 @@ type activeRun struct {
 	status    string
 	tick      int
 
+	// 书池快照按账号划分：账号专属优先，其次共享，最后回落内置常量。
+	// poolChaptersBy 保存「书 → 章节」映射；无归属章节进入全局备用池。
+	poolBooksOwned    []string
+	poolBooksShared   []string
+	poolChaptersByOwned   map[string][]string
+	poolChaptersByShared  map[string][]string
+	poolChaptersOwned     []string
+	poolChaptersShared    []string
+
+	// 顺序书单模式：orderedBookList 为按池内顺序拼接的书单；seqPos 为当前
+	// 读到的书/章下标（持久化在 settings，跨次运行衔接）；seqMark 记录本次
+	// 心跳实际使用的位置，成功后才推进。
+	orderedBookList []string
+	seqPos   seqPointer
+	seqMark  seqMark
+
+	// 书/章节的可读标题（value → title），写日志展示用；章节词数用于按
+	// 字数折算每个章节需要多少次心跳。
+	bookTitles    map[string]string
+	chapterTitles map[string]string
+	chapterTitlesRaw map[string]string
+	chapterWordCounts map[string]int
+
 	ctx    context.Context
 	cancel context.CancelFunc
 	done   chan struct{}
+}
+
+// seqPointer 是顺序书单在「书单 → 章节」里的持久化位置（St = 当前章节里
+// 已经花掉的心跳数，跨次运行衔接）。
+type seqPointer struct {
+	Bi int `json:"bi"`
+	Ci int `json:"ci"`
+	St int `json:"st,omitempty"`
+}
+
+// seqMark 记录当前心跳所选的（书下标，章节下标，书内章节序列，原始章节值）。
+type seqMark struct {
+	bi         int
+	ci         int
+	chapters   []string
+	rawChapter string
 }
 
 // tickState carries cumulative counters across automatic retries so a retried
@@ -76,6 +118,36 @@ func New(st *store.Store, wc *weread.Client, nt *notify.Sender, hub *Hub, log *s
 // Hub exposes the event hub.
 func (e *Engine) Hub() *Hub { return e.hub }
 
+// poolValueSet 返回一个 kind 的抽取池（该账号自己的池，无共享层）；
+// 池为空时引擎会在启动时报错提示用户导入，不用内置常量兜底。
+func (e *Engine) poolValueSet(kind string, accountID int64) (first, second []string) {
+	owned, shared, err := e.st.PoolPoolForAccount(kind, accountID)
+	if err != nil {
+		e.log.Warn("读取书池失败", "kind", kind, "err", err)
+	}
+	if len(owned) == 0 {
+		return shared, nil
+	}
+	return append(owned, shared...), nil
+}
+
+// defaultTemplate resolves the admin-configured default read template from the
+// book pool settings. 返回 nil 表示没有配置——稳定模板模式此时无法发起阅读。
+func (e *Engine) defaultTemplate() (map[string]any, bool) {
+	raw, err := e.st.GetDefaultTemplate()
+	if err != nil {
+		e.log.Warn("读取账号指纹模板设置失败", "err", err)
+	}
+	if raw = strings.TrimSpace(raw); raw != "" {
+		var m map[string]any
+		if err := json.Unmarshal([]byte(raw), &m); err == nil && m["b"] != nil && m["c"] != nil {
+			return m, true
+		}
+		e.log.Warn("账号指纹模板无效（需为含 b/c 的 JSON 对象）")
+	}
+	return nil, false
+}
+
 // Start begins a run for the account. It returns the created run row.
 func (e *Engine) Start(acc *store.Account, minutes int, trigger string) (*store.Run, error) {
 	if acc == nil {
@@ -101,7 +173,22 @@ func (e *Engine) Start(acc *store.Account, minutes int, trigger string) (*store.
 	}
 	template := payload
 	if len(template) == 0 {
-		template = weread.DefaultTemplate()
+		template, _ = e.defaultTemplate()
+	}
+	byOwned, byShared, globalOwned, globalShared, _ := e.st.PoolChapterMapForAccount(acc.ID)
+	bookFirst, _ := e.poolValueSet(store.KindBook, acc.ID)
+	bookTitles, _ := e.st.PoolTitleMapForAccount(store.KindBook, acc.ID)
+	chapterTitlesRaw, _ := e.st.PoolTitleMapForAccount(store.KindChapter, acc.ID)
+	chapterWordCounts, _ := e.st.PoolWordCountMapForAccount(store.KindChapter, acc.ID)
+	// 心跳 payload 里的 b/c 是 NormalizePayloadID 之后的形态（纯数字书 ID 会被
+	// 编码），标题映射的键也要换成同一形态，日志才能查到名字。
+	bookTitlesN := make(map[string]string, len(bookTitles))
+	for k, v := range bookTitles {
+		bookTitlesN[weread.NormalizePayloadID(k)] = v
+	}
+	chapterTitlesN := make(map[string]string, len(chapterTitlesRaw))
+	for k, v := range chapterTitlesRaw {
+		chapterTitlesN[weread.NormalizePayloadID(k)] = v
 	}
 
 	run := &store.Run{
@@ -123,16 +210,74 @@ func (e *Engine) Start(acc *store.Account, minutes int, trigger string) (*store.
 		e.mu.Unlock()
 		return nil, fmt.Errorf("创建运行记录失败: %w", err)
 	}
+	// 顺序书单：按书池列表顺序（sort_order）读完整书单再循环。
+	var seqBooks []string
+	if acc.Mode != "custom" {
+		seqBooks = append(seqBooks, bookFirst...)
+	}
+
+	// 池与模板均为纯用户配置：缺内容就明确报错，引导用户去书池导入。
+	// 所有模式都需要一份模板作为请求基底（设备/会话字段），书/章节由模式决定。
+	if len(template) == 0 {
+		e.mu.Unlock()
+		return nil, errors.New("没有可用的阅读模板：请在账号设置保存抓包模板，或在「设置 · 账号指纹模板」配置一份全局模板")
+	}
+	switch acc.Mode {
+	case "custom":
+		if acc.BookID == "" {
+			e.mu.Unlock()
+			return nil, errors.New("请在账号设置中先指定书籍（阅读模式：指定书籍）")
+		}
+	case "rotate":
+		if len(bookFirst) == 0 {
+			e.mu.Unlock()
+			return nil, errors.New("书池为空：请先在「书池 · 书籍导入」导入书籍")
+		}
+		if len(byOwned)+len(byShared)+len(globalOwned)+len(globalShared) == 0 {
+			e.mu.Unlock()
+			return nil, errors.New("书池里没有可读章节：请在导入时选择「同时导入章节」，或在章节抽屉里手动添加")
+		}
+	default:
+		// 默认/未知/缺失模式一律按顺序书单处理。
+		if len(seqBooks) == 0 {
+			e.mu.Unlock()
+			return nil, errors.New("顺序书单为空：请先在「书池 · 书籍导入」导入书籍")
+		}
+		if len(byOwned)+len(byShared)+len(globalOwned)+len(globalShared) == 0 {
+			e.mu.Unlock()
+			return nil, errors.New("书单里的书都没有可读章节：请在导入时选择「同时导入章节」，或在章节抽屉里手动添加")
+		}
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	ar := &activeRun{
 		runID: run.ID, accountID: acc.ID, account: acc.Name, target: target,
 		started: run.StartedAt, status: "running", tick: clampTick(acc.TickSeconds),
-		ctx: ctx, cancel: cancel, done: make(chan struct{}),
+		poolBooksOwned:    bookFirst,
+		poolBooksShared:   nil,
+		poolChaptersByOwned:   byOwned,
+		poolChaptersByShared:  byShared,
+		poolChaptersOwned:     globalOwned,
+		poolChaptersShared:    globalShared,
+		orderedBookList: seqBooks,
+		seqPos:              e.loadSeqPos(acc.ID),
+		bookTitles:          bookTitlesN,
+		chapterTitles:       chapterTitlesN,
+		chapterTitlesRaw:    chapterTitlesRaw,
+		chapterWordCounts:   chapterWordCounts,
+		ctx:               ctx, cancel: cancel, done: make(chan struct{}),
 	}
 	e.act[run.ID] = ar
 	e.mu.Unlock()
 
 	e.hub.Publish(Event{Type: "run.start", RunID: run.ID, AccountID: acc.ID, TS: time.Now().Unix(), Data: e.progress(ar)})
+	if acc.Mode == "rotate" {
+		e.logLine(ar, "info", fmt.Sprintf("轮换书池 %d 本书、%d 个章节", len(ar.poolBooksOwned), len(ar.poolChaptersOwned)))
+	}
+	if acc.Mode == "sequence" {
+		e.logLine(ar, "info", fmt.Sprintf("顺序书单 %d 本书，从「%s」继续（进度跨次运行衔接）",
+			len(seqBooks), seqBookName(ar, ar.seqPos.Bi)))
+	}
 	startMsg := fmt.Sprintf("开始阅读：目标 %s，间隔 %d 秒，模式 %s", humanMinutes(target), clampTick(acc.TickSeconds), modeName(acc.Mode))
 	if clampRetries(acc.MaxRetries) > 0 {
 		startMsg += fmt.Sprintf("，失败自动重试 %d 次（间隔 %d 秒）", clampRetries(acc.MaxRetries), clampDelay(acc.RetryDelay))
@@ -297,6 +442,32 @@ func (e *Engine) loop(ar *activeRun, acc *store.Account, ck weread.Cookies, temp
 	}
 }
 
+// describeReading 生成当前心跳正在读的「书名 · 章节名」（日志展示用）。
+// 书池里没有对应条目的（模板自带的书），回退显示原始 ID。
+func describeReading(ar *activeRun, acc *store.Account, payload map[string]any) string {
+	b, _ := payload["b"].(string)
+	c, _ := payload["c"].(string)
+	bookName := ar.bookTitles[b]
+	if bookName == "" && acc.BookID != "" && b == weread.NormalizePayloadID(acc.BookID) {
+		bookName = acc.BookTitle
+	}
+	if bookName == "" {
+		bookName = b
+	}
+	chapName := ar.chapterTitles[c]
+	if chapName == "" && acc.ChapterID != "" && c == weread.NormalizePayloadID(acc.ChapterID) {
+		chapName = acc.ChapterTitle
+	}
+	// 章节条目的标题存成「书名 · 章节名」：剥掉书名前缀。
+	if i := strings.Index(chapName, " · "); i >= 0 {
+		chapName = chapName[i+3:]
+	}
+	if chapName == "" {
+		chapName = c
+	}
+	return fmt.Sprintf("《%s》· %s", bookName, chapName)
+}
+
 // session runs one full reading session (renewal + heartbeat loop) and never
 // panics past its own recover: the third return states whether the failure is
 // worth retrying (network hiccups yes, a dead login no).
@@ -338,7 +509,9 @@ func (e *Engine) session(ar *activeRun, acc *store.Account, ck weread.Cookies,
 		}
 
 		tick.tickIndex++
-		payload := weread.SignPayload(e.buildPayload(template, acc, tick.tickIndex, rnd), time.Now(), tick.last, rnd)
+		built := e.buildPayload(ar, template, acc, tick.tickIndex, rnd)
+		reading := describeReading(ar, acc, built)
+		payload := weread.SignPayload(built, time.Now(), tick.last, rnd)
 		now := time.Now()
 
 		res, err := e.wc.Read(ar.ctx, ck, payload)
@@ -371,9 +544,13 @@ func (e *Engine) session(ar *activeRun, acc *store.Account, ck weread.Cookies,
 				elapsed = ar.target
 			}
 			tick.last = now
+			// 顺序书单：成功一次才推进书/章指针（失败重试不跳章）。
+			if acc.Mode == "sequence" {
+				e.seqAdvance(ar)
+			}
 			e.update(ar, elapsed, success, tick.failed, "running")
-			e.logLine(ar, "info", fmt.Sprintf("第 %d 次成功 · 已读 %s / %s · synckey=%d",
-				tick.tickIndex, humanMinutes(elapsed), humanMinutes(ar.target), res.SyncKey))
+			e.logLine(ar, "info", fmt.Sprintf("第 %d 次成功 · %s · 已读 %s / %s · synckey=%d",
+				tick.tickIndex, reading, humanMinutes(elapsed), humanMinutes(ar.target), res.SyncKey))
 			if !sleepCtx(ar.ctx, tickJitter(interval, rnd)) {
 				finishS("stopped", "", false)
 				return
@@ -383,7 +560,7 @@ func (e *Engine) session(ar *activeRun, acc *store.Account, ck weread.Cookies,
 			repairs++
 			consecutive++
 			tick.failed++
-			e.logLine(ar, "warn", fmt.Sprintf("第 %d 次未返回 synckey，尝试修复（%d/3）", tick.tickIndex, repairs))
+			e.logLine(ar, "warn", fmt.Sprintf("第 %d 次未返回 synckey，尝试修复（%d/3）· %s", tick.tickIndex, repairs, reading))
 			e.update(ar, elapsed, success, tick.failed, "running")
 			if repairs > 3 {
 				finishS("failed", "连续多次未获得 synckey，已停止", true)
@@ -426,7 +603,7 @@ func (e *Engine) session(ar *activeRun, acc *store.Account, ck weread.Cookies,
 			if msg == "" {
 				msg = fmt.Sprintf("errCode=%d", res.ErrCode)
 			}
-			e.logLine(ar, "warn", fmt.Sprintf("第 %d 次返回异常：%s", tick.tickIndex, msg))
+			e.logLine(ar, "warn", fmt.Sprintf("第 %d 次返回异常：%s · %s", tick.tickIndex, msg, reading))
 			e.update(ar, elapsed, success, tick.failed, "running")
 			if consecutive >= 5 {
 				finishS("failed", "接口持续返回异常："+msg, true)
@@ -447,6 +624,19 @@ func (e *Engine) session(ar *activeRun, acc *store.Account, ck weread.Cookies,
 func (e *Engine) finalize(ar *activeRun, acc *store.Account, inStatus, errMsg string, tick *tickState, target int) {
 	status, errMsg := inStatus, errMsg
 	elapsed, success, failed := tick.elapsed, tick.success, tick.failed
+
+	// 先把结束原因写进运行日志，再持久化结果并广播 run.end——否则前端收到
+	// end 事件立即拉取日志时，失败原因那一行可能还没落库，看起来就像
+	// 「日志里没有失败原因」。
+	switch status {
+	case "success":
+		e.logLine(ar, "info", fmt.Sprintf("阅读完成，本次计入约 %s", humanMinutes(elapsed)))
+	case "stopped":
+		e.logLine(ar, "warn", fmt.Sprintf("已手动停止，本次计入约 %s", humanMinutes(elapsed)))
+	default:
+		e.logLine(ar, "error", "阅读失败："+errMsg)
+	}
+
 	_ = e.st.FinishRun(ar.runID, status, elapsed, success, failed, errMsg)
 	e.mu.Lock()
 	ar.elapsed, ar.success, ar.failed, ar.status = elapsed, success, failed, status
@@ -460,35 +650,236 @@ func (e *Engine) finalize(ar *activeRun, acc *store.Account, inStatus, errMsg st
 			"success": success, "failed": failed, "target": target,
 		}})
 
-	if status == "success" {
-		e.logLine(ar, "info", fmt.Sprintf("阅读完成，本次计入约 %s", humanMinutes(elapsed)))
-	} else if status == "stopped" {
-		e.logLine(ar, "warn", fmt.Sprintf("已手动停止，本次计入约 %s", humanMinutes(elapsed)))
-	} else {
-		e.logLine(ar, "error", "阅读失败："+errMsg)
-	}
-
 	if acc.PushChannelID > 0 {
 		go e.notifyResult(acc, ar, status, errMsg, elapsed)
 	}
 }
 
-func (e *Engine) buildPayload(template map[string]any, acc *store.Account, tick int, rnd *rand.Rand) map[string]any {
+// ---------- 顺序书单支持 ----------
+
+// seqKey 每个账号的顺序书单持久化位置（跨次运行衔接）。
+func seqKey(accountID int64) string {
+	return fmt.Sprintf("sequence_pos_%d", accountID)
+}
+
+func (e *Engine) loadSeqPos(accountID int64) seqPointer {
+	raw, _ := e.st.GetSetting(seqKey(accountID))
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return seqPointer{}
+	}
+	var pos seqPointer
+	if err := json.Unmarshal([]byte(raw), &pos); err != nil || pos.Bi < 0 || pos.Ci < 0 {
+		return seqPointer{}
+	}
+	return pos
+}
+
+func (e *Engine) saveSeqPos(accountID int64, pos seqPointer) {
+	b, err := json.Marshal(pos)
+	if err != nil {
+		return
+	}
+	_ = e.st.SetSetting(seqKey(accountID), string(b))
+}
+
+// chaptersForBook 返回某本书在池中的章节序列（专属优先，导入顺序即目录顺序）。
+func chaptersForBook(ar *activeRun, bookID string) []string {
+	owned := ar.poolChaptersByOwned[bookID]
+	shared := ar.poolChaptersByShared[bookID]
+	if len(owned) == 0 && len(shared) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(owned)+len(shared))
+	out = append(out, owned...)
+	out = append(out, shared...)
+	return out
+}
+
+// seqBookName 所在书单下标的书名（打日志用，优先取池内标题，回退原始 ID）。
+func seqBookName(ar *activeRun, idx int) string {
+	books := ar.orderedBookList
+	if len(books) == 0 {
+		return "（书单为空）"
+	}
+	book := books[idx%len(books)]
+	if title := ar.bookTitles[weread.NormalizePayloadID(book)]; title != "" {
+		return title
+	}
+	return book
+}
+
+// seqNextBookIdx 从 idx 起向后找第一本「池中还有章节」的书，wrap 到开头；
+// 若整张书单都没有章节则原样返回。
+func seqNextBookIdx(ar *activeRun, idx int) int {
+	n := len(ar.orderedBookList)
+	if n == 0 {
+		return 0
+	}
+	for k := 0; k < n; k++ {
+		bi := (idx + k) % n
+		if len(chaptersForBook(ar, ar.orderedBookList[bi])) > 0 {
+			return bi
+		}
+	}
+	return idx % n
+}
+
+// chapterTickBudget 一个章节需要多少次 30 秒心跳才算“读完”：按字数折算，
+// 150 字 / 心跳 ≈ 真人 300 字/分钟。字数未知按 4 次（约 2 分钟）兜底。
+func chapterTickBudget(wordCount int) int {
+	if wordCount <= 0 {
+		return 4
+	}
+	ticks := (wordCount + 149) / 150
+	if ticks < 1 {
+		return 1
+	}
+	return ticks
+}
+
+// chapterDisplayName 章节条目的显示名（剥掉「书名 · 」前缀）。
+func chapterDisplayName(ar *activeRun, rawValue string) string {
+	title := ar.chapterTitlesRaw[rawValue]
+	if title == "" {
+		return rawValue
+	}
+	if i := strings.Index(title, " · "); i >= 0 {
+		title = title[i+3:]
+	}
+	return title
+}
+
+// seqAdvance 在一次成功心跳后推进书单指针，并持久化（跨次运行衔接）。
+// 章节切换按字数预算：读满一章的字数才切下一章，符合真人阅读节奏；
+// 读完整本书切下一本，书单尾部 wrap 回第一本。
+func (e *Engine) seqAdvance(ar *activeRun) {
+	pos := ar.seqPos
+	pos.St++
+	budget := chapterTickBudget(ar.chapterWordCounts[ar.seqMark.rawChapter])
+	if ar.seqMark.rawChapter == "" {
+		budget = 4 // buildPayload 未记录原始章节（兜底路径），保守处理
+	}
+	if pos.St < budget {
+		ar.seqPos = pos
+		e.saveSeqPos(ar.accountID, pos)
+		return
+	}
+	// 本章读满 → 下一章；本书读完 → 下一本。
+	pos.Ci = ar.seqMark.ci + 1
+	pos.St = 0
+	chapters := ar.seqMark.chapters
+	finishedBook := false
+	if len(chapters) == 0 || pos.Ci >= len(chapters) {
+		finishedBook = true
+		pos.Ci = 0
+		pos.Bi = seqNextBookIdx(ar, ar.seqMark.bi+1)
+	}
+	ar.seqPos = pos
+	e.saveSeqPos(ar.accountID, pos)
+
+	bookName := seqBookName(ar, ar.seqMark.bi)
+	if finishedBook {
+		e.logLine(ar, "info", fmt.Sprintf("顺序书单：《%s》已读完，切换到《%s》（第 %d 本）", bookName, seqBookName(ar, pos.Bi), pos.Bi+1))
+	} else {
+		next := ""
+		if pos.Ci < len(chapters) {
+			next = chapters[pos.Ci]
+		}
+		nextName := chapterDisplayName(ar, next)
+		if next == "" {
+			nextName = "下一章"
+		}
+		e.logLine(ar, "info", fmt.Sprintf("顺序书单：《%s》读完「%s」，开始「%s」", bookName, chapterDisplayName(ar, ar.seqMark.rawChapter), nextName))
+	}
+}
+
+func (e *Engine) applyRotatePayload(ar *activeRun, p map[string]any, rnd *rand.Rand) {
+	books := ar.poolBooksOwned
+	if len(books) == 0 {
+		return // Start 已校验书池非空，这里只是防御
+	}
+	book := books[rnd.Intn(len(books))]
+	p["b"] = weread.NormalizePayloadID(book)
+	// 先抽书、再抽章节：该书没有链接章节时回退到无归属的全局备用章节。
+	chapters := chaptersForBook(ar, book)
+	if len(chapters) == 0 {
+		if len(ar.poolChaptersOwned) > 0 {
+			chapters = ar.poolChaptersOwned
+		} else {
+			chapters = ar.poolChaptersShared
+		}
+	}
+	if len(chapters) == 0 {
+		return // Start 已校验存在可读章节，这里只是防御
+	}
+	p["c"] = weread.NormalizePayloadID(chapters[rnd.Intn(len(chapters))])
+}
+
+func (e *Engine) buildPayload(ar *activeRun, template map[string]any, acc *store.Account, tick int, rnd *rand.Rand) map[string]any {
 	p := make(map[string]any, len(template)+4)
 	for k, v := range template {
 		p[k] = v
 	}
 
 	switch acc.Mode {
+	default:
+		// 顺序书单（默认模式）：unknown / "" / "sequence" 都按顺序推进。
+		books := ar.orderedBookList
+		if len(books) == 0 {
+			// 书单为空：退化为随机轮换行为，至少不空转。
+			e.applyRotatePayload(ar, p, rnd)
+			break
+		}
+		pos := ar.seqPos
+		if pos.Bi < 0 || pos.Bi >= len(books) {
+			pos.Bi = ((pos.Bi % len(books)) + len(books)) % len(books)
+			pos.Ci = 0
+		}
+		book := books[pos.Bi]
+		chapters := chaptersForBook(ar, book)
+		for k := 0; k < len(books) && len(chapters) == 0; k++ {
+			pos.Bi = (pos.Bi + 1) % len(books)
+			pos.Ci = 0
+			book = books[pos.Bi]
+			chapters = chaptersForBook(ar, book)
+		}
+		ci := pos.Ci
+		if ci < 0 || (len(chapters) > 0 && ci >= len(chapters)) {
+			ci = 0
+		}
+		var chapter string
+		switch {
+		case len(chapters) > 0:
+			chapter = chapters[ci]
+		case len(ar.poolChaptersOwned) > 0:
+			chapter = ar.poolChaptersOwned[rnd.Intn(len(ar.poolChaptersOwned))]
+		case len(ar.poolChaptersShared) > 0:
+			chapter = ar.poolChaptersShared[rnd.Intn(len(ar.poolChaptersShared))]
+		}
+		if chapter == "" {
+			e.applyRotatePayload(ar, p, rnd) // 不可能出现：Start 已校验章节存在
+			break
+		}
+		p["b"] = weread.NormalizePayloadID(book)
+		p["c"] = weread.NormalizePayloadID(chapter)
+		// 与「指定书籍」一致：像真实阅读一样推进页码参数。
+		if co, ok := numeric(p["co"]); ok {
+			p["co"] = co + 1 + rnd.Intn(3)
+		}
+		if pr, ok := numeric(p["pr"]); ok && pr < 100 {
+			p["pr"] = pr + 1
+		}
+		ar.seqPos = pos
+		ar.seqMark = seqMark{bi: pos.Bi, ci: ci, chapters: chapters, rawChapter: chapter}
 	case "rotate":
-		p["b"] = weread.BookPool[rnd.Intn(len(weread.BookPool))]
-		p["c"] = weread.ChapterPool[rnd.Intn(len(weread.ChapterPool))]
+		e.applyRotatePayload(ar, p, rnd)
 	case "custom":
 		if acc.BookID != "" {
-			p["b"] = acc.BookID
+			p["b"] = weread.NormalizePayloadID(acc.BookID)
 		}
 		if acc.ChapterID != "" {
-			p["c"] = acc.ChapterID
+			p["c"] = weread.NormalizePayloadID(acc.ChapterID)
 		}
 		// Simulate page turns so the session looks like real reading.
 		if co, ok := numeric(p["co"]); ok {
@@ -496,13 +887,6 @@ func (e *Engine) buildPayload(template map[string]any, acc *store.Account, tick 
 		}
 		if pr, ok := numeric(p["pr"]); ok && pr < 100 {
 			p["pr"] = pr + 1
-		}
-	default: // stable
-		if acc.BookID != "" {
-			p["b"] = acc.BookID
-		}
-		if acc.ChapterID != "" {
-			p["c"] = acc.ChapterID
 		}
 	}
 	return p
@@ -553,7 +937,7 @@ func modeName(mode string) string {
 	case "custom":
 		return "指定书籍"
 	default:
-		return "稳定模板"
+		return "顺序书单"
 	}
 }
 

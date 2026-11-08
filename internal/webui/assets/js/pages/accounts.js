@@ -9,7 +9,7 @@ import {
   $, $$, escapeHtml, relTime, statusBadge, toast, confirmDialog, fmtMinutes, pageHeaderHTML,
 } from '../util.js';
 
-const MODE_LABEL = { stable: '稳定模板', custom: '指定书籍', rotate: '随机轮换' };
+const MODE_LABEL = { custom: '指定书籍', rotate: '随机轮换', sequence: '顺序书单' };
 
 // 筛选状态：模块级，整页切换离开后天然失效。
 let accFilter = 'all';
@@ -42,7 +42,7 @@ export async function renderAccounts(ctx) {
     })}
 
     <div class="tool-row">
-      <input class="input" id="acc-search" placeholder="搜索序号 / 名称 / 昵称 / 书籍" style="min-width:230px">
+      <input class="input" id="acc-search" placeholder="搜索序号 / 名称 / 昵称" style="min-width:230px">
       <select class="select" id="acc-filter">
         <option value="all">全部状态</option>
         <option value="active">在线</option>
@@ -51,7 +51,7 @@ export async function renderAccounts(ctx) {
       </select>
     </div>
 
-    ${state.accounts.length ? `<div class="accounts-grid" id="accounts-grid"></div>
+    ${state.accounts.length ? `<div class="table-wrap" id="accounts-grid"></div>
       <div class="hint" id="acc-empty" style="display:none;margin-top:10px">没有符合筛选条件的账号。</div>`
       : `<article class="card"><div class="empty" style="padding:64px 24px">
           <div class="empty-ico" style="width:64px;height:64px;border-radius:20px">${icon('qr')}</div>
@@ -81,9 +81,6 @@ export async function renderAccounts(ctx) {
     drawCards(ctx);
   });
 
-  document.addEventListener('click', closeMenus);
-  ctx.onCleanup(() => document.removeEventListener('click', closeMenus));
-
   drawCards(ctx);
 }
 
@@ -106,35 +103,32 @@ function filteredAccounts(running) {
   });
 }
 
-// drawCards charts the filtered grid and (re)wires per-card events.
+// drawCards 重画筛选后的表格（表头 + 居中行）。
 function drawCards(ctx) {
   const { root } = ctx;
   const grid = $('#accounts-grid', root);
   if (!grid) return;
   const running = runningMap();
   const list = filteredAccounts(running);
-  grid.innerHTML = list.map((a) => accountCard(a, running.get(a.id))).join('');
+  grid.innerHTML = `
+    <table class="table acc-table table-wide">
+      <thead><tr>
+        <th style="min-width:260px">账号</th>
+        <th style="min-width:300px">定时 / 心跳 / 模板</th>
+        <th style="width:150px">阅读</th>
+        <th style="min-width:170px">推送渠道</th>
+        <th style="width:300px">管理</th>
+      </tr></thead>
+      <tbody>${list.map((a) => accountCard(a, running.get(a.id))).join('')}</tbody>
+    </table>
+  `;
   const empty = $('#acc-empty', root);
   if (empty) empty.style.display = list.length ? 'none' : '';
   wireCards(ctx, running);
 }
 
-function closeMenus() {
-  $$('.menu.open').forEach((m) => m.classList.remove('open'));
-}
-
 function wireCards(ctx, running) {
   const { root } = ctx;
-
-  $$('[data-menu-btn]', root).forEach((btn) => {
-    btn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      const menu = btn.parentElement.querySelector('.menu');
-      const isOpen = menu.classList.contains('open');
-      closeMenus();
-      if (!isOpen) menu.classList.add('open');
-    });
-  });
 
   $$('[data-start]', root).forEach((btn) => {
     btn.addEventListener('click', () => {
@@ -159,9 +153,24 @@ function wireCards(ctx, running) {
 
   bindStopButtons(root, { onDone: () => ctx.reload() });
 
+  // 推送渠道绑定：下拉即选即存，每个账号可绑定不同渠道。
+  $$('[data-push-channel]', root).forEach((sel) => sel.addEventListener('change', async () => {
+    const id = Number(sel.dataset.pushChannel);
+    const channelId = Number(sel.value) || 0;
+    try {
+      await api.updateAccount(id, { push_channel_id: channelId });
+      toast(channelId ? '已绑定推送渠道' : '已取消推送', 'ok');
+      await refreshAccounts();
+      drawCards(ctx);
+    } catch (e) {
+      toast(e.message, 'error');
+      await refreshAccounts();
+      drawCards(ctx);
+    }
+  }));
+
   $$('[data-action]', root).forEach((item) => {
     item.addEventListener('click', async () => {
-      closeMenus();
       const id = Number(item.dataset.id);
       const action = item.dataset.action;
       const acc = state.accounts.find((a) => a.id === id);
@@ -217,51 +226,66 @@ function wireCards(ctx, running) {
 
 function accountCard(a, active) {
   const pct = active && active.target ? Math.min(100, Math.round((active.elapsed / active.target) * 100)) : 0;
-  return `<article class="account-card" data-account-id="${a.id}">
-    <div class="account-top">
-      <div class="avatar">${avatarHTML(a)}</div>
-      <div style="flex:1;min-width:0">
-        <div class="account-name">${escapeHtml(a.name)} <span class="badge neutral mono" title="本项目生成的账号 ID">#${escapeHtml(a.seq)}</span> ${statusBadge(a.status, !!active)}</div>
-        <div class="account-sub">${escapeHtml(a.nickname && a.nickname !== a.name ? a.nickname : (a.vid ? '微信读书账号' : '未绑定用户信息'))}</div>
-      </div>
-    </div>
-
-    <div class="account-meta">
-      <span class="badge neutral">${icon('timer')}默认 ${escapeHtml(a.default_minutes)} 分钟</span>
-      <span class="badge neutral">${escapeHtml(a.tick_seconds)}s 心跳</span>
-      <span class="badge neutral">${escapeHtml(MODE_LABEL[a.mode] || a.mode)}</span>
-      ${a.has_payload ? '<span class="badge ok">自定义模板</span>' : ''}
-      ${a.book_title ? `<span class="badge neutral">${icon('book')}${escapeHtml(a.book_title)}</span>` : ''}
-    </div>
-
-    ${active ? `<div>
-      <div class="row" style="justify-content:space-between;font-size:11px;color:var(--muted);margin-bottom:6px">
-        <span>本次已读 ${fmtMinutes(active.elapsed)} / ${fmtMinutes(active.target)} 分钟</span><span>${pct}%</span>
-      </div>
-      <div class="bar"><i style="width:${pct}%"></i></div>
-    </div>` : ''}
-
-    <div class="hint">
-      ${a.last_check_at ? `上次检查 ${relTime(a.last_check_at, state.tz)}` : '尚未校验登录状态'}
-      ${a.last_error ? ` · <span style="color:var(--amber)">${escapeHtml(a.last_error)}</span>` : ''}
-    </div>
-
-    <div class="account-actions">
-      ${active
-        ? `<button class="btn btn-sm" data-start="${a.id}">${icon('play')}查看进度</button>
-           <button class="btn btn-sm btn-danger" data-stop="${active.run_id}">${icon('stop')}停止</button>`
-        : `<button class="btn btn-sm btn-primary" data-start="${a.id}">${icon('play')}开始阅读</button>
-           <button class="btn btn-sm btn-ghost" data-edit="${a.id}">${icon('edit')}设置</button>`}
-      <div class="menu-wrap">
-        <button class="btn btn-sm btn-ghost btn-icon" data-menu-btn aria-label="更多">${icon('more')}</button>
-        <div class="menu">
-          <button class="menu-item" data-action="check" data-id="${a.id}">${icon('shield')}检查登录状态</button>
-          <button class="menu-item" data-action="refresh" data-id="${a.id}">${icon('refresh')}刷新登录凭据</button>
-          <button class="menu-item" data-action="edit" data-id="${a.id}">${icon('settings')}编辑设置</button>
-          <div class="menu-sep"></div>
-          <button class="menu-item danger" data-action="delete" data-id="${a.id}">${icon('trash')}删除账号</button>
+  const nickname = a.nickname && a.nickname !== a.name ? `${escapeHtml(a.nickname)} · ` : '';
+  // 检查信息单独一行，与上一行的 #ID、状态徽标同列同左缘。
+  const checkText = a.last_check_at
+    ? `上次检查 ${relTime(a.last_check_at, state.tz)}`
+    : '尚未校验登录状态';
+  return `<tr data-account-id="${a.id}">
+    <td>
+      <div class="acc-info">
+        <div class="avatar">${avatarHTML(a)}</div>
+        <div class="acc-info-text">
+          <div class="account-name">${escapeHtml(a.name)}</div>
+          <div class="acc-idline">
+            <span class="badge neutral mono" title="本项目生成的账号 ID">#${escapeHtml(a.seq)}</span>
+            ${statusBadge(a.status, !!active)}
+          </div>
+          ${active ? `
+            <div class="acc-progress">
+              <div class="row" style="justify-content:space-between;font-size:11px;color:var(--muted);margin-bottom:4px">
+                <span>已读 ${fmtMinutes(active.elapsed)} / ${fmtMinutes(active.target)} 分钟</span><span>${pct}%</span>
+              </div>
+              <div class="bar"><i style="width:${pct}%"></i></div>
+            </div>`
+          : `<div class="hint acc-checkline">
+              ${nickname}${checkText}
+              ${a.last_error ? ` · <span style="color:var(--amber)">${escapeHtml(a.last_error)}</span>` : ''}
+            </div>`}
         </div>
       </div>
-    </div>
-  </article>`;
+    </td>
+    <td>
+      <div class="acc-badges">
+        <span class="badge neutral">${icon('timer')}默认 ${escapeHtml(a.default_minutes)} 分钟</span>
+        <span class="badge neutral">${escapeHtml(a.tick_seconds)}s 心跳</span>
+        <span class="badge neutral">${escapeHtml(MODE_LABEL[a.mode] || a.mode)}</span>
+        ${a.has_payload ? '<span class="badge ok">自定义模板</span>' : ''}
+        ${a.book_title ? `<span class="badge neutral">${icon('book')}${escapeHtml(a.book_title)}</span>` : ''}
+      </div>
+    </td>
+    <td>
+      <div class="acc-cta">
+        ${active
+          ? `<button class="btn" data-start="${a.id}">${icon('play')}进度</button>
+             <button class="btn btn-danger" data-stop="${active.run_id}">${icon('stop')}停止</button>`
+          : `<button class="btn btn-primary" data-start="${a.id}">${icon('play')}开始阅读</button>`}
+      </div>
+    </td>
+    <td>
+      <select class="select" data-push-channel="${a.id}" aria-label="推送渠道"
+        style="min-width:150px" title="阅读完成后的推送渠道（完成后通知）">
+        <option value="0" ${!a.push_channel_id ? 'selected' : ''}>不推送</option>
+        ${state.channels.map((c) => `<option value="${c.id}" ${a.push_channel_id === c.id ? 'selected' : ''}>${escapeHtml(c.name)}</option>`).join('')}
+      </select>
+    </td>
+    <td>
+      <div class="acc-ops">
+        <button class="btn btn-sm btn-ghost" data-action="check" data-id="${a.id}" title="检查登录状态">${icon('shield')}检查</button>
+        <button class="btn btn-sm btn-ghost" data-action="refresh" data-id="${a.id}" title="刷新登录凭据">${icon('refresh')}刷新</button>
+        <button class="btn btn-sm btn-ghost" data-action="edit" data-id="${a.id}" title="编辑设置">${icon('edit')}设置</button>
+        <button class="btn btn-sm btn-ghost btn-icon" data-action="delete" data-id="${a.id}" title="删除账号" style="color:var(--red)">${icon('trash')}</button>
+      </div>
+    </td>
+  </tr>`;
 }

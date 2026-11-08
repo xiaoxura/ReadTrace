@@ -155,7 +155,9 @@ func (s *Server) handleAccountImport(w http.ResponseWriter, r *http.Request) {
 	id, err := s.st.CreateAccount(store.Account{
 		Name: name, Vid: vid, Nickname: nickname, Avatar: avatar,
 		Status: status, LastError: validateErrString(validateErr), LastCheckAt: time.Now().Unix(),
-		DefaultMinutes: 30, TickSeconds: 30, Mode: "stable",
+		DefaultMinutes: 30, TickSeconds: 30, Mode: "sequence",
+		// 新账号默认：阅读失败自动重试 5 次，间隔 30 秒。
+		MaxRetries: 5, RetryDelay: 30,
 	}, map[string]string(ck), payload)
 	if err != nil {
 		s.writeErr(w, http.StatusInternalServerError, "创建账号失败："+err.Error())
@@ -249,10 +251,10 @@ func (s *Server) handleAccountUpdate(w http.ResponseWriter, r *http.Request) {
 	if body.Mode != nil {
 		mode := strings.ToLower(strings.TrimSpace(*body.Mode))
 		switch mode {
-		case "stable", "rotate", "custom":
+		case "sequence", "rotate", "custom":
 			acc.Mode = mode
 		default:
-			s.writeErr(w, http.StatusBadRequest, "模式只能是 stable / rotate / custom")
+			s.writeErr(w, http.StatusBadRequest, "模式只能是 sequence / rotate / custom")
 			return
 		}
 	}

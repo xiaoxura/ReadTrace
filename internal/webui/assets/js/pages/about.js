@@ -60,7 +60,7 @@ export async function renderAbout(ctx) {
                 <div class="stack-text"><b>${name}</b><span>${desc}</span></div>
               </div>`).join('')}
           </div>
-          <div class="kv" style="margin-top:10px"><span>开源协议</span><b><a href="${REPO_URL}/blob/main/LICENSE" target="_blank" rel="noopener">MIT</a></b></div>
+          <div class="kv" style="margin-top:10px"><span>开源协议</span><b><a href="${REPO_URL}/blob/main/LICENSE" target="_blank" rel="noopener">AGPL-3.0</a></b></div>
         </article>
       </div>
     </div>

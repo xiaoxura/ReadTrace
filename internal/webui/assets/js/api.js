@@ -61,6 +61,21 @@ export const api = {
   bookDetail: (accountId, bookId) =>
     request(`/api/books/${encodeURIComponent(bookId)}?account_id=${accountId}`),
 
+  pool: (accountId = 0) => request(`/api/pool?account_id=${accountId}`),
+  poolBookChapters: (bookId, { refresh = false, account_id = 0 } = {}) =>
+    request(`/api/pool/book/${encodeURIComponent(bookId)}/chapters?account_id=${account_id}${refresh ? '&refresh=1' : ''}`),
+  poolBookPrune: (bookId, account_id = 0) =>
+    request(`/api/pool/book/${encodeURIComponent(bookId)}/prune?account_id=${account_id}`, { method: 'POST', body: {} }),
+  poolAdd: (kind, value, title = '', accountId = 0) => request('/api/pool/add', { method: 'POST', body: { kind, value, title, account_id: accountId } }),
+  poolImport: (kind, text, accountId = 0) => request('/api/pool/import', { method: 'POST', body: { kind, text, account_id: accountId } }),
+  poolUpdate: (id, patch) => request(`/api/pool/items/${id}`, { method: 'PATCH', body: patch }),
+  poolMove: (id, direction) => request(`/api/pool/items/${id}/move`, { method: 'POST', body: { direction } }),
+  poolDelete: (id) => request(`/api/pool/items/${id}`, { method: 'DELETE' }),
+  poolReset: (kind, accountId = 0) => request('/api/pool/reset', { method: 'POST', body: { kind, account_id: accountId } }),
+  poolTemplate: (template) => request('/api/pool/template', { method: 'PUT', body: { template } }),
+  poolShelf: (accountId = 0) => request(`/api/pool/shelf?account_id=${accountId}`),
+  poolShelfImport: (payload) => request('/api/pool/shelf/import', { method: 'POST', body: payload }),
+
   startRun: (accountId, minutes) => request('/api/runs', { method: 'POST', body: { account_id: accountId, minutes } }),
   stopRun: (id) => request(`/api/runs/${id}/stop`, { method: 'POST', body: {} }),
   runs: (accountId = 0, limit = 100) =>

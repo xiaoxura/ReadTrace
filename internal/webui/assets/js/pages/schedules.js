@@ -35,7 +35,16 @@ export async function renderSchedules(ctx) {
     })}
 
     <article class="card">
-      ${list.length ? `<div class="list" style="gap:0">${list.map((s) => scheduleRow(s)).join('')}</div>` : `
+      ${list.length ? `<div class="table-wrap"><table class="table sch-table table-wide">
+        <thead><tr>
+          <th style="min-width:200px">计划</th>
+          <th style="min-width:240px">表达式 / 时长</th>
+          <th style="width:170px">下次执行</th>
+          <th style="width:130px">状态</th>
+          <th style="width:120px">操作</th>
+        </tr></thead>
+        <tbody>${list.map((s) => scheduleRow(s)).join('')}</tbody>
+      </table></div>` : `
         <div class="empty" style="padding:54px 20px">
           <div class="empty-ico" style="width:60px;height:60px;border-radius:18px">${icon('calendar')}</div>
           <h3>还没有定时任务</h3>
@@ -94,27 +103,35 @@ export async function renderSchedules(ctx) {
 
 function scheduleRow(s) {
   const hasNext = !!(s.enabled && s.next_run_at);
-  return `<div class="schedule-row">
-    <div class="schedule-icon ${s.enabled ? 'on' : ''}">${icon('clock')}</div>
-    <div class="schedule-main">
-      <div class="schedule-title">
-        ${escapeHtml(humanCron(s.cron))}
-        <span class="badge neutral">${escapeHtml(s.account_name || '账号')}</span>
-        ${s.enabled ? '<span class="badge ok">已启用</span>' : '<span class="badge neutral">已暂停</span>'}
+  return `<tr>
+    <td>
+      <div style="display:inline-flex;align-items:center;gap:9px">
+        <div class="schedule-icon ${s.enabled ? 'on' : ''}" style="width:34px;height:34px">${icon('clock')}</div>
+        <div style="min-width:0;text-align:left">
+          <div class="cell-strong">${escapeHtml(humanCron(s.cron))}</div>
+          <div class="cell-muted">${escapeHtml(s.account_name || '账号')}</div>
+        </div>
       </div>
-      <div class="schedule-meta">
-        <span class="mono">${escapeHtml(s.cron)}</span> · ${s.minutes} 分钟
-        · 上次运行 ${s.last_run_at ? relTime(s.last_run_at, state.tz) : '尚未运行'}
+    </td>
+    <td>
+      <div class="mono" style="font-size:12px">${escapeHtml(s.cron)}</div>
+      <div class="cell-muted">${s.minutes} 分钟 · 上次运行 ${s.last_run_at ? relTime(s.last_run_at, state.tz) : '尚未运行'}</div>
+    </td>
+    <td>
+      <b${hasNext ? ` data-countdown="${s.next_run_at}"` : ''} style="font-size:12.5px">${hasNext ? relativeSeconds(s.next_run_at, state.tz) : '—'}</b>
+      <div class="cell-muted">${hasNext ? fmtClock(s.next_run_at, state.tz) : '已暂停'}</div>
+    </td>
+    <td>
+      ${s.enabled ? '<span class="badge ok">已启用</span>' : '<span class="badge neutral">已暂停</span>'}
+      <label class="switch" title="${s.enabled ? '暂停任务' : '启用任务'}" style="margin-left:auto;margin-right:auto;display:block;margin-top:6px">
+        <input type="checkbox" data-toggle="${s.id}" ${s.enabled ? 'checked' : ''} aria-label="${s.enabled ? '暂停任务' : '启用任务'}"><i></i>
+      </label>
+    </td>
+    <td>
+      <div style="display:flex;gap:7px;justify-content:center">
+        <button class="btn btn-sm btn-ghost btn-icon" data-edit="${s.id}" title="编辑" aria-label="编辑任务">${icon('edit')}</button>
+        <button class="btn btn-sm btn-ghost btn-icon" data-del="${s.id}" title="删除" aria-label="删除任务">${icon('trash')}</button>
       </div>
-    </div>
-    <div class="schedule-next">
-      <b${hasNext ? ` data-countdown="${s.next_run_at}"` : ''}>${hasNext ? relativeSeconds(s.next_run_at, state.tz) : '—'}</b>
-      <span>${hasNext ? fmtClock(s.next_run_at, state.tz) : '已暂停'}</span>
-    </div>
-    <label class="switch" title="${s.enabled ? '暂停' : '启用'}">
-      <input type="checkbox" data-toggle="${s.id}" ${s.enabled ? 'checked' : ''} aria-label="${s.enabled ? '暂停任务' : '启用任务'}"><i></i>
-    </label>
-    <button class="btn btn-sm btn-ghost btn-icon" data-edit="${s.id}" title="编辑" aria-label="编辑任务">${icon('edit')}</button>
-    <button class="btn btn-sm btn-ghost btn-icon" data-del="${s.id}" title="删除" aria-label="删除任务">${icon('trash')}</button>
-  </div>`;
+    </td>
+  </tr>`;
 }

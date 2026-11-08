@@ -3,11 +3,12 @@ import { state, refreshAccounts, refreshChannels } from './state.js';
 import { icon } from './icons.js';
 import { redrawCharts } from './charts.js';
 import {
-  $, $$, escapeHtml, toast, applyTheme, setLoading, openModal,
+  $, $$, escapeHtml, toast, applyTheme, setLoading,
 } from './util.js';
 import { renderDashboard } from './pages/dashboard.js';
 import { renderAccounts } from './pages/accounts.js';
 import { renderRuns } from './pages/runs.js';
+import { renderPool } from './pages/pool.js';
 import { renderSchedules } from './pages/schedules.js';
 import { renderPush } from './pages/push.js';
 import { renderSettings } from './pages/settings.js';
@@ -17,6 +18,7 @@ const PAGES = {
   dashboard: renderDashboard,
   accounts: renderAccounts,
   runs: renderRuns,
+  pool: renderPool,
   schedules: renderSchedules,
   push: renderPush,
   settings: renderSettings,
@@ -27,16 +29,16 @@ const NAV = [
   { key: 'dashboard', label: '总览', icon: 'home' },
   { key: 'accounts', label: '账号', icon: 'users' },
   { key: 'runs', label: '记录', icon: 'list' },
+  { key: 'pool', label: '书池', icon: 'book' },
   { key: 'schedules', label: '定时', icon: 'calendar' },
   { key: 'push', label: '推送', icon: 'bell' },
   { key: 'settings', label: '设置', icon: 'settings' },
   { key: 'about', label: '关于', icon: 'info' },
 ];
 
-// 移动端底部只放最常用的 5 个入口，其余收进「更多」，避免 7 项挤在 390px 里。
-const MOBILE_PRIMARY = ['dashboard', 'accounts', 'runs', 'schedules', 'push'];
+// 移动端入口更多了，「更多」弹层已移除：底部导航横向滚动展示全部页面。
 const PAGE_TITLES = {
-  dashboard: '总览', accounts: '账号', runs: '记录', schedules: '定时',
+  dashboard: '总览', accounts: '账号', runs: '记录', pool: '书池', schedules: '定时',
   push: '推送', settings: '设置', about: '关于',
 };
 
@@ -64,9 +66,6 @@ function setActiveNav(key) {
     el.classList.toggle('active', active);
     if (active) el.setAttribute('aria-current', 'page');
     else el.removeAttribute('aria-current');
-  });
-  $$('[data-more]').forEach((el) => {
-    el.classList.toggle('active', !MOBILE_PRIMARY.includes(key));
   });
 }
 
@@ -132,10 +131,8 @@ function shellHTML(me) {
       ${n.key === 'accounts' ? '<span class="nav-count" data-count="accounts"></span>' : ''}
     </a>`).join('');
 
-  const mobileHTML = NAV
-    .filter((n) => MOBILE_PRIMARY.includes(n.key))
-    .map((n) => `<a href="#/${n.key}" data-nav="${n.key}">${icon(n.icon)}<span>${n.label}</span></a>`)
-    .join('');
+  const mobileHTML = NAV.map((n) =>
+    `<a href="#/${n.key}" data-nav="${n.key}">${icon(n.icon)}<span>${n.label}</span></a>`).join('');
 
   return `<div class="app-shell">
     <aside class="sidebar">
@@ -159,7 +156,6 @@ function shellHTML(me) {
     <main class="main"><div class="page-inner"><div id="page"></div></div></main>
     <nav class="mobile-nav">
       ${mobileHTML}
-      <button class="mobile-more" type="button" data-more id="btn-more" aria-label="更多入口">${icon('more')}<span>更多</span></button>
     </nav>
   </div>`;
 }
@@ -186,25 +182,6 @@ function renderShell(me) {
     try { await api.logout(); } catch { /* ignore */ }
     location.reload();
   });
-
-  $('#btn-more')?.addEventListener('click', openMoreSheet);
-}
-
-function openMoreSheet() {
-  const links = NAV.filter((n) => !MOBILE_PRIMARY.includes(n.key));
-  const desc = { push: '推送渠道、模板与测试', settings: '站点、安全与运行信息', about: '项目地址与技术栈' };
-  const { mask, close } = openModal({
-    title: '更多',
-    subtitle: '推送、设置与项目信息',
-    narrow: true,
-    body: `<div class="more-list">
-      ${links.map((n) => `<a class="more-item" href="#/${n.key}" data-more-link>
-        ${icon(n.icon)}
-        <span class="more-text"><b>${n.label}</b><span>${desc[n.key] || ''}</span></span>
-      </a>`).join('')}
-    </div>`,
-  });
-  $$('[data-more-link]', mask).forEach((a) => a.addEventListener('click', () => close()));
 }
 
 function teardownEvents() {

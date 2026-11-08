@@ -97,6 +97,20 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/books/search", s.auth(s.handleBookSearch))
 	mux.HandleFunc("GET /api/books/{id}", s.auth(s.handleBookDetail))
 
+	// 阅读书池/章节池与账号指纹模板管理。
+	mux.HandleFunc("GET /api/pool", s.auth(s.handlePoolGet))
+	mux.HandleFunc("GET /api/pool/book/{value}/chapters", s.auth(s.handlePoolBookChapters))
+	mux.HandleFunc("POST /api/pool/book/{value}/prune", s.auth(s.handlePoolBookPrune))
+	mux.HandleFunc("POST /api/pool/add", s.auth(s.handlePoolAdd))
+	mux.HandleFunc("POST /api/pool/import", s.auth(s.handlePoolImport))
+	mux.HandleFunc("GET /api/pool/shelf", s.auth(s.handlePoolShelf))
+	mux.HandleFunc("POST /api/pool/shelf/import", s.auth(s.handlePoolShelfImport))
+	mux.HandleFunc("PATCH /api/pool/items/{id}", s.auth(s.handlePoolUpdate))
+	mux.HandleFunc("POST /api/pool/items/{id}/move", s.auth(s.handlePoolMove))
+	mux.HandleFunc("DELETE /api/pool/items/{id}", s.auth(s.handlePoolDelete))
+	mux.HandleFunc("POST /api/pool/reset", s.auth(s.handlePoolReset))
+	mux.HandleFunc("PUT /api/pool/template", s.auth(s.handlePoolTemplate))
+
 	mux.HandleFunc("POST /api/runs", s.auth(s.handleRunStart))
 	mux.HandleFunc("GET /api/runs", s.auth(s.handleRunList))
 	mux.HandleFunc("GET /api/runs/{id}", s.auth(s.handleRunGet))

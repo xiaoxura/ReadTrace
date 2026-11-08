@@ -68,13 +68,13 @@ func (s *Store) CreateAccount(a Account, cookies map[string]string, payload map[
 		a.TickSeconds = 30
 	}
 	if a.RetryDelay <= 0 {
-		a.RetryDelay = 15
+		a.RetryDelay = 30
 	}
-	if a.MaxRetries < 0 {
-		a.MaxRetries = 0
+	if a.MaxRetries <= 0 {
+		a.MaxRetries = 5
 	}
 	if a.Mode == "" {
-		a.Mode = "stable"
+		a.Mode = "sequence"
 	}
 	ck, err := s.sealJSON(cookies)
 	if err != nil {

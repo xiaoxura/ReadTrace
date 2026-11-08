@@ -141,9 +141,9 @@ func TestAccountSeqStartsAtZeroAndIncrements(t *testing.T) {
 	if acc.Seq != 3 {
 		t.Fatalf("seq after delete = %d, want 3", acc.Seq)
 	}
-	// 重试配置默认值。
-	if acc.RetryDelay != 15 || acc.MaxRetries != 0 {
-		t.Fatalf("retry defaults = (%d,%d), want (0,15)", acc.MaxRetries, acc.RetryDelay)
+	// 重试配置默认值：新账号默认自动重试 5 次、间隔 30 秒。
+	if acc.RetryDelay != 30 || acc.MaxRetries != 5 {
+		t.Fatalf("retry defaults = (%d,%d), want (5,30)", acc.MaxRetries, acc.RetryDelay)
 	}
 }
 

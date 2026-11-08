@@ -13,8 +13,8 @@ type Account struct {
 	LastCheckAt    int64  `json:"last_check_at"`
 	DefaultMinutes int    `json:"default_minutes"`
 	TickSeconds    int    `json:"tick_seconds"`
-	MaxRetries     int    `json:"max_retries"`  // 阅读失败自动重试次数，0 表示不重试
-	RetryDelay     int    `json:"retry_delay"`  // 重试间隔，秒
+	MaxRetries     int    `json:"max_retries"` // 阅读失败自动重试次数，0 表示不重试
+	RetryDelay     int    `json:"retry_delay"` // 重试间隔，秒
 	BookID         string `json:"book_id"`
 	BookTitle      string `json:"book_title"`
 	ChapterID      string `json:"chapter_id"`

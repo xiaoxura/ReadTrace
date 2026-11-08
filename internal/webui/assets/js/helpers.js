@@ -36,7 +36,9 @@ export function runStatusBadge(status, runningLabel = '进行中') {
 
 export function runRowHTML(r, { endTime = false } = {}) {
   const pct = r.plan_seconds ? Math.min(100, Math.round((r.elapsed_seconds / r.plan_seconds) * 100)) : 0;
-  return `<tr class="clickable" data-run="${r.id}" tabindex="0" role="button" aria-label="查看运行 #${r.id}">
+  // 失败原因只呈现在运行详情的日志里（引擎结束前会先落一条 error 日志），
+  // 列表里只保留状态徽标。
+  return `<tr class="clickable" data-run="${r.id}" data-run-group="${r.id}" data-status="${escapeHtml(r.status)}" data-trigger="${escapeHtml(r.trigger)}" tabindex="0" role="button" aria-label="查看运行 #${r.id}">
     <td>${runStatusBadge(r.status)}</td>
     <td class="cell-strong">${escapeHtml(r.account_name || '')}</td>
     <td>${r.trigger === 'schedule' ? '<span class="badge neutral">定时</span>' : '<span class="badge neutral">手动</span>'}</td>
@@ -107,4 +109,39 @@ export function bindRunStateRefresh(ctx) {
   return (ev) => {
     if (ev.type === 'run.start' || ev.type === 'run.end') reload();
   };
+}
+
+/* ---------- 客户端分页 ---------- */
+
+export const PAGE_SIZES = [10, 20, 50, 100];
+
+export function pageSlice(items, page, pageSize) {
+  const start = (Math.max(1, page) - 1) * pageSize;
+  return items.slice(start, start + pageSize);
+}
+
+// pagerHTML 底部工具条：总数 + 每页条数选择 + 上/下页。翻页事件用 bindPager 绑定。
+export function pagerHTML(total, page, pageSize) {
+  const pages = Math.max(1, Math.ceil(total / pageSize));
+  const safePage = Math.min(Math.max(1, page), pages);
+  return `
+    <div class="table-pager" data-pager>
+      <span class="hint">共 ${total} 条</span>
+      <span class="table-pager-gap"></span>
+      <span class="hint">第 ${safePage} / ${pages} 页</span>
+      <select class="select pager-size" style="width:auto;min-width:110px" aria-label="每页条数">
+        ${PAGE_SIZES.map((sz) => `<option value="${sz}" ${sz === pageSize ? 'selected' : ''}>${sz} 条 / 页</option>`).join('')}
+      </select>
+      <button class="btn btn-sm btn-ghost" data-pager-prev ${safePage <= 1 ? 'disabled' : ''}>上一页</button>
+      <button class="btn btn-sm btn-ghost" data-pager-next ${safePage >= pages ? 'disabled' : ''}>下一页</button>
+    </div>
+  `;
+}
+
+export function bindPager(host, { onPage, onSize } = {}) {
+  const pager = $('[data-pager]', host);
+  if (!pager) return;
+  $('[data-pager-prev]', pager)?.addEventListener('click', () => onPage?.(-1));
+  $('[data-pager-next]', pager)?.addEventListener('click', () => onPage?.(1));
+  $('.pager-size', pager)?.addEventListener('change', (e) => onSize?.(Number(e.target.value)));
 }

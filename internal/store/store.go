@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -104,6 +105,26 @@ CREATE TABLE IF NOT EXISTS push_channels (
 	created_at    INTEGER NOT NULL
 );
 
+-- 随机轮换用的书池与章节池（多账号：account_id=0 表示全账号共享，
+-- account_id=N 表示该账号专属）。pool_items 只保存用户条目，内置 12 本书/
+-- 16 章节 16 作为引擎兜底由 weread 包级常量承担。
+-- sort_order：书籍在书池中的显示与「顺序书单」阅读顺序（0 = 按 id 兜底）。
+CREATE TABLE IF NOT EXISTS pool_items (
+	id          INTEGER PRIMARY KEY AUTOINCREMENT,
+	kind        TEXT NOT NULL CHECK (kind IN ('book','chapter')),
+	value       TEXT NOT NULL,
+	title       TEXT NOT NULL DEFAULT '',
+	author      TEXT NOT NULL DEFAULT '',
+	cover       TEXT NOT NULL DEFAULT '',
+	book_id     TEXT NOT NULL DEFAULT '',
+	account_id  INTEGER NOT NULL DEFAULT 0,
+	enabled     INTEGER NOT NULL DEFAULT 1,
+	sort_order  INTEGER NOT NULL DEFAULT 0,
+	word_count  INTEGER NOT NULL DEFAULT 0,
+	created_at  INTEGER NOT NULL,
+	UNIQUE(kind, value, account_id)
+);
+
 -- 微信机器人渠道已移除：旧库中的遗留表在此清理。
 DROP TABLE IF EXISTS bot_logins;
 DROP TABLE IF EXISTS bot_users;
@@ -140,7 +161,8 @@ func Open(dbPath string, box *secure.Box) (*Store, error) {
 		return nil, fmt.Errorf("初始化数据库失败: %w", err)
 	}
 	migrate(db)
-	return &Store{db: db, box: box}, nil
+	s := &Store{db: db, box: box}
+	return s, nil
 }
 
 // migrate adjusts databases created by older versions in place. Each ALTER
@@ -161,10 +183,86 @@ func migrate(db *sql.DB) {
 	if _, err := db.Exec(`ALTER TABLE accounts ADD COLUMN seq INTEGER NOT NULL DEFAULT -1`); err == nil {
 		_, _ = db.Exec(`UPDATE accounts SET seq = CAST(id - 1 AS INTEGER)`)
 	}
+	// 稳定模板模式已移除：旧账号统一归入顺序书单。
+	_, _ = db.Exec(`UPDATE accounts SET mode = 'sequence' WHERE mode = 'stable' OR mode = ''`)
 	// 每个推送渠道可自定义各事件类型的消息模板。
 	if _, err := db.Exec(`ALTER TABLE push_channels ADD COLUMN templates_enc BLOB`); err != nil {
 		_ = err
 	}
+	// 书池的展示元数据与章节归属：kind=book 行存 author/cover；kind=chapter
+	// 行存 book_id 指向所属书籍的 value，供「点进书籍看章节」与按书抽取。
+	for _, col := range []string{
+		`ALTER TABLE pool_items ADD COLUMN author TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE pool_items ADD COLUMN cover TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE pool_items ADD COLUMN book_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE pool_items ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE pool_items ADD COLUMN word_count INTEGER NOT NULL DEFAULT 0`,
+	} {
+		if _, err := db.Exec(col); err != nil {
+			_ = err
+		}
+	}
+	// 内置 12 本书/16 章节已彻底移除：书池不再由程序播种，这里不再有兜底
+	// 常量需要清理。
+	// "mpbook" 是微信读书的「文章收藏」合集虚拟书，没法按书阅读，迁移时清理。
+	_, _ = db.Exec(`DELETE FROM pool_items WHERE value = 'mpbook'`)
+	_, _ = db.Exec(`DELETE FROM settings WHERE key = 'pool_seeded_v1'`)
+	// 书池多账号化：account_id（0=共享）。老库还有 UNIQUE(kind, value) 约束，
+	// 同一本书无法在不同账号各有一条，需要重建表改唯一键。
+	if _, err := db.Exec(`ALTER TABLE pool_items ADD COLUMN account_id INTEGER NOT NULL DEFAULT 0`); err != nil {
+		_ = err
+	}
+	rebuildPoolUniqueKey(db)
+	// 共享池已移除：account_id=0 的历史条目归属到第一个已绑定账号。
+	_, _ = db.Exec(`UPDATE pool_items SET account_id = (SELECT MIN(id) FROM accounts)
+		WHERE account_id = 0 AND EXISTS (SELECT 1 FROM accounts)`)
+}
+
+// rebuildPoolUniqueKey 把 pool_items 的 UNIQUE(kind, value) 升级为
+// UNION(kind, value, account_id)。通过检查旧表 DDL 判断是否已经迁移过，
+// 避免每次重启都要重建表。
+func rebuildPoolUniqueKey(db *sql.DB) {
+	var ddl string
+	if err := db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='pool_items'`).Scan(&ddl); err != nil {
+		return
+	}
+	if strings.Contains(strings.ToLower(ddl), "account_id") {
+		return // 已经是多账号版本
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return
+	}
+	defer func() { _ = tx.Rollback() }()
+	steps := []string{
+		`CREATE TABLE pool_items_new (
+			id          INTEGER PRIMARY KEY AUTOINCREMENT,
+			kind        TEXT NOT NULL CHECK (kind IN ('book','chapter')),
+			value       TEXT NOT NULL,
+			title       TEXT NOT NULL DEFAULT '',
+			author      TEXT NOT NULL DEFAULT '',
+			cover       TEXT NOT NULL DEFAULT '',
+			book_id     TEXT NOT NULL DEFAULT '',
+			account_id  INTEGER NOT NULL DEFAULT 0,
+			enabled     INTEGER NOT NULL DEFAULT 1,
+			sort_order  INTEGER NOT NULL DEFAULT 0,
+			word_count  INTEGER NOT NULL DEFAULT 0,
+			created_at  INTEGER NOT NULL,
+			UNIQUE(kind, value, account_id)
+		)`,
+		`INSERT OR IGNORE INTO pool_items_new
+			(id, kind, value, title, author, cover, book_id, account_id, enabled, sort_order, word_count, created_at)
+		 SELECT id, kind, value, title, author, cover, book_id, COALESCE(account_id, 0), enabled, 0, 0, created_at
+		 FROM pool_items`,
+		`DROP TABLE pool_items`,
+		`ALTER TABLE pool_items_new RENAME TO pool_items`,
+	}
+	for _, stmt := range steps {
+		if _, err := tx.Exec(stmt); err != nil {
+			return
+		}
+	}
+	_ = tx.Commit()
 }
 
 // Close closes the database.

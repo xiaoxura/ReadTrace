@@ -343,13 +343,9 @@ export function importAccountDialog({ onDone } = {}) {
 }
 
 export function editAccountDialog(acc, { onDone } = {}) {
-  let book = {
-    id: acc.book_id || '',
-    title: acc.book_title || '',
-    chapterId: acc.chapter_id || '',
-    chapterTitle: acc.chapter_title || '',
-  };
-  let chapters = [];
+  // 指定书籍直接从该账号的书池里选；不再联网搜索（书池由「书池 · 书籍导入」维护）。
+  let book = { id: acc.book_id || '', title: acc.book_title || '' };
+  let poolBooks = null; // 该账号视角的启用书籍，加载后缓存
 
   const channelOptions = state.channels.map((c) =>
     `<option value="${c.id}" ${acc.push_channel_id === c.id ? 'selected' : ''}>${escapeHtml(c.name)}</option>`).join('');
@@ -380,11 +376,12 @@ export function editAccountDialog(acc, { onDone } = {}) {
         <div class="field">
           <label class="label" for="acc-mode">阅读模式</label>
           <select class="select" id="acc-mode" data-mode>
-            <option value="stable" ${acc.mode === 'stable' ? 'selected' : ''}>稳定模板（推荐）</option>
-            <option value="custom" ${acc.mode === 'custom' ? 'selected' : ''}>指定书籍 + 进度推进</option>
+            <option value="sequence" ${!acc.mode || acc.mode === 'sequence' ? 'selected' : ''}>顺序书单（推荐）</option>
             <option value="rotate" ${acc.mode === 'rotate' ? 'selected' : ''}>随机轮换书籍</option>
+            <option value="custom" ${acc.mode === 'custom' ? 'selected' : ''}>指定书籍 + 进度推进</option>
           </select>
-          <div class="hint">稳定模板沿用抓包请求，成功率最高。</div>
+          <div class="hint">推荐顺序书单：按书池顺序逐本读完自动循环。</div>
+          <div class="hint">顺序书单按书池顺序逐章推进，随机轮换按池抽取；模板只提供指纹基底。</div>
         </div>
       </div>
       <div class="grid-2">
@@ -404,15 +401,8 @@ export function editAccountDialog(acc, { onDone } = {}) {
         </div>
       </div>
 
-      <div class="section-title">书籍与章节</div>
-      <div data-book-box>
-        <div class="row" style="gap:8px">
-          <input class="input grow" id="acc-book-q" data-book-q placeholder="搜索书名、作者，例如：三体" aria-label="搜索书籍">
-          <button class="btn btn-sm" data-book-search>${icon('search')}搜索</button>
-        </div>
-        <div data-book-results style="margin-top:10px"></div>
-        <div data-book-current style="margin-top:10px"></div>
-      </div>
+      <div class="section-title">阅读内容</div>
+      <div data-mode-extra></div>
 
       <div class="section-title">推送通知</div>
       <div class="field">
@@ -422,17 +412,6 @@ export function editAccountDialog(acc, { onDone } = {}) {
           ${channelOptions}
         </select>
         <div class="hint">可在「推送」页面添加 PushPlus / WxPusher / Telegram / ServerChan。</div>
-      </div>
-
-      <div class="section-title">高级：请求模板</div>
-      <div class="note" style="margin-bottom:12px">${icon('info')}<div>模板来自浏览器真实阅读请求，包含书籍、章节与设备标识。为空时使用内置稳定模板。</div></div>
-      <div class="field">
-        <textarea class="textarea" id="acc-payload" data-payload placeholder="粘贴 read 请求的 curl 或 JSON 请求体（可选）" aria-label="请求模板"></textarea>
-      </div>
-      <div class="row">
-        <button class="btn btn-sm" data-save-payload>保存模板</button>
-        <button class="btn btn-sm btn-ghost" data-clear-payload>清除模板</button>
-        <span class="hint" data-payload-state>${acc.has_payload ? '当前已有自定义模板' : '当前使用内置模板'}</span>
       </div>`,
     footer: `<button class="btn btn-danger" data-delete>${icon('trash')}删除账号</button>
       <span style="flex:1"></span>
@@ -440,144 +419,99 @@ export function editAccountDialog(acc, { onDone } = {}) {
       <button class="btn btn-primary" data-save>${icon('check')}保存</button>`,
   });
 
-  const renderCurrent = () => {
-    const box = $('[data-book-current]', mask);
-    if (!book.id) {
-      box.innerHTML = '';
-      return;
-    }
-    box.innerHTML = `
-      <div class="note" style="align-items:center">
-        ${icon('book')}
-        <div style="flex:1">
-          <b>${escapeHtml(book.title || book.id)}</b>
-          <div class="hint">${book.chapterTitle ? escapeHtml(book.chapterTitle) : '未指定章节，沿用模板章节'}</div>
+  const modeSel = $('[data-mode]', mask);
+  const modeExtra = $('[data-mode-extra]', mask);
+
+  const renderModeExtra = () => {
+    const mode = modeSel.value;
+    const MODE_HINTS = {
+      custom: '模板只提供设备指纹与会话标识；每次读的书由上面所选书籍决定。',
+      rotate: '模板只提供设备指纹与会话标识；书/章节每次心跳从书池随机抽取。',
+      sequence: '模板只提供设备指纹与会话标识；书/章节按书池顺序逐个推进。',
+    };
+    // 请求模板 = 账号的设备指纹底盘，所有模式都会使用（b/c 按模式覆盖）。
+    const tplSection = `
+      <div class="field">
+        <label class="label">请求模板 ${acc.has_payload ? '<span class="opt">已保存</span>' : '<span class="opt">可选 · 所有模式共用</span>'}</label>
+        <textarea class="textarea" id="acc-payload" data-payload placeholder="粘贴 read 请求的 curl 或 JSON 请求体" aria-label="请求模板"></textarea>
+        <div class="hint">获取方法：浏览器打开 weread.qq.com 阅读任意一本书 → F12 → Network → 找到名为 <code>read</code> 的请求（每 30 秒一条）→ 右键 → 「Copy as cURL (bash)」→ 粘贴到这里。签名 s/sg 自动重算，不用手写。</div>
+        <div class="row" style="margin-top:8px">
+          <button class="btn btn-sm" data-save-payload>${icon('check')}保存模板</button>
+          ${acc.has_payload ? `<button class="btn btn-sm btn-ghost" data-clear-payload>清除（回到全局指纹模板）</button>` : ''}
+          <span class="hint" data-payload-state>${acc.has_payload ? '当前使用该账号的专属指纹模板' : '当前使用全局指纹模板（设置页）'}</span>
         </div>
-        <button class="btn btn-sm btn-ghost" data-clear-book>移除</button>
       </div>`;
-    $('[data-clear-book]', box)?.addEventListener('click', () => {
-      book = { id: '', title: '', chapterId: '', chapterTitle: '' };
-      renderCurrent();
+    modeExtra.innerHTML = `
+      ${mode === 'custom' ? customSelectHTML() : ''}
+      ${mode !== 'custom' ? `<div class="note" style="margin-bottom:10px">${icon('info')}<div>${mode === 'rotate'
+        ? '随机轮换：每次心跳从书池导入的书籍与章节中随机抽取。'
+        : '顺序书单：按书池列表的顺序逐本阅读（读完循环）。'}</div></div>` : ''}
+      ${tplSection}
+    `;
+    bindTplWiring();
+  };
+  const customSelectHTML = () => {
+    const list = (poolBooks || []).slice();
+    if (book.id && !list.some((b) => b.value === book.id)) {
+      list.unshift({ value: book.id, title: book.title });
+    }
+    return `
+      <div class="field">
+        <label class="label" for="acc-pool-book">指定书籍 ${poolBooks ? '' : '<span class="opt">书池加载中…</span>'}</label>
+        <select class="select" id="acc-pool-book" data-pool-book>
+          <option value="">（未指定 · 沿用模板章节）</option>
+          ${list.map((b) => `<option value="${escapeHtml(b.value)}" ${b.value === book.id ? 'selected' : ''}>${escapeHtml(b.title || b.value)}</option>`).join('')}
+        </select>
+        <div class="hint">${poolBooks
+          ? '列表来自书池。到「书池 · 书籍导入」可以添加更多可读书籍。'
+          : ''}</div>
+      </div>`;
+  };
+  const bindTplWiring = () => {
+    $('[data-pool-book]', modeExtra)?.addEventListener('change', (e) => {
+      const v = e.target.value;
+      const hit = (poolBooks || []).find((b) => b.value === v);
+      book = v ? { id: v, title: (hit && hit.title) || book.title || '' } : { id: '', title: '' };
+    });
+    $('[data-save-payload]', modeExtra)?.addEventListener('click', async (e) => {
+      const val = $('[data-payload]', modeExtra).value.trim();
+      if (!val) { toast('请粘贴 curl 或请求体', 'warn'); return; }
+      setLoading(e.currentTarget, true);
+      try {
+        await api.savePayload(acc.id, { curl: val });
+        acc.has_payload = true;
+        renderModeExtra();
+        toast('模板已保存，该账号所有模式都会用它作为请求基底', 'ok');
+      } catch (err) {
+        toast(err.message, 'error');
+      } finally {
+        setLoading(e.currentTarget, false);
+      }
+    });
+    $('[data-clear-payload]', modeExtra)?.addEventListener('click', async () => {
+      const ok = await confirmDialog({
+        title: '清除自定义模板',
+        message: '将删除该账号保存的抓包模板，之后所有模式回落到「设置 · 账号指纹模板」作为请求基底；若全局指纹模板也未配置，将无法发起阅读。',
+        confirmText: '清除',
+      });
+      if (!ok) return;
+      try {
+        await api.clearPayload(acc.id);
+        acc.has_payload = false;
+        renderModeExtra();
+        toast('已清除专属模板，回到全局指纹模板', 'ok');
+      } catch (err) {
+        toast(err.message, 'error');
+      }
     });
   };
-  renderCurrent();
+  modeSel.addEventListener('change', renderModeExtra);
+  renderModeExtra();
 
-  const searchBtn = $('[data-book-search]', mask);
-  searchBtn.addEventListener('click', async () => {
-    const q = $('[data-book-q]', mask).value.trim();
-    if (!q) return;
-    const results = $('[data-book-results]', mask);
-    results.innerHTML = `<div class="hint">搜索中…</div>`;
-    setLoading(searchBtn, true);
-    try {
-      const res = await api.searchBooks(acc.id, q);
-      if (!res.books?.length) {
-        results.innerHTML = `<div class="hint">没有找到相关书籍</div>`;
-        return;
-      }
-      results.innerHTML = `<div class="list" style="max-height:220px;overflow:auto">${res.books.map((b, i) => `
-        <div class="list-row clickable" data-book-row="${i}" style="cursor:pointer" role="button" tabindex="0" aria-label="选择 ${escapeHtml(b.title)}">
-          <div class="schedule-icon" style="width:32px;height:32px">${icon('book')}</div>
-          <div class="list-main">
-            <div class="list-title">${escapeHtml(b.title)}</div>
-            <div class="list-sub">${escapeHtml(b.author || '')} · ${escapeHtml(b.id)}</div>
-          </div>
-          <button class="btn btn-sm" data-pick="${i}">选择</button>
-        </div>`).join('')}</div>`;
-      const pickBook = async (idx) => {
-        const b = res.books[idx];
-        book = { id: b.id, title: b.title, chapterId: '', chapterTitle: '' };
-        const modeSel = $('[data-mode]', mask);
-        if (modeSel) modeSel.value = 'custom';
-        renderCurrent();
-        const detailEl = $('[data-book-results]', mask);
-        detailEl.innerHTML = `<div class="hint">正在读取目录…</div>`;
-        try {
-          const detail = await api.bookDetail(acc.id, b.id);
-          chapters = detail.chapters || [];
-          if (!chapters.length) {
-            detailEl.innerHTML = `<div class="hint">没有读取到目录，将沿用模板章节。</div>`;
-            return;
-          }
-          const withIds = chapters.filter((c) => c.id);
-          if (!withIds.length) {
-            detailEl.innerHTML = `<div class="note warn">${icon('alert')}<div>该书的目录未返回可用章节 ID。你仍可指定书籍，章节将沿用模板；如需精确章节，请导入该书真实阅读请求的 curl 模板。</div></div>`;
-            return;
-          }
-          detailEl.innerHTML = `
-            <div class="field" style="margin-top:4px">
-              <label class="label" for="acc-chapter">选择章节</label>
-              <select class="select" id="acc-chapter" data-chapter>
-                <option value="">沿用模板章节</option>
-                ${withIds.map((c, i) => `<option value="${i}">${escapeHtml(c.title || `第 ${c.index} 章`)}</option>`).join('')}
-              </select>
-            </div>`;
-          $('[data-chapter]', detailEl).addEventListener('change', (e) => {
-            const idx = e.target.value;
-            if (idx === '') {
-              book.chapterId = '';
-              book.chapterTitle = '';
-            } else {
-              const c = withIds[Number(idx)];
-              book.chapterId = c.id;
-              book.chapterTitle = c.title;
-            }
-            renderCurrent();
-          });
-        } catch (e) {
-          detailEl.innerHTML = `<div class="hint">读取目录失败：${escapeHtml(e.message)}</div>`;
-        }
-      };
-      $$('[data-pick]', results).forEach((btn) => btn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        pickBook(Number(btn.dataset.pick));
-      }));
-      $$('[data-book-row]', results).forEach((row) => {
-        row.addEventListener('click', (e) => {
-          if (e.target.closest('[data-pick]')) return;
-          pickBook(Number(row.dataset.bookRow));
-        });
-        row.addEventListener('keydown', (e) => {
-          if (e.key === 'Enter' || e.key === ' ') {
-            e.preventDefault();
-            pickBook(Number(row.dataset.bookRow));
-          }
-        });
-      });
-    } catch (e) {
-      results.innerHTML = `<div class="hint" style="color:var(--red)">${escapeHtml(e.message)}</div>`;
-    } finally {
-      setLoading(searchBtn, false);
-    }
-  });
-
-  $('[data-save-payload]', mask).addEventListener('click', async (e) => {
-    const val = $('[data-payload]', mask).value.trim();
-    if (!val) {
-      toast('请粘贴 curl 或请求体', 'warn');
-      return;
-    }
-    setLoading(e.currentTarget, true);
-    try {
-      await api.savePayload(acc.id, { curl: val });
-      $('[data-payload-state]', mask).textContent = '当前已有自定义模板';
-      toast('模板已保存', 'ok');
-    } catch (err) {
-      toast(err.message, 'error');
-    } finally {
-      setLoading(e.currentTarget, false);
-    }
-  });
-
-  $('[data-clear-payload]', mask).addEventListener('click', async () => {
-    try {
-      await api.clearPayload(acc.id);
-      $('[data-payload-state]', mask).textContent = '当前使用内置模板';
-      toast('模板已清除', 'ok');
-    } catch (e) {
-      toast(e.message, 'error');
-    }
-  });
+  api.pool(acc.id).then((data) => {
+    poolBooks = (data.books || []).filter((b) => b.enabled).map((b) => ({ value: b.value, title: b.title || '' }));
+    if (modeSel.value === 'custom') renderModeExtra();
+  }).catch(() => { poolBooks = []; });
 
   $('[data-cancel]', mask).addEventListener('click', close);
 
@@ -597,8 +531,9 @@ export function editAccountDialog(acc, { onDone } = {}) {
       push_channel_id: Number($('[data-channel]', mask).value) || 0,
       book_id: book.id,
       book_title: book.title,
-      chapter_id: book.chapterId,
-      chapter_title: book.chapterTitle,
+      // 没换书时保留原有的章节指定；换了书则章节随书重置（可在书池里看章节）。
+      chapter_id: book.id === acc.book_id ? acc.chapter_id : '',
+      chapter_title: book.id === acc.book_id ? acc.chapter_title : '',
     };
     setLoading(e.currentTarget, true);
     try {
@@ -917,6 +852,7 @@ export function runDetailDrawer(runId, { onDone } = {}) {
     </div>
     <div class="drawer-body">
       <div class="grid-2" data-stats style="margin-bottom:14px"></div>
+      <div data-run-error style="margin-bottom:14px"></div>
       <div class="card-title" style="margin-bottom:10px">${icon('list')}实时日志</div>
       <div class="console" data-console><div class="empty-log">加载日志…</div></div>
     </div>
@@ -987,6 +923,10 @@ export function runDetailDrawer(runId, { onDone } = {}) {
         <div style="margin-top:8px">${runStatusBadge(run.status, '阅读中')}</div>
         <div class="hint" style="margin-top:8px">成功 ${run.success_ticks} 次 · 失败 ${run.failed_ticks} 次</div>
       </div>`;
+    // 失败原因固定展示（含服务重启等没有日志的失败场景）。
+    $('[data-run-error]', drawer).innerHTML = run.status === 'failed' && run.error
+      ? `<div class="note danger">${icon('alert')}<div><b>失败原因：</b>${escapeHtml(run.error)}</div></div>`
+      : '';
     stopBtn.style.display = run.status === 'running' ? '' : 'none';
   };
 
