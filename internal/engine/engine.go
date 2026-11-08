@@ -374,7 +374,7 @@ func (e *Engine) session(ar *activeRun, acc *store.Account, ck weread.Cookies,
 			e.update(ar, elapsed, success, tick.failed, "running")
 			e.logLine(ar, "info", fmt.Sprintf("第 %d 次成功 · 已读 %s / %s · synckey=%d",
 				tick.tickIndex, humanMinutes(elapsed), humanMinutes(ar.target), res.SyncKey))
-			if !sleepCtx(ar.ctx, interval) {
+			if !sleepCtx(ar.ctx, tickJitter(interval, rnd)) {
 				finishS("stopped", "", false)
 				return
 			}
@@ -641,6 +641,17 @@ func backoff(failed int) time.Duration {
 		d = 10 * time.Second
 	}
 	return d
+}
+
+// tickJitter perturbs the heartbeat sleep by ±10% so the request rhythm never
+// shows an exact fixed-interval fingerprint over long sessions. Reading
+// accounting keeps counting the nominal interval, so a longer sleep simply
+// ends the run a few seconds late (bounded by the deadline above).
+func tickJitter(d time.Duration, rnd *rand.Rand) time.Duration {
+	if d <= 0 {
+		return d
+	}
+	return time.Duration(float64(d) * (0.9 + 0.2*rnd.Float64()))
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) bool {

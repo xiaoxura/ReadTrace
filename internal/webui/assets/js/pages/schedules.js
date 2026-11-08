@@ -29,7 +29,6 @@ export async function renderSchedules(ctx) {
 
   root.innerHTML = `
     ${pageHeaderHTML({
-      kicker: '定时',
       title: '定时任务',
       sub: `${list.length} 个任务 · ${enabled} 个启用中`,
       actions: `<button class="btn btn-primary" id="btn-add">${icon('plus')}<span>新建定时</span></button>`,

@@ -44,9 +44,7 @@ export async function renderSettings(ctx) {
 
   root.innerHTML = `
     ${pageHeaderHTML({
-      kicker: '系统',
       title: '设置',
-      sub: '站点外观、安全策略与运行信息',
     })}
     <div class="tabs-host"></div>
     <div class="settings-body"></div>
@@ -195,7 +193,7 @@ function securityHTML(info) {
       <div>
         <article class="card">
           <div class="card-head"><div><div class="card-title">${icon('shield')}安全与隐私</div></div></div>
-          <div class="note" style="margin-bottom:10px">${icon('shield')}<div>账号 Cookie、机器人凭据与推送 Token 使用 AES-256-GCM 加密后保存在本机 SQLite，密钥文件位于数据目录，不会上传。</div></div>
+          <div class="note" style="margin-bottom:10px">${icon('shield')}<div>账号 Cookie 与推送 Token 使用 AES-256-GCM 加密后保存在本机 SQLite，密钥文件位于数据目录，不会上传。</div></div>
           <div class="note">${icon('alert')}<div>本工具通过模拟阅读心跳保持时长，可能违反微信读书用户协议并触发风控。请仅用于个人学习，自行承担账号风险。</div></div>
           <div class="bot-card-actions">
             <button class="btn btn-danger" id="logout-panel">${icon('logout')}退出登录</button>

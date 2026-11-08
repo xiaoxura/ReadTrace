@@ -4,6 +4,7 @@ package sched
 import (
 	"fmt"
 	"log/slog"
+	"math/rand"
 	"sync"
 	"time"
 
@@ -20,11 +21,14 @@ type Scheduler struct {
 	log  *slog.Logger
 	opMu sync.Mutex // serializes Start/Add/Remove so a reload cannot interleave
 
-	mu   sync.Mutex // guards the fields below
-	cron *cron.Cron
-	loc  *time.Location
-	ids  map[int64]cron.EntryID
-	next map[int64]int64 // schedule id -> next fire unix, self-managed
+	mu     sync.Mutex // guards the fields below
+	cron   *cron.Cron
+	loc    *time.Location
+	ids    map[int64]cron.EntryID
+	next   map[int64]int64 // schedule id -> next fire unix, self-managed
+	stopCh chan struct{}   // closed by Stop; releases fire() during jitter delay
+	stopMu sync.Mutex      // guards stopCh lifecycle (each generation closes once)
+	stopOn bool
 }
 
 var parser = cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor)
@@ -34,6 +38,29 @@ func New(st *store.Store, eng *engine.Engine, log *slog.Logger) *Scheduler {
 	return &Scheduler{
 		st: st, eng: eng, log: log,
 		ids: map[int64]cron.EntryID{}, next: map[int64]int64{}, loc: time.Local,
+	}
+}
+
+// rotateStopCh closes the previous stop channel (if open) and opens a fresh
+// one for the new cron generation.
+func (s *Scheduler) rotateStopCh() {
+	s.stopMu.Lock()
+	defer s.stopMu.Unlock()
+	if s.stopOn {
+		close(s.stopCh)
+	}
+	s.stopCh = make(chan struct{})
+	s.stopOn = true
+}
+
+// closeStopCh closes the active stop channel so waiting fire() goroutines
+// return; calling it again is a no-op until rotateStopCh.
+func (s *Scheduler) closeStopCh() {
+	s.stopMu.Lock()
+	defer s.stopMu.Unlock()
+	if s.stopOn {
+		close(s.stopCh)
+		s.stopOn = false
 	}
 }
 
@@ -52,6 +79,8 @@ func (s *Scheduler) Start(loc *time.Location) error {
 	if s.cron != nil {
 		s.cron.Stop()
 	}
+	// 新一代 stopCh：旧的（若已关闭）让历史 fire goroutine 直接退出。
+	s.rotateStopCh()
 	s.loc = loc
 	c := cron.New(cron.WithLocation(loc), cron.WithParser(parser),
 		cron.WithChain(cron.Recover(cron.DefaultLogger)))
@@ -86,15 +115,17 @@ func (s *Scheduler) Reload(loc *time.Location) error {
 	return s.Start(loc)
 }
 
-// Stop shuts the cron instance down.
+// Stop shuts the cron instance down and releases any fire() waiting out a
+// jitter delay.
 func (s *Scheduler) Stop() {
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.cron != nil {
 		s.cron.Stop()
 	}
+	s.mu.Unlock()
+	s.closeStopCh()
 }
 
 // Add registers one schedule. It is safe to call on a started scheduler.
@@ -252,6 +283,18 @@ func (s *Scheduler) fire(id int64) {
 			"schedule_id": id, "account_name": acc.Name, "reason": "该账号已有阅读任务在运行",
 		})
 		return
+	}
+
+	// 触发抖动：cron 整点启动是固定秒级指纹，加 0~90s 随机延迟弱化它。
+	// Stop（退出或时区重载）会立即放行并取消本次触发。
+	if d := time.Duration(rand.Int63n(int64(90 * time.Second))); d > 0 {
+		timer := time.NewTimer(d)
+		select {
+		case <-timer.C:
+		case <-s.stopCh:
+			timer.Stop()
+			return
+		}
 	}
 
 	run, err := s.eng.Start(acc, v.Minutes, "schedule")

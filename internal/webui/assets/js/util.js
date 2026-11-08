@@ -68,15 +68,6 @@ export function relTime(ts, tz) {
   return fmtClock(ts, tz);
 }
 
-export function greeting() {
-  const h = new Date().getHours();
-  if (h < 6) return '夜深了';
-  if (h < 11) return '早上好';
-  if (h < 14) return '中午好';
-  if (h < 18) return '下午好';
-  return '晚上好';
-}
-
 export function initials(name) {
   const s = String(name || '').trim();
   if (!s) return '读';
@@ -332,14 +323,13 @@ export function applyTheme(pref) {
   syncThemeColor(theme);
 }
 /**
- * 统一页面标题区。kicker / title / sub 会被转义，actions 由调用方提供
- * 已经转义好的按钮 HTML。
+ * 统一页面标题区：单行紧凑布局（标题 + 可选计数小字 + 右侧操作）。
+ * title / sub 会被转义，actions 由调用方提供已经转义好的按钮 HTML。
  */
-export function pageHeaderHTML({ kicker = '', title = '', sub = '', actions = '' } = {}) {
+export function pageHeaderHTML({ title = '', sub = '', actions = '' } = {}) {
   return `<div class="topbar">
     <div class="topbar-main">
-      ${kicker ? `<div class="page-kicker">${escapeHtml(kicker)}</div>` : ''}
-      ${title ? `<h1 class="page-title">${escapeHtml(title)}</h1>` : ''}
+      <h1 class="page-title">${escapeHtml(title)}</h1>
       ${sub ? `<div class="page-sub">${escapeHtml(sub)}</div>` : ''}
     </div>
     ${actions ? `<div class="top-actions">${actions}</div>` : ''}

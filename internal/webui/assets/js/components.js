@@ -748,7 +748,65 @@ const PUSH_FIELDS = {
     { key: 'proxy', label: '代理地址', placeholder: 'http://127.0.0.1:7890（可选）', optional: true },
   ],
   serverchan: [{ key: 'sendkey', label: 'SendKey', placeholder: 'SCT...' }],
+  bark: [
+    { key: 'device_key', label: 'Device Key', placeholder: 'Bark 设备 Key' },
+    { key: 'server', label: '服务器地址', placeholder: '默认 https://api.day.app（可选）', optional: true },
+    { key: 'sound', label: '通知音效', placeholder: '例如 bell（可选）', optional: true },
+  ],
+  ntfy: [
+    { key: 'topic', label: 'Topic', placeholder: '主题名' },
+    { key: 'server', label: '服务器地址', placeholder: '默认 https://ntfy.sh（可选）', optional: true },
+    { key: 'token', label: '访问令牌', placeholder: '私有主题的 Token（可选）', optional: true },
+  ],
+  gotify: [
+    { key: 'server', label: '服务器地址', placeholder: 'https://gotify.example.com' },
+    { key: 'token', label: '应用令牌', placeholder: 'App Token' },
+    { key: 'priority', label: '优先级', placeholder: '1-10（可选）', optional: true },
+  ],
+  pushdeer: [
+    { key: 'pushkey', label: 'PushKey', placeholder: 'PushDeer PushKey' },
+    { key: 'type', label: '消息类型', placeholder: 'text 或 markdown（默认 text）', optional: true },
+  ],
+  feishu: [
+    { key: 'webhook_url', label: 'Webhook 地址', placeholder: 'https://open.feishu.cn/open-apis/bot/v2/hook/...' },
+  ],
+  wework: [
+    { key: 'webhook_url', label: 'Webhook 地址', placeholder: 'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...' },
+    { key: 'msg_type', label: '消息类型', placeholder: 'text 或 markdown（默认 text）', optional: true },
+  ],
+  dingtalk: [
+    { key: 'webhook_url', label: 'Webhook 地址', placeholder: 'https://oapi.dingtalk.com/robot/send?access_token=...' },
+    { key: 'msg_type', label: '消息类型', placeholder: 'text 或 markdown（默认 text）', optional: true },
+  ],
+  serverchan3: [
+    { key: 'uid', label: 'UID', placeholder: 'Server酱³ UID' },
+    { key: 'sendkey', label: 'SendKey', placeholder: 'Server酱³ SendKey' },
+    { key: 'short', label: '简短描述', placeholder: '可选', optional: true },
+    { key: 'tags', label: '标签', placeholder: '多个用 | 分隔（可选）', optional: true },
+  ],
+  apprise: [
+    { key: 'server', label: 'Apprise 服务器', placeholder: 'https://apprise.example.com' },
+    { key: 'token', label: '配置 Key', placeholder: '/notify/ 接口的配置 Key' },
+    { key: 'urls', label: '目标 URL', placeholder: 'discord://…、mailtos://…，多个用逗号分隔（可选）', optional: true },
+  ],
 };
+
+// 弹窗里的渠道选择器按键序排列，与 PUSH_FIELDS 一一对应。
+const PUSH_TYPES = [
+  ['pushplus', 'PushPlus', 'megaphone'],
+  ['wxpusher', 'WxPusher', 'chat'],
+  ['telegram', 'Telegram', 'plane'],
+  ['serverchan', 'ServerChan', 'bell'],
+  ['serverchan3', 'Server酱³', 'zap'],
+  ['bark', 'Bark', 'moon'],
+  ['ntfy', 'Ntfy', 'globe'],
+  ['gotify', 'Gotify', 'server'],
+  ['pushdeer', 'PushDeer', 'rocket'],
+  ['feishu', '飞书', 'chatDuo'],
+  ['wework', '企业微信', 'building'],
+  ['dingtalk', '钉钉', 'pin'],
+  ['apprise', 'Apprise', 'external'],
+];
 
 // 每类事件的可自定义模板，字段为 {kind}_title / {kind}_body。
 const TEMPLATE_KINDS = [
@@ -765,8 +823,8 @@ export function pushChannelDialog({ channel = null, onDone } = {}) {
     subtitle: '阅读完成后发送结果通知',
     body: `
       <div class="type-grid" data-types>
-        ${[['pushplus', 'PushPlus'], ['wxpusher', 'WxPusher'], ['telegram', 'Telegram'], ['serverchan', 'ServerChan']]
-          .map(([t, label]) => `<button type="button" class="type-opt ${t === type ? 'active' : ''}" data-type="${t}"><b>${label}</b>${icon(t === 'telegram' ? 'external' : 'bell')}</button>`).join('')}
+        ${PUSH_TYPES.map(([t, label, ic]) =>
+          `<button type="button" class="type-opt ${t === type ? 'active' : ''}" data-type="${t}"><b>${label}</b>${icon(ic)}</button>`).join('')}
       </div>
       <div class="field">
         <label class="label" for="push-name">渠道名称</label>

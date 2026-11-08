@@ -29,7 +29,7 @@
 | 多账号 | 不支持 | **多账号独立配置与统计** |
 | 定时任务 | 服务器 cron / Action cron | 面板内 **图形化 cron + 下次执行时间 + 启停** |
 | Cookie 失效 | 再次抓包 | 自动续期，失败时标记失效并提示重扫 |
-| 推送 | 4 种渠道 | 同样支持 4 种，面板内配置与测试 |
+| 推送 | 4 种渠道 | **13 种**：PushPlus / WxPusher / Telegram / ServerChan / Server酱³ / Bark / Ntfy / Gotify / PushDeer / 飞书 / 企业微信 / 钉钉 / Apprise，面板内配置与测试 |
 | 数据安全 | Cookie 存环境变量 | **AES-256-GCM 加密落库**，本机密钥 |
 | 移动端 / 暗色 | 无 | **响应式 + 明暗主题** |
 
@@ -41,12 +41,11 @@
 - **实时阅读面板**：进度环、已读分钟、心跳成功/失败次数、实时日志流，卡片随 SSE 自动更新。
 - **历史与趋势**：今日/本周/累计时长、连续阅读天数、最近 14 天柱状图、每次运行的完整日志。
 - **多账号**：每个账号独立设置默认时长、心跳间隔、阅读模式、绑定书籍、推送渠道。
-- **微信机器人**：接入微信官方机器人（腾讯 iLink Bot），多人可在微信里完成登录账号、开始/停止阅读、查统计、配定时任务；绑定关系逐账号隔离，杜绝越权。
 - **可视化定时任务**：5 段 cron、常见时间预设、未来 3 次执行预览、启停开关、下次执行倒计时。
 - **账号状态检测**：后台按设定间隔自动校验登录态（可关闭），发现失效立即在面板标注，并可通过绑定的推送渠道提醒。
 - **阅读自动重试**：单账号可配置失败自动重试次数与间隔；登录已失效的情况不会盲目重试。
 - **自定义推送模板**：阅读成功 / 阅读失败 / 账号失效三类事件可分别自定义标题与内容，支持 `{{account}}`、`{{elapsed}}` 等变量。
-- **四种推送**：PushPlus、WxPusher、Telegram（支持代理）、ServerChan，支持发送测试消息。
+- **多种推送**：PushPlus、WxPusher、Telegram（支持代理）、ServerChan、Server酱³、Bark、Ntfy、Gotify、PushDeer、飞书、企业微信、钉钉、Apprise（自建 API 服务桥接数十种服务），支持发送测试消息。
 - **响应式界面**：桌面侧边栏 / 移动端底部导航，深色与浅色主题，跟随系统。
 - **数据本地化**：SQLite 单文件，账号 Cookie 与推送 Token 加密存储；复制数据目录即可迁移。
 
@@ -58,10 +57,6 @@
   <tr>
     <td><img src="docs/screenshots/schedules.png" alt="定时任务" /></td>
     <td><img src="docs/screenshots/settings.png" alt="设置" /></td>
-  </tr>
-  <tr>
-    <td><img src="docs/screenshots/wechat.png" alt="微信机器人" /></td>
-    <td><img src="docs/screenshots/wechat-chat.png" alt="微信对话记录" /></td>
   </tr>
   <tr>
     <td><img src="docs/screenshots/dashboard-light.png" alt="浅色主题" /></td>
@@ -116,32 +111,6 @@ go build -trimpath -ldflags "-s -w -X main.version=1.2.0" -o readtrace ./cmd/rea
 - 在总览页点 **开始阅读**，选择时长即可。
 - 在「定时」页新建任务，例如每天 01:00 自动阅读 30 分钟。
 - 在「推送」页添加渠道，并在账号设置里选择完成后推送到哪个渠道。
-
-### 5. 微信机器人（可选）
-
-在侧栏「**微信**」页点 **绑定机器人**：用你的个人微信扫码（手机显示数字时在面板输入），扫码人自动成为微信侧管理员。页面提供机器人 ID、绑定账号列表（含所有者）、微信用户管理，以及**用户与机器人的完整对话记录**（实时更新，随数据保留天数自动清理）。之后任意微信用户给机器人发送：
-
-| 指令 | 作用 |
-| --- | --- |
-| `菜单` / `帮助` | 查看全部指令 |
-| `登录` | 扫码绑定新的微信读书账号（二维码以图片直发微信，手机显示数字时直接回复数字） |
-| `我的账号` | 已绑定账号与状态 |
-| `开始 序号 分钟` | 立即开始阅读 |
-| `停止 序号` | 停止阅读（缺省为全部账号） |
-| `进度` / `今日` / `最近` | 实时进度 / 今日统计 / 运行记录 |
-| `定时 列表` / `定时 新增 [序号] 22:30 30` | 查看 / 新增定时任务 |
-| `定时 开/关/删 任务编号` | 启停 / 删除任务 |
-| `解绑 序号` | 解除该账号与你微信的绑定 |
-
-**权限模型（防越权）**：
-
-- 谁扫微信读书的登录码，谁就是该账号在微信侧的**唯一所有者**；一个微信用户可以绑定多个账号，一个账号同一时刻只属于一个微信用户（重新扫码即换绑，再次扫码要求持有该微信读书账号的凭据，即持有权即所有权）。
-- 微信用户只可能查到、操作**自己绑定的账号**及其定时任务、统计、运行记录；接口层不提供越过绑定关系的通道。
-- 扫码绑定机器人的人自动成为**管理员**；管理员可在「微信」页查看全部用户、在微信里操作全部账号、手动改绑/解绑。
-- 「运行结束直推」开启时，某账号阅读结束会推送结果到其绑定的微信用户。
-- 机器人侧凭据（iLink bot_token）与微信读书 Cookie 一样经 AES-256-GCM 加密后落库。
-
-> 协议说明：该渠道使用 iLink Bot 的 HTTP 长轮询收消息与加密 CDN 媒体接口，按公开接口行为独立实现；协议可能随时变化，字段与行为以实现为准。本项目不包含任何第三方插件源代码。
 
 ---
 
@@ -240,31 +209,16 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now readtrace
 ```
 
-### Docker / NAS
+### Docker
 
 ```bash
+docker build -t readtrace .
 mkdir -p data
-sudo chown -R 10001:10001 data   # 容器内以非 root 用户运行
-docker compose up -d
+docker run -d --name readtrace -p 8720:8720 \
+  -v ./data:/opt/readtrace/data readtrace
 ```
 
-`docker-compose.yml` 默认映射 `8720:8720`，数据落在 `./data`（挂载到容器内 `/opt/readtrace/data`，与二进制同目录）。容器内默认监听 `0.0.0.0`，请务必设置管理密码，并建议只在局域网或反代后暴露。
-
-### 反向代理（Nginx）
-
-```nginx
-location / {
-    proxy_pass http://127.0.0.1:8720;
-    proxy_http_version 1.1;
-    proxy_set_header Host $host;
-    proxy_set_header X-Forwarded-Proto $scheme;
-    proxy_set_header X-Real-IP $remote_addr;
-
-    # SSE
-    proxy_buffering off;
-    proxy_read_timeout 3600s;
-}
-```
+容器内以非 root 用户运行，默认监听 `0.0.0.0`，请务必设置管理密码，并建议只在局域网或反代后暴露。
 
 ---
 
@@ -277,7 +231,7 @@ location / {
 - `sg = sha256(ts + rn + KEY)`
 - `s = cal_hash("k=v&..." 按 key 排序、URL 编码)`
 
-阅迹用 Go 复刻了同一套签名逻辑（见 `internal/weread/sign.go`），并附带与官方 Python 实现逐字节对照的单元测试。
+阅迹用 Go 复刻了同一套签名逻辑（见 `internal/weread/sign.go`），并附带与官方 Python 实现逐字节对照的单元测试。`rt` 直接取自真实流逝时间；心跳间隔带 ±10% 抖动、定时任务触发带 0~90 秒随机延迟，避免固定的节奏指纹。
 
 单次心跳流程：
 
@@ -384,7 +338,6 @@ internal/notify/       推送渠道与消息模板
 internal/store/        SQLite 数据层与迁移
 internal/secure/       AES-GCM 加密
 internal/weread/       微信读书客户端、签名、curl 解析
-internal/wxbot/        微信官方机器人渠道（iLink Bot 协议）
 internal/webui/assets/ 内嵌前端（原生 ES Module，无构建步骤）
 docs/screenshots/      README 截图
 ```

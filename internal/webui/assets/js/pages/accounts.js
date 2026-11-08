@@ -34,7 +34,6 @@ export async function renderAccounts(ctx) {
 
   root.innerHTML = `
     ${pageHeaderHTML({
-      kicker: '账号',
       title: '账号管理',
       sub: `${state.accounts.length} 个账号 · ${state.active.length} 个正在阅读`,
       actions: `

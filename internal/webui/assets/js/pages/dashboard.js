@@ -9,7 +9,7 @@ import {
   renderError, skeletonHTML, runRowHTML, bindRunRows, bindStopButtons, bindCountdown,
 } from '../helpers.js';
 import {
-  $, $$, escapeHtml, fmtMinutes, fmtTime, fmtDuration, greeting, humanCron,
+  $, $$, escapeHtml, fmtMinutes, fmtTime, fmtDuration, humanCron,
   debounce, relativeSeconds, pageHeaderHTML,
 } from '../util.js';
 
@@ -71,9 +71,6 @@ function pageHTML(data, logs, accountId) {
   }
 
   const hasAccounts = state.accounts.length > 0;
-  const todayText = data.today_seconds > 0
-    ? `今天已读 ${fmtMinutes(data.today_seconds)} 分钟`
-    : '今天读点什么？';
   const accountsFilter = state.accounts.length > 1
     ? accountSelectHTML(accountId, { includeAll: true, id: 'dash-filter', style: 'width:auto;min-width:130px' })
     : '';
@@ -82,11 +79,8 @@ function pageHTML(data, logs, accountId) {
 
   return `
     ${pageHeaderHTML({
-      kicker: `总览 · ${dateText}`,
-      title: `${greeting()}，${todayText}`,
-      sub: data.streak_days > 0
-        ? `已连续阅读 ${data.streak_days} 天 · 累计 ${fmtDuration(data.total_seconds)}`
-        : '开始第一次阅读，建立连续记录',
+      title: '总览',
+      sub: `${dateText} · 已连续阅读 ${data.streak_days} 天 · 累计 ${fmtDuration(data.total_seconds)}`,
       actions: `
         ${accountsFilter}
         <button class="btn btn-ghost" id="btn-manage">${icon('users')}<span>账号</span></button>
@@ -97,7 +91,6 @@ function pageHTML(data, logs, accountId) {
 
     ${!hasAccounts ? onboardingHTML() : `
       ${statsHTML(data)}
-      ${botStripHTML(data.wxbot || {})}
       <div class="dash-grid">
         ${chartHTML(data)}
         ${sideHTML(data)}
@@ -161,27 +154,6 @@ function statsHTML(data) {
       <div class="stat-foot">${(data.next_runs || [])[0] ? `下次 ${escapeHtml(humanCron(data.next_runs[0].cron))}` : '还没有启用中的任务'}</div>
     </div>
   </div>`;
-}
-
-function botStripHTML(wx) {
-  const bound = !!wx.bound;
-  const broken = !!wx.needs_rebind;
-  const enabled = !!wx.enabled;
-  const label = !bound ? '未绑定' : broken ? '凭据失效' : enabled ? '运行中' : '已停用';
-  const tone = !bound ? 'neutral' : broken ? 'err' : enabled ? 'ok' : 'warn';
-  const sub = !bound
-    ? '绑定后可在微信里登录账号、开始/停止阅读、查统计与定时任务'
-    : broken
-      ? '机器人凭据已失效，请到「微信」页重新扫码绑定'
-      : `微信用户 ${wx.users ?? 0} 人 · 绑定账号 ${wx.bindings ?? 0} 个 · 运行结束直推${wx.push_runs ? '开启' : '关闭'}`;
-  return `<a class="bot-strip" href="#/wechat">
-    <span class="bot-strip-ico">${icon('wechat')}</span>
-    <span class="bot-strip-body">
-      <span class="bot-strip-title">微信机器人 <span class="badge ${tone}">${label}</span></span>
-      <span class="bot-strip-sub">${escapeHtml(sub)}</span>
-    </span>
-    <span class="bot-strip-go">${bound ? '管理' : '去绑定'} →</span>
-  </a>`;
 }
 
 function chartHTML() {

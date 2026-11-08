@@ -6,10 +6,19 @@ import { renderError, skeletonHTML, bindEnabledToggle } from '../helpers.js';
 import { $, $$, escapeHtml, toast, setLoading, confirmDialog, pageHeaderHTML } from '../util.js';
 
 const TYPES = {
-  pushplus: { label: 'PushPlus', icon: 'bell', color: 'var(--amber)' },
-  wxpusher: { label: 'WxPusher', icon: 'bell', color: 'var(--blue)' },
-  telegram: { label: 'Telegram', icon: 'external', color: 'var(--purple)' },
+  pushplus: { label: 'PushPlus', icon: 'megaphone', color: 'var(--amber)' },
+  wxpusher: { label: 'WxPusher', icon: 'chat', color: 'var(--blue)' },
+  telegram: { label: 'Telegram', icon: 'plane', color: 'var(--purple)' },
   serverchan: { label: 'ServerChan', icon: 'bell', color: 'var(--accent)' },
+  serverchan3: { label: 'Server酱³', icon: 'zap', color: 'var(--accent)' },
+  bark: { label: 'Bark', icon: 'moon', color: 'var(--amber)' },
+  ntfy: { label: 'Ntfy', icon: 'globe', color: 'var(--blue)' },
+  gotify: { label: 'Gotify', icon: 'server', color: 'var(--purple)' },
+  pushdeer: { label: 'PushDeer', icon: 'rocket', color: 'var(--amber)' },
+  feishu: { label: '飞书', icon: 'chatDuo', color: 'var(--blue)' },
+  wework: { label: '企业微信', icon: 'building', color: 'var(--purple)' },
+  dingtalk: { label: '钉钉', icon: 'pin', color: 'var(--blue)' },
+  apprise: { label: 'Apprise', icon: 'external', color: 'var(--amber)' },
 };
 
 function mask(value) {
@@ -25,6 +34,13 @@ function summary(ch) {
     case 'wxpusher': return `SPT ${mask(c.spt)}`;
     case 'telegram': return `chat ${escapeHtml(c.chat_id || '—')} · ${mask(c.bot_token)}`;
     case 'serverchan': return `SendKey ${mask(c.sendkey)}`;
+    case 'serverchan3': return `uid ${escapeHtml(c.uid || '—')} · key ${mask(c.sendkey)}`;
+    case 'bark': return `key ${mask(c.device_key)}`;
+    case 'ntfy': return `topic ${escapeHtml(c.topic || '—')}`;
+    case 'gotify': return `token ${mask(c.token)}`;
+    case 'pushdeer': return `key ${mask(c.pushkey)}`;
+    case 'feishu': case 'wework': case 'dingtalk': return `webhook ${mask(c.webhook_url)}`;
+    case 'apprise': return `token ${mask(c.token)}`;
     default: return '';
   }
 }
@@ -44,9 +60,8 @@ export async function renderPush(ctx) {
   const list = state.channels;
   root.innerHTML = `
     ${pageHeaderHTML({
-      kicker: '推送',
       title: '推送渠道',
-      sub: list.length ? `${list.length} 个渠道 · ${list.filter((c) => c.enabled).length} 个启用中` : '阅读完成后把结果推送到微信或 Telegram',
+      sub: `${list.length} 个渠道 · ${list.filter((c) => c.enabled).length} 个启用中`,
       actions: `<button class="btn btn-primary" id="btn-add">${icon('plus')}<span>添加渠道</span></button>`,
     })}
 

@@ -33,9 +33,8 @@ export async function renderRuns(ctx) {
 
   root.innerHTML = `
     ${pageHeaderHTML({
-      kicker: '记录',
       title: '阅读记录',
-      sub: `最近 ${(data.runs || []).length} 条 · 点击任意一行查看日志`,
+      sub: `最近 ${(data.runs || []).length} 条`,
       actions: `
         <button class="btn btn-ghost" id="btn-refresh">${icon('refresh')}<span>刷新</span></button>
         <button class="btn btn-primary" id="btn-start">${icon('play')}<span>开始阅读</span></button>`,

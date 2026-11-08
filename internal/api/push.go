@@ -11,10 +11,19 @@ import (
 )
 
 var pushTypes = map[string]string{
-	"pushplus":   "PushPlus",
-	"wxpusher":   "WxPusher",
-	"telegram":   "Telegram",
-	"serverchan": "ServerChan",
+	"pushplus":    "PushPlus",
+	"wxpusher":    "WxPusher",
+	"telegram":    "Telegram",
+	"serverchan":  "ServerChan",
+	"bark":        "Bark",
+	"ntfy":        "Ntfy",
+	"gotify":      "Gotify",
+	"pushdeer":    "PushDeer",
+	"feishu":      "飞书",
+	"wework":      "企业微信",
+	"dingtalk":    "钉钉",
+	"serverchan3": "Server酱³",
+	"apprise":     "Apprise",
 }
 
 func validPushType(t string) bool {
@@ -62,6 +71,34 @@ func validatePushConfig(t string, cfg map[string]string) string {
 	case "serverchan":
 		if strings.TrimSpace(cfg["sendkey"]) == "" {
 			return "请填写 ServerChan SendKey"
+		}
+	case "bark":
+		if strings.TrimSpace(cfg["device_key"]) == "" {
+			return "请填写 Bark Device Key"
+		}
+	case "ntfy":
+		if strings.TrimSpace(cfg["topic"]) == "" {
+			return "请填写 Ntfy Topic"
+		}
+	case "gotify":
+		if strings.TrimSpace(cfg["server"]) == "" || strings.TrimSpace(cfg["token"]) == "" {
+			return "请填写 Gotify 服务器地址和应用令牌"
+		}
+	case "pushdeer":
+		if strings.TrimSpace(cfg["pushkey"]) == "" {
+			return "请填写 PushDeer PushKey"
+		}
+	case "feishu", "wework", "dingtalk":
+		if strings.TrimSpace(cfg["webhook_url"]) == "" {
+			return "请填写 Webhook 地址"
+		}
+	case "serverchan3":
+		if strings.TrimSpace(cfg["uid"]) == "" || strings.TrimSpace(cfg["sendkey"]) == "" {
+			return "请填写 Server酱³ UID 和 SendKey"
+		}
+	case "apprise":
+		if strings.TrimSpace(cfg["server"]) == "" || strings.TrimSpace(cfg["token"]) == "" {
+			return "请填写 Apprise 服务器地址和配置 Key"
 		}
 	default:
 		return "不支持的推送类型"
