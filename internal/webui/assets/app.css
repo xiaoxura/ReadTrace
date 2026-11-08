@@ -1141,6 +1141,28 @@ h1, h2, h3, h4, p { margin: 0; }
   .settings-grid { grid-template-columns: 1fr; }
 }
 
+/* ===== 关于页 ===== */
+.about-brand { display: flex; align-items: center; gap: 12px; }
+.about-links { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 14px; }
+.about-cmd {
+  margin: 0 0 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface-2);
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.stack-list { display: flex; flex-direction: column; gap: 4px; }
+.stack-item { display: flex; align-items: flex-start; gap: 12px; padding: 9px 0; border-top: 1px solid var(--line); }
+.stack-item:first-child { border-top: none; }
+.stack-item svg { width: 17px; height: 17px; color: var(--muted); flex: none; margin-top: 2px; }
+.stack-item .stack-text { min-width: 0; }
+.stack-item .stack-text b { display: block; font-size: 13px; }
+.stack-item .stack-text span { display: block; font-size: 11.5px; color: var(--muted); margin-top: 3px; line-height: 1.6; }
+
 /* ===== 概览页：等高卡片 ===== */
 .dash-grid > article.card { height: 100%; display: flex; flex-direction: column; }
 .dash-grid > article.card > .chart-host { flex: 1; }

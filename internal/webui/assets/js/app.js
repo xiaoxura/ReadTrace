@@ -11,6 +11,7 @@ import { renderRuns } from './pages/runs.js';
 import { renderSchedules } from './pages/schedules.js';
 import { renderPush } from './pages/push.js';
 import { renderSettings } from './pages/settings.js';
+import { renderAbout } from './pages/about.js';
 
 const PAGES = {
   dashboard: renderDashboard,
@@ -19,6 +20,7 @@ const PAGES = {
   schedules: renderSchedules,
   push: renderPush,
   settings: renderSettings,
+  about: renderAbout,
 };
 
 const NAV = [
@@ -28,13 +30,14 @@ const NAV = [
   { key: 'schedules', label: '定时', icon: 'calendar' },
   { key: 'push', label: '推送', icon: 'bell' },
   { key: 'settings', label: '设置', icon: 'settings' },
+  { key: 'about', label: '关于', icon: 'info' },
 ];
 
 // 移动端底部只放最常用的 5 个入口，其余收进「更多」，避免 7 项挤在 390px 里。
 const MOBILE_PRIMARY = ['dashboard', 'accounts', 'runs', 'schedules', 'push'];
 const PAGE_TITLES = {
   dashboard: '总览', accounts: '账号', runs: '记录', schedules: '定时',
-  push: '推送', settings: '设置',
+  push: '推送', settings: '设置', about: '关于',
 };
 
 let currentHandler = null;
@@ -189,10 +192,10 @@ function renderShell(me) {
 
 function openMoreSheet() {
   const links = NAV.filter((n) => !MOBILE_PRIMARY.includes(n.key));
-  const desc = { push: '推送渠道、模板与测试', settings: '站点、安全与运行信息' };
+  const desc = { push: '推送渠道、模板与测试', settings: '站点、安全与运行信息', about: '项目地址与技术栈' };
   const { mask, close } = openModal({
     title: '更多',
-    subtitle: '推送与站点设置',
+    subtitle: '推送、设置与项目信息',
     narrow: true,
     body: `<div class="more-list">
       ${links.map((n) => `<a class="more-item" href="#/${n.key}" data-more-link>

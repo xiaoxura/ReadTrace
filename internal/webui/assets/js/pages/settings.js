@@ -5,7 +5,7 @@ import { redrawCharts } from '../charts.js';
 import { renderError, skeletonHTML } from '../helpers.js';
 import {
   $, $$, escapeHtml, fmtClock, toast, setLoading, themePreference, applyTheme, resolveTheme,
-  renderTabs, pageHeaderHTML, confirmDialog,
+  pageHeaderHTML, confirmDialog,
 } from '../util.js';
 
 const TZ_OPTIONS = [
@@ -19,14 +19,7 @@ const TZ_OPTIONS = [
   ['UTC', 'UTC'],
 ];
 
-const TABS = [
-  { key: 'site', label: '站点' },
-  { key: 'security', label: '安全' },
-  { key: 'about', label: '关于' },
-];
-
 let infoCache = null;
-let activeTab = 'site';
 
 export async function renderSettings(ctx) {
   const { root } = ctx;
@@ -46,46 +39,26 @@ export async function renderSettings(ctx) {
     ${pageHeaderHTML({
       title: '设置',
     })}
-    <div class="tabs-host"></div>
     <div class="settings-body"></div>
   `;
 
-  drawTabs(ctx, root);
   draw(ctx, root);
-}
-
-function drawTabs(ctx, root) {
-  renderTabs({
-    container: $('.tabs-host', root),
-    tabs: TABS,
-    active: activeTab,
-    onChange: (key) => {
-      if (key === activeTab) return;
-      activeTab = key;
-      drawTabs(ctx, root);
-      draw(ctx, root);
-    },
-  });
 }
 
 function draw(ctx, root, info = infoCache) {
   const host = $('.settings-body', root);
-  const pref = themePreference();
-
-  if (activeTab === 'site') host.innerHTML = siteHTML();
-  else if (activeTab === 'security') host.innerHTML = securityHTML(info);
-  else host.innerHTML = aboutHTML(info);
+  host.innerHTML = siteHTML() + securityHTML(info);
 
   wireSite(ctx, host, info);
   wireSecurity(ctx, host, info);
 }
 
-/* ---------- 站点 tab ---------- */
+/* ---------- 外观与站点 ---------- */
 
 function siteHTML() {
   const info = infoCache;
   return `
-    <div class="settings-grid">
+    <div class="settings-grid" style="margin-bottom:16px">
       <div>
         <article class="card" style="margin-bottom:16px">
           <div class="card-head"><div><div class="card-title">${icon('sun')}外观</div><div class="card-sub">主题会记忆在本地浏览器</div></div></div>
@@ -151,7 +124,7 @@ function wireSite(ctx, host, info) {
   });
 }
 
-/* ---------- 安全 tab ---------- */
+/* ---------- 安全、检测与运行信息 ---------- */
 
 function securityHTML(info) {
   return `
@@ -191,6 +164,15 @@ function securityHTML(info) {
       </div>
 
       <div>
+        <article class="card" style="margin-bottom:16px">
+          <div class="card-head"><div><div class="card-title">${icon('server')}运行信息</div><div class="card-sub">当前服务实例</div></div></div>
+          <div class="kv"><span>版本</span><b>${escapeHtml(info.version)}</b></div>
+          <div class="kv"><span>Go 运行时</span><b>${escapeHtml(info.go_version)}</b></div>
+          <div class="kv"><span>已运行</span><b>${Math.floor(info.uptime_seconds / 3600)} 小时 ${Math.floor((info.uptime_seconds % 3600) / 60)} 分</b></div>
+          <div class="kv"><span>启动于</span><b>${fmtClock(info.started_at, info.timezone)}</b></div>
+          <div class="kv"><span>时区</span><b>${escapeHtml(info.timezone)}</b></div>
+        </article>
+
         <article class="card">
           <div class="card-head"><div><div class="card-title">${icon('shield')}安全与隐私</div></div></div>
           <div class="note" style="margin-bottom:10px">${icon('shield')}<div>账号 Cookie 与推送 Token 使用 AES-256-GCM 加密后保存在本机 SQLite，密钥文件位于数据目录，不会上传。</div></div>
@@ -252,34 +234,3 @@ function wireSecurity(ctx, host, info) {
     location.reload();
   });
 }
-
-/* ---------- 关于 tab ---------- */
-
-function aboutHTML(info) {
-  return `
-    <div class="settings-grid">
-      <div>
-        <article class="card">
-          <div class="card-head"><div><div class="card-title">${icon('info')}运行信息</div><div class="card-sub">当前服务实例</div></div></div>
-          <div class="kv"><span>版本</span><b>${escapeHtml(info.version)}</b></div>
-          <div class="kv"><span>Go 运行时</span><b>${escapeHtml(info.go_version)}</b></div>
-          <div class="kv"><span>已运行</span><b>${Math.floor(info.uptime_seconds / 3600)} 小时 ${Math.floor((info.uptime_seconds % 3600) / 60)} 分</b></div>
-          <div class="kv"><span>启动于</span><b>${fmtClock(info.started_at, info.timezone)}</b></div>
-          <div class="kv"><span>时区</span><b>${escapeHtml(info.timezone)}</b></div>
-        </article>
-      </div>
-      <div>
-        <article class="card">
-          <div class="card-head"><div><div class="card-title">${icon('bookOpen')}关于阅迹</div></div></div>
-          <p class="hint" style="font-size:12px;line-height:1.8">
-            阅迹（ReadTrace）是一个单文件、可自托管的微信读书阅读面板。
-            数据全部保存在本地，不需要数据库服务，把二进制和 <code>data/</code> 目录带走即可迁移。
-          </p>
-          <div class="hint" style="margin-top:12px">构建：<code>go build -o readtrace ./cmd/readtrace</code></div>
-        </article>
-      </div>
-    </div>
-  `;
-}
-
-
