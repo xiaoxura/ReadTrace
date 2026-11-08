@@ -18,53 +18,65 @@ type Scheduler struct {
 	st   *store.Store
 	eng  *engine.Engine
 	log  *slog.Logger
-	mu   sync.Mutex
+	opMu sync.Mutex // serializes Start/Add/Remove so a reload cannot interleave
+
+	mu   sync.Mutex // guards the fields below
 	cron *cron.Cron
 	loc  *time.Location
 	ids  map[int64]cron.EntryID
+	next map[int64]int64 // schedule id -> next fire unix, self-managed
 }
 
 var parser = cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor)
 
 // New creates a scheduler (call Start to activate it).
 func New(st *store.Store, eng *engine.Engine, log *slog.Logger) *Scheduler {
-	return &Scheduler{st: st, eng: eng, log: log, ids: map[int64]cron.EntryID{}, loc: time.Local}
+	return &Scheduler{
+		st: st, eng: eng, log: log,
+		ids: map[int64]cron.EntryID{}, next: map[int64]int64{}, loc: time.Local,
+	}
 }
 
 // Start builds a fresh cron instance for the timezone and registers all
-// enabled schedules.
+// enabled schedules. robfig/cron v3 does no internal locking, so Next times
+// are never read from cron.Entry(); they are computed with the parser here and
+// kept in s.next.
 func (s *Scheduler) Start(loc *time.Location) error {
 	if loc == nil {
 		loc = time.Local
 	}
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
+
 	s.mu.Lock()
 	if s.cron != nil {
 		s.cron.Stop()
 	}
 	s.loc = loc
-	s.cron = cron.New(cron.WithLocation(loc), cron.WithParser(parser),
+	c := cron.New(cron.WithLocation(loc), cron.WithParser(parser),
 		cron.WithChain(cron.Recover(cron.DefaultLogger)))
+	s.cron = c
 	s.ids = map[int64]cron.EntryID{}
+	s.next = map[int64]int64{}
 	s.mu.Unlock()
 
 	rows, err := s.st.EnabledSchedules()
 	if err != nil {
+		// Start the (empty) cron anyway so later Add() calls work.
+		s.mu.Lock()
+		c.Start()
+		s.mu.Unlock()
 		return err
 	}
-	for i := range rows {
-		if err := s.Add(&rows[i]); err != nil {
-			s.log.Warn("注册定时任务失败", "schedule", rows[i].ID, "cron", rows[i].Cron, "err", err)
-		}
-	}
-
 	s.mu.Lock()
-	s.cron.Start()
+	c.Start()
 	s.mu.Unlock()
-
-	// Persist next-run times now that entries are live.
 	for i := range rows {
-		next := s.Next(rows[i].ID)
-		_ = s.st.SetScheduleTimes(rows[i].ID, rows[i].LastRunAt, next)
+		if _, next, err := s.tryAdd(c, loc, &rows[i]); err != nil {
+			s.log.Warn("注册定时任务失败", "schedule", rows[i].ID, "cron", rows[i].Cron, "err", err)
+		} else {
+			_ = s.st.SetScheduleTimes(rows[i].ID, rows[i].LastRunAt, next.Unix())
+		}
 	}
 	return nil
 }
@@ -76,6 +88,8 @@ func (s *Scheduler) Reload(loc *time.Location) error {
 
 // Stop shuts the cron instance down.
 func (s *Scheduler) Stop() {
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.cron != nil {
@@ -85,66 +99,78 @@ func (s *Scheduler) Stop() {
 
 // Add registers one schedule. It is safe to call on a started scheduler.
 func (s *Scheduler) Add(v *store.Schedule) error {
-	spec := v.Cron
-	if _, err := parser.Parse(spec); err != nil {
-		return fmt.Errorf("Cron 表达式无效：%w", err)
-	}
-	id := v.ID
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
 
 	s.mu.Lock()
-	if old, ok := s.ids[id]; ok {
-		s.cron.Remove(old)
+	c := s.cron
+	loc := s.loc
+	s.mu.Unlock()
+	if c == nil {
+		return fmt.Errorf("调度器尚未启动")
 	}
-	entryID, err := s.cron.AddFunc(spec, func() { s.fire(id) })
+
+	s.mu.Lock()
+	old, ok := s.ids[v.ID]
+	s.mu.Unlock()
+	if ok {
+		c.Remove(old)
+	}
+	_, next, err := s.tryAdd(c, loc, v)
 	if err != nil {
-		s.mu.Unlock()
 		return err
 	}
-	s.ids[id] = entryID
-	next := s.cron.Entry(entryID).Next
-	s.mu.Unlock()
-
-	_ = s.st.SetScheduleTimes(id, v.LastRunAt, next.Unix())
+	_ = s.st.SetScheduleTimes(v.ID, v.LastRunAt, next.Unix())
 	return nil
+}
+
+// tryAdd registers one schedule on c and updates the next-time map. It must
+// only be called while opMu is held (or from Start, which holds it).
+func (s *Scheduler) tryAdd(c *cron.Cron, loc *time.Location, v *store.Schedule) (cron.EntryID, time.Time, error) {
+	schedParsed, err := parser.Parse(v.Cron)
+	if err != nil {
+		return 0, time.Time{}, fmt.Errorf("Cron 表达式无效：%w", err)
+	}
+	entryID, err := c.AddFunc(v.Cron, func() { s.fire(v.ID) })
+	if err != nil {
+		return 0, time.Time{}, err
+	}
+	next := schedParsed.Next(time.Now().In(loc))
+	s.mu.Lock()
+	s.ids[v.ID] = entryID
+	s.next[v.ID] = next.Unix()
+	s.mu.Unlock()
+	return entryID, next, nil
 }
 
 // Remove unregisters a schedule.
 func (s *Scheduler) Remove(id int64) {
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if entryID, ok := s.ids[id]; ok {
 		s.cron.Remove(entryID)
 		delete(s.ids, id)
 	}
+	delete(s.next, id)
 }
 
 // Next returns the next fire time for a schedule (zero when unknown).
 func (s *Scheduler) Next(id int64) int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	entryID, ok := s.ids[id]
-	if !ok || s.cron == nil {
-		return 0
-	}
-	next := s.cron.Entry(entryID).Next
-	if next.IsZero() {
-		return 0
-	}
-	return next.Unix()
+	return s.next[id]
 }
 
 // NextTimes returns the next fire timestamps for every registered schedule.
 func (s *Scheduler) NextTimes() map[int64]int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := make(map[int64]int64, len(s.ids))
-	if s.cron == nil {
-		return out
-	}
-	for id, entryID := range s.ids {
-		next := s.cron.Entry(entryID).Next
-		if !next.IsZero() {
-			out[id] = next.Unix()
+	out := make(map[int64]int64, len(s.next))
+	for id, n := range s.next {
+		if n > 0 {
+			out[id] = n
 		}
 	}
 	return out
@@ -158,21 +184,19 @@ func (s *Scheduler) Validate(expr string) error {
 
 // Preview returns the next n fire times for an expression.
 func (s *Scheduler) Preview(expr string, n int) ([]time.Time, error) {
-	sched, err := parser.Parse(expr)
+	schedParsed, err := parser.Parse(expr)
 	if err != nil {
 		return nil, err
 	}
 	if n <= 0 || n > 20 {
 		n = 5
 	}
-	s.mu.Lock()
-	loc := s.loc
-	s.mu.Unlock()
+	loc := s.Timezone()
 
 	out := make([]time.Time, 0, n)
 	cur := time.Now().In(loc)
 	for i := 0; i < n; i++ {
-		cur = sched.Next(cur)
+		cur = schedParsed.Next(cur)
 		if cur.IsZero() {
 			break
 		}
@@ -192,10 +216,21 @@ func (s *Scheduler) fire(id int64) {
 	v, err := s.st.GetSchedule(id)
 	if err != nil || v == nil {
 		s.log.Warn("定时任务不存在", "schedule", id, "err", err)
+		// The schedule row is gone (e.g. its account was deleted); drop the
+		// entry so it cannot keep firing on removed data.
+		s.Remove(id)
 		return
 	}
 	now := time.Now().Unix()
-	next := s.Next(id)
+	next := int64(0)
+	if schedParsed, perr := parser.Parse(v.Cron); perr == nil {
+		if nx := schedParsed.Next(time.Now().In(s.Timezone())); !nx.IsZero() {
+			next = nx.Unix()
+		}
+	}
+	s.mu.Lock()
+	s.next[id] = next
+	s.mu.Unlock()
 	_ = s.st.SetScheduleTimes(id, now, next)
 
 	acc, err := s.st.GetAccount(v.AccountID)

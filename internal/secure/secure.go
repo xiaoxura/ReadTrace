@@ -30,14 +30,22 @@ func New(dataDir string) (*Box, error) {
 		if _, err := rand.Read(key); err != nil {
 			return nil, err
 		}
-		if err := os.WriteFile(keyPath, key, 0o600); err != nil {
-			return nil, err
+		// Write through a temp file + rename so an interrupted first run can
+		// never leave a truncated (zero-length) key behind: every encrypted
+		// cookie would become unreadable.
+		tmp := keyPath + ".tmp"
+		if err := os.WriteFile(tmp, key, 0o600); err != nil {
+			return nil, fmt.Errorf("写入密钥文件失败: %w", err)
+		}
+		if err := os.Rename(tmp, keyPath); err != nil {
+			_ = os.Remove(tmp)
+			return nil, fmt.Errorf("保存密钥文件失败: %w", err)
 		}
 	} else if err != nil {
 		return nil, err
 	}
 	if len(key) != 32 {
-		return nil, fmt.Errorf("密钥文件损坏（长度 %d），请删除 %s 后重新登录账号", len(key), keyPath)
+		return nil, fmt.Errorf("密钥文件损坏（长度 %d）。删除 %s 可以重新开始，但所有已加密的 Cookie 将无法恢复，所有账号需要重新登录", len(key), keyPath)
 	}
 	block, err := aes.NewCipher(key)
 	if err != nil {

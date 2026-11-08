@@ -7,6 +7,6 @@ services:
     ports:
       - "8720:8720"
     volumes:
-      - ./data:/data
+      - ./data:/opt/readtrace/data
     environment:
       - TZ=Asia/Shanghai

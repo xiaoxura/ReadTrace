@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand"
+	"strconv"
 	"sync"
 	"time"
 
@@ -44,6 +45,16 @@ type activeRun struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	done   chan struct{}
+}
+
+// tickState carries cumulative counters across automatic retries so a retried
+// session keeps adding up on top of what the earlier attempts achieved.
+type tickState struct {
+	elapsed   int
+	success   int
+	failed    int // cumulative, persisted to the run row and shown in the UI
+	tickIndex int
+	last      time.Time // previous tick timestamp used by the signature
 }
 
 // Engine manages concurrent reading runs.
@@ -122,7 +133,11 @@ func (e *Engine) Start(acc *store.Account, minutes int, trigger string) (*store.
 	e.mu.Unlock()
 
 	e.hub.Publish(Event{Type: "run.start", RunID: run.ID, AccountID: acc.ID, TS: time.Now().Unix(), Data: e.progress(ar)})
-	e.logLine(ar, "info", fmt.Sprintf("开始阅读：目标 %s，间隔 %d 秒，模式 %s", humanMinutes(target), clampTick(acc.TickSeconds), modeName(acc.Mode)))
+	startMsg := fmt.Sprintf("开始阅读：目标 %s，间隔 %d 秒，模式 %s", humanMinutes(target), clampTick(acc.TickSeconds), modeName(acc.Mode))
+	if clampRetries(acc.MaxRetries) > 0 {
+		startMsg += fmt.Sprintf("，失败自动重试 %d 次（间隔 %d 秒）", clampRetries(acc.MaxRetries), clampDelay(acc.RetryDelay))
+	}
+	e.logLine(ar, "info", startMsg)
 	go e.loop(ar, acc, weread.Cookies(cookies), template)
 	return run, nil
 }
@@ -141,6 +156,23 @@ func (e *Engine) Stop(runID int64) error {
 	case <-time.After(8 * time.Second):
 	}
 	return nil
+}
+
+// StopByAccount cancels the account's active run, if any. Used when the
+// account itself is being removed so a racing run cannot keep writing rows.
+func (e *Engine) StopByAccount(accountID int64) {
+	e.mu.Lock()
+	var runID int64
+	for _, ar := range e.act {
+		if ar.accountID == accountID {
+			runID = ar.runID
+			break
+		}
+	}
+	e.mu.Unlock()
+	if runID > 0 {
+		_ = e.Stop(runID)
+	}
 }
 
 // StopAll cancels every active run (used on shutdown).
@@ -202,9 +234,10 @@ func (e *Engine) progressLocked(ar *activeRun) Progress {
 func (e *Engine) update(ar *activeRun, elapsed, success, failed int, status string) {
 	e.mu.Lock()
 	ar.elapsed, ar.success, ar.failed, ar.status = elapsed, success, failed, status
+	p := e.progressLocked(ar)
 	e.mu.Unlock()
 	_ = e.st.UpdateRunProgress(ar.runID, elapsed, success, failed)
-	e.hub.Publish(Event{Type: "run.tick", RunID: ar.runID, AccountID: ar.accountID, TS: time.Now().Unix(), Data: e.progress(ar)})
+	e.hub.Publish(Event{Type: "run.tick", RunID: ar.runID, AccountID: ar.accountID, TS: time.Now().Unix(), Data: p})
 }
 
 func (e *Engine) logLine(ar *activeRun, level, msg string) {
@@ -220,48 +253,72 @@ func (e *Engine) logLine(ar *activeRun, level, msg string) {
 }
 
 // loop performs the reading ticks until the target or an error is reached.
+// A failed session is automatically retried while the account allows it
+// (max_retries > 0); success, manual stop and non-retryable failures return
+// immediately.
 func (e *Engine) loop(ar *activeRun, acc *store.Account, ck weread.Cookies, template map[string]any) {
 	defer close(ar.done)
 
-	interval := time.Duration(clampTick(acc.TickSeconds)) * time.Second
 	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
-	elapsed, success, failed := 0, 0, 0
-	last := time.Now().Add(-interval)
-	status, errMsg := "success", ""
-	repairs, authRetried := 0, 0
+	tick := &tickState{last: time.Now()}
+	maxRetries := clampRetries(acc.MaxRetries)
+	retryDelay := time.Duration(clampDelay(acc.RetryDelay)) * time.Second
 	deadline := time.Now().Add(time.Duration(ar.target)*2*time.Second + 10*time.Minute)
-	tickIndex := 0
-
+	status, errMsg := "success", ""
 	finish := func(st, msg string) {
 		status, errMsg = st, msg
 	}
+
 	defer func() {
-		_ = e.st.FinishRun(ar.runID, status, elapsed, success, failed, errMsg)
-		e.mu.Lock()
-		ar.elapsed, ar.success, ar.failed, ar.status = elapsed, success, failed, status
-		delete(e.act, ar.runID)
-		e.mu.Unlock()
-
-		e.hub.Publish(Event{Type: "run.end", RunID: ar.runID, AccountID: acc.ID, TS: time.Now().Unix(),
-			Data: map[string]any{
-				"run_id": ar.runID, "account_id": acc.ID, "account_name": acc.Name,
-				"status": status, "error": errMsg, "elapsed": elapsed,
-				"success": success, "failed": failed, "target": ar.target,
-			}})
-
-		if status == "success" {
-			e.logLine(ar, "info", fmt.Sprintf("阅读完成，本次计入约 %s", humanMinutes(elapsed)))
-		} else if status == "stopped" {
-			e.logLine(ar, "warn", fmt.Sprintf("已手动停止，本次计入约 %s", humanMinutes(elapsed)))
-		} else {
-			e.logLine(ar, "error", "阅读失败："+errMsg)
+		// A panic anywhere in the loop is caught here so one broken account
+		// cannot take down the whole process. This defer runs before
+		// close(ar.done), so Stop()/StopAll() waiters still return normally.
+		if r := recover(); r != nil {
+			status, errMsg = "failed", fmt.Sprintf("内部错误：%v", r)
+			e.log.Error("阅读循环 panic", "run", ar.runID, "account", acc.ID, "panic", r)
 		}
+		e.finalize(ar, acc, status, errMsg, tick, ar.target)
+	}()
 
-		if acc.PushChannelID > 0 {
-			go e.notifyResult(acc, ar, status, errMsg, elapsed)
+	for attempt := 0; ; attempt++ {
+		if attempt > 0 {
+			e.logLine(ar, "info", fmt.Sprintf("第 %d/%d 次自动重试，%s 后重新开始",
+				attempt, maxRetries, humanDelay(retryDelay)))
+			if !sleepCtx(ar.ctx, retryDelay) {
+				finish("stopped", "")
+				return
+			}
+		}
+		st, msg, retryable := e.session(ar, acc, ck, template, rnd, tick, deadline)
+		finish(st, msg)
+		if st != "failed" || !retryable || attempt >= maxRetries {
+			return
+		}
+	}
+}
+
+// session runs one full reading session (renewal + heartbeat loop) and never
+// panics past its own recover: the third return states whether the failure is
+// worth retrying (network hiccups yes, a dead login no).
+func (e *Engine) session(ar *activeRun, acc *store.Account, ck weread.Cookies,
+	template map[string]any, rnd *rand.Rand, tick *tickState, deadline time.Time,
+) (status, errMsg string, retryable bool) {
+	finishS := func(st, msg string, r bool) {
+		status, errMsg, retryable = st, msg, r
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			status, errMsg, retryable = "failed", fmt.Sprintf("内部错误：%v", r), false
+			e.log.Error("阅读会话 panic", "run", ar.runID, "account", acc.ID, "panic", r)
 		}
 	}()
 
+	interval := time.Duration(clampTick(acc.TickSeconds)) * time.Second
+	elapsed, success := tick.elapsed, tick.success
+	// consecutiveFailures counts failures since the last success within this
+	// session; tick.failed stays cumulative for the run record.
+	consecutive := 0
+	authRetried, repairs := 0, 0
 	// Refresh the session up front; failures are non-fatal.
 	if key, err := e.wc.Renew(ar.ctx, ck); err == nil && key != "" {
 		_ = e.st.SaveCookies(acc.ID, map[string]string(ck))
@@ -272,61 +329,64 @@ func (e *Engine) loop(ar *activeRun, acc *store.Account, ck weread.Cookies, temp
 
 	for elapsed < ar.target {
 		if ar.ctx.Err() != nil {
-			finish("stopped", "")
+			finishS("stopped", "", false)
 			return
 		}
 		if time.Now().After(deadline) {
-			finish("failed", "运行超时，已自动终止")
+			finishS("failed", "运行超时，已自动终止", false)
 			return
 		}
 
-		tickIndex++
-		payload := weread.SignPayload(e.buildPayload(template, acc, tickIndex, rnd), time.Now(), last, rnd)
+		tick.tickIndex++
+		payload := weread.SignPayload(e.buildPayload(template, acc, tick.tickIndex, rnd), time.Now(), tick.last, rnd)
 		now := time.Now()
 
 		res, err := e.wc.Read(ar.ctx, ck, payload)
 		if ar.ctx.Err() != nil {
-			finish("stopped", "")
+			finishS("stopped", "", false)
 			return
 		}
 		if err != nil {
-			failed++
-			e.logLine(ar, "warn", fmt.Sprintf("第 %d 次请求失败：%v", tickIndex, err))
-			if failed >= 5 {
-				finish("failed", "连续请求失败："+err.Error())
+			consecutive++
+			tick.failed++
+			e.logLine(ar, "warn", fmt.Sprintf("第 %d 次请求失败：%v", tick.tickIndex, err))
+			e.update(ar, elapsed, success, tick.failed, "running")
+			if consecutive >= 5 {
+				finishS("failed", fmt.Sprintf("连续请求失败：%v", err), true)
 				return
 			}
-			if !sleepCtx(ar.ctx, backoff(failed)) {
-				finish("stopped", "")
+			if !sleepCtx(ar.ctx, backoff(consecutive)) {
+				finishS("stopped", "", false)
 				return
 			}
-			e.update(ar, elapsed, success, failed, "running")
 			continue
 		}
 
 		switch {
 		case res.Succ && res.HasSyncKey:
-			repairs, authRetried, failed = 0, 0, 0
+			repairs, authRetried, consecutive = 0, 0, 0
 			success++
 			elapsed += int(interval.Seconds())
 			if elapsed > ar.target {
 				elapsed = ar.target
 			}
-			last = now
-			e.update(ar, elapsed, success, failed, "running")
+			tick.last = now
+			e.update(ar, elapsed, success, tick.failed, "running")
 			e.logLine(ar, "info", fmt.Sprintf("第 %d 次成功 · 已读 %s / %s · synckey=%d",
-				tickIndex, humanMinutes(elapsed), humanMinutes(ar.target), res.SyncKey))
+				tick.tickIndex, humanMinutes(elapsed), humanMinutes(ar.target), res.SyncKey))
 			if !sleepCtx(ar.ctx, interval) {
-				finish("stopped", "")
+				finishS("stopped", "", false)
 				return
 			}
 
 		case res.Succ:
 			repairs++
-			failed++
-			e.logLine(ar, "warn", fmt.Sprintf("第 %d 次未返回 synckey，尝试修复（%d/3）", tickIndex, repairs))
+			consecutive++
+			tick.failed++
+			e.logLine(ar, "warn", fmt.Sprintf("第 %d 次未返回 synckey，尝试修复（%d/3）", tick.tickIndex, repairs))
+			e.update(ar, elapsed, success, tick.failed, "running")
 			if repairs > 3 {
-				finish("failed", "连续多次未获得 synckey，已停止")
+				finishS("failed", "连续多次未获得 synckey，已停止", true)
 				return
 			}
 			bookID, _ := payload["b"].(string)
@@ -334,25 +394,26 @@ func (e *Engine) loop(ar *activeRun, acc *store.Account, ck weread.Cookies, temp
 				e.logLine(ar, "warn", "修复 synckey 请求失败："+err.Error())
 			}
 			if !sleepCtx(ar.ctx, 5*time.Second) {
-				finish("stopped", "")
+				finishS("stopped", "", false)
 				return
 			}
-			e.update(ar, elapsed, success, failed, "running")
 
 		default:
-			failed++
+			consecutive++
+			tick.failed++
 			if isAuthError(res.ErrCode) {
 				e.logLine(ar, "warn", fmt.Sprintf("登录状态异常（errCode=%d），尝试自动续期", res.ErrCode))
+				e.update(ar, elapsed, success, tick.failed, "running")
 				if authRetried >= 2 {
 					_ = e.st.SetAccountStatus(acc.ID, "expired", "登录已失效，请重新扫码登录", time.Now().Unix())
-					finish("failed", "登录已失效，请重新扫码登录")
+					finishS("failed", "登录已失效，请重新扫码登录", false)
 					return
 				}
 				authRetried++
 				key, renewErr := e.wc.Renew(ar.ctx, ck)
 				if renewErr != nil || key == "" {
 					_ = e.st.SetAccountStatus(acc.ID, "expired", "登录已失效，请重新扫码登录", time.Now().Unix())
-					finish("failed", "登录已失效，请重新扫码登录")
+					finishS("failed", "登录已失效，请重新扫码登录", false)
 					return
 				}
 				_ = e.st.SaveCookies(acc.ID, map[string]string(ck))
@@ -365,19 +426,51 @@ func (e *Engine) loop(ar *activeRun, acc *store.Account, ck weread.Cookies, temp
 			if msg == "" {
 				msg = fmt.Sprintf("errCode=%d", res.ErrCode)
 			}
-			e.logLine(ar, "warn", fmt.Sprintf("第 %d 次返回异常：%s", tickIndex, msg))
-			if failed >= 5 {
-				finish("failed", "接口持续返回异常："+msg)
+			e.logLine(ar, "warn", fmt.Sprintf("第 %d 次返回异常：%s", tick.tickIndex, msg))
+			e.update(ar, elapsed, success, tick.failed, "running")
+			if consecutive >= 5 {
+				finishS("failed", "接口持续返回异常："+msg, true)
 				return
 			}
-			if !sleepCtx(ar.ctx, backoff(failed)) {
-				finish("stopped", "")
+			if !sleepCtx(ar.ctx, backoff(consecutive)) {
+				finishS("stopped", "", false)
 				return
 			}
-			e.update(ar, elapsed, success, failed, "running")
 		}
 	}
-	finish("success", "")
+	finishS("success", "", false)
+	return
+}
+
+// finalize persists the run result, broadcasts run.end and pushes the
+// notification.
+func (e *Engine) finalize(ar *activeRun, acc *store.Account, inStatus, errMsg string, tick *tickState, target int) {
+	status, errMsg := inStatus, errMsg
+	elapsed, success, failed := tick.elapsed, tick.success, tick.failed
+	_ = e.st.FinishRun(ar.runID, status, elapsed, success, failed, errMsg)
+	e.mu.Lock()
+	ar.elapsed, ar.success, ar.failed, ar.status = elapsed, success, failed, status
+	delete(e.act, ar.runID)
+	e.mu.Unlock()
+
+	e.hub.Publish(Event{Type: "run.end", RunID: ar.runID, AccountID: acc.ID, TS: time.Now().Unix(),
+		Data: map[string]any{
+			"run_id": ar.runID, "account_id": acc.ID, "account_name": acc.Name,
+			"status": status, "error": errMsg, "elapsed": elapsed,
+			"success": success, "failed": failed, "target": target,
+		}})
+
+	if status == "success" {
+		e.logLine(ar, "info", fmt.Sprintf("阅读完成，本次计入约 %s", humanMinutes(elapsed)))
+	} else if status == "stopped" {
+		e.logLine(ar, "warn", fmt.Sprintf("已手动停止，本次计入约 %s", humanMinutes(elapsed)))
+	} else {
+		e.logLine(ar, "error", "阅读失败："+errMsg)
+	}
+
+	if acc.PushChannelID > 0 {
+		go e.notifyResult(acc, ar, status, errMsg, elapsed)
+	}
 }
 
 func (e *Engine) buildPayload(template map[string]any, acc *store.Account, tick int, rnd *rand.Rand) map[string]any {
@@ -420,17 +513,29 @@ func (e *Engine) notifyResult(acc *store.Account, ar *activeRun, status, errMsg 
 	if err != nil || ch == nil {
 		return
 	}
+	kind := notify.KindSuccess
 	title := "微信读书 · 阅读完成"
 	if status == "failed" {
-		title = "微信读书 · 阅读失败"
+		kind, title = notify.KindFailed, "微信读书 · 阅读失败"
 	} else if status == "stopped" {
-		title = "微信读书 · 已停止"
+		kind, title = notify.KindFailed, "微信读书 · 已停止"
 	}
-	content := fmt.Sprintf("账号：%s\n计划：%s\n实际：%s\n状态：%s",
+	vars := map[string]string{
+		"account": acc.Name,
+		"status":  statusLabel(status),
+		"plan":    humanMinutes(ar.target),
+		"elapsed": humanMinutes(elapsed),
+		"success": strconv.Itoa(ar.success),
+		"failed":  strconv.Itoa(ar.failed),
+		"error":   errMsg,
+		"time":    time.Now().Format("2006-01-02 15:04:05"),
+	}
+	fallback := fmt.Sprintf("账号：%s\n计划：%s\n实际：%s\n状态：%s",
 		acc.Name, humanMinutes(ar.target), humanMinutes(elapsed), statusLabel(status))
 	if errMsg != "" {
-		content += "\n详情：" + errMsg
+		fallback += "\n详情：" + errMsg
 	}
+	title, content := notify.BuildMessage(ch.Templates, kind, title, fallback, vars)
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
 	if err := e.nt.Send(ctx, *ch, title, content); err != nil {
@@ -479,6 +584,35 @@ func clampTick(v int) int {
 		return 300
 	}
 	return v
+}
+
+// clampRetries keeps the retry count in 0..10.
+func clampRetries(v int) int {
+	if v < 0 {
+		return 0
+	}
+	if v > 10 {
+		return 10
+	}
+	return v
+}
+
+// clampDelay keeps the retry delay in 5..600 seconds (0 means default 15).
+func clampDelay(v int) int {
+	if v <= 0 {
+		return 15
+	}
+	if v > 600 {
+		return 600
+	}
+	return v
+}
+
+func humanDelay(d time.Duration) string {
+	if d < time.Minute {
+		return fmt.Sprintf("%d 秒", int(d.Seconds()))
+	}
+	return fmt.Sprintf("%d 分钟", int(d.Minutes()))
 }
 
 func isAuthError(code int) bool {

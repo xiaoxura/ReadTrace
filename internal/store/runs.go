@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"time"
 )
 
 const runCols = `r.id, r.account_id, COALESCE(a.name, ''), r.trigger, r.plan_seconds,
@@ -112,6 +113,34 @@ func (s *Store) RunsSince(since int64) ([]Run, error) {
 		out = append(out, *r)
 	}
 	return out, rows.Err()
+}
+
+// PurgeHistory deletes finished runs older than retainDays, together with
+// their run_logs rows. Runs that are still running (or failed to finish) are
+// never touched. Returns the number of runs deleted.
+func (s *Store) PurgeHistory(retainDays int) (int64, error) {
+	if retainDays <= 0 {
+		return 0, nil
+	}
+	cutoff := time.Now().AddDate(0, 0, -retainDays).Unix()
+	return s.PurgeHistoryBefore(cutoff)
+}
+
+// PurgeHistoryBefore deletes finished runs with finished_at < cutoff.
+// Exposed as-is so tests can pin the cutoff. Bot chat history shares the
+// same retention window with keyed cleanup below.
+func (s *Store) PurgeHistoryBefore(cutoff int64) (int64, error) {
+	if _, err := s.db.Exec(`DELETE FROM run_logs WHERE run_id IN
+		(SELECT id FROM runs WHERE finished_at > 0 AND finished_at < ?)`, cutoff); err != nil {
+		return 0, err
+	}
+	res, err := s.db.Exec(`DELETE FROM runs WHERE finished_at > 0 AND finished_at < ?`, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	_, _ = s.db.Exec(`DELETE FROM bot_messages WHERE ts < ?`, cutoff)
+	return n, nil
 }
 
 // InterruptRunningRuns marks leftover running rows as interrupted (called on

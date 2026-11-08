@@ -3,35 +3,37 @@ import { state, refreshAccounts, refreshSchedules } from '../state.js';
 import { icon } from '../icons.js';
 import { addScheduleDialog } from '../components.js';
 import {
-  $, $$, escapeHtml, humanCron, fmtClock, relativeSeconds, relTime, toast, confirmDialog,
+  renderError, skeletonHTML, bindCountdown, bindEnabledToggle,
+} from '../helpers.js';
+import {
+  $, $$, escapeHtml, humanCron, fmtClock, relativeSeconds, relTime, confirmDialog, toast,
+  pageHeaderHTML,
 } from '../util.js';
 
 export async function renderSchedules(ctx) {
   const { root } = ctx;
-  root.innerHTML = `<div class="page-loading"><div class="skeleton" style="height:70px;width:45%"></div><div class="skeleton" style="height:260px"></div></div>`;
+  root.innerHTML = skeletonHTML(['height:70px;width:45%', 'height:260px']);
 
   try {
     if (!state.accounts.length) await refreshAccounts();
+    if (!ctx.isActive()) return;
     await refreshSchedules();
   } catch (e) {
-    root.innerHTML = `<div class="card"><div class="empty"><div class="empty-ico">${icon('alert')}</div><h3>加载失败</h3><p>${escapeHtml(e.message)}</p></div></div>`;
+    renderError(root, e, { onRetry: () => ctx.reload() });
     return;
   }
+  if (!ctx.isActive()) return;
 
   const list = state.schedules;
   const enabled = list.filter((s) => s.enabled).length;
 
   root.innerHTML = `
-    <div class="topbar">
-      <div>
-        <div class="page-kicker">定时任务</div>
-        <h1 class="page-title">让阅读自动发生</h1>
-        <div class="page-sub">${list.length ? `共 ${list.length} 个任务 · ${enabled} 个已启用 · 时区 ${escapeHtml(state.tz)}` : '设置一个时间，到点自动开始阅读'}</div>
-      </div>
-      <div class="top-actions">
-        <button class="btn btn-primary" id="btn-add">${icon('plus')}<span>新建定时</span></button>
-      </div>
-    </div>
+    ${pageHeaderHTML({
+      kicker: '定时',
+      title: '定时任务',
+      sub: `${list.length} 个任务 · ${enabled} 个启用中`,
+      actions: `<button class="btn btn-primary" id="btn-add">${icon('plus')}<span>新建定时</span></button>`,
+    })}
 
     <article class="card">
       ${list.length ? `<div class="list" style="gap:0">${list.map((s) => scheduleRow(s)).join('')}</div>` : `
@@ -48,33 +50,30 @@ export async function renderSchedules(ctx) {
       <div>定时任务使用标准 5 段 cron 表达式（分 时 日 月 周）。服务需要保持运行，任务才会按时触发。</div>
     </div>
   `;
+  if (!ctx.isActive()) return;
 
   const openAdd = () => addScheduleDialog({ onDone: () => ctx.reload() });
   $('#btn-add', root)?.addEventListener('click', openAdd);
   $('#empty-add', root)?.addEventListener('click', openAdd);
 
-  $$('[data-toggle]', root).forEach((input) => {
-    input.addEventListener('change', async () => {
-      const id = Number(input.dataset.toggle);
-      try {
-        await api.updateSchedule(id, { enabled: input.checked });
-        toast(input.checked ? '已启用，任务将按计划执行' : '已暂停该任务', 'ok');
-        await refreshSchedules();
-        ctx.reload();
-      } catch (e) {
-        input.checked = !input.checked;
-        toast(e.message, 'error');
-      }
-    });
+  bindEnabledToggle($$('[data-toggle]', root), {
+    call: (input) => api.updateSchedule(Number(input.dataset.toggle), { enabled: input.checked }),
+    labels: { on: '已启用，任务将按计划执行', off: '已暂停该任务' },
+    onSuccess: async () => {
+      await refreshSchedules();
+      ctx.reload();
+    },
   });
 
   $$('[data-edit]', root).forEach((btn) => btn.addEventListener('click', () => {
     const s = state.schedules.find((x) => x.id === Number(btn.dataset.edit));
+    if (!s) return;
     addScheduleDialog({ schedule: s, onDone: () => ctx.reload() });
   }));
 
   $$('[data-del]', root).forEach((btn) => btn.addEventListener('click', async () => {
     const s = state.schedules.find((x) => x.id === Number(btn.dataset.del));
+    if (!s) return;
     const ok = await confirmDialog({
       title: '删除定时任务',
       message: `确定删除「${humanCron(s.cron)}（${s.account_name || '账号'}）」吗？`,
@@ -91,15 +90,11 @@ export async function renderSchedules(ctx) {
     }
   }));
 
-  const timer = setInterval(() => {
-    $$('[data-countdown]').forEach((el) => {
-      el.textContent = relativeSeconds(Number(el.dataset.countdown), state.tz);
-    });
-  }, 30000);
-  ctx.onCleanup(() => clearInterval(timer));
+  bindCountdown(ctx);
 }
 
 function scheduleRow(s) {
+  const hasNext = !!(s.enabled && s.next_run_at);
   return `<div class="schedule-row">
     <div class="schedule-icon ${s.enabled ? 'on' : ''}">${icon('clock')}</div>
     <div class="schedule-main">
@@ -114,13 +109,13 @@ function scheduleRow(s) {
       </div>
     </div>
     <div class="schedule-next">
-      <b data-countdown="${s.next_run_at}">${s.enabled && s.next_run_at ? relativeSeconds(s.next_run_at, state.tz) : '—'}</b>
-      <span>${s.enabled && s.next_run_at ? fmtClock(s.next_run_at, state.tz) : '已暂停'}</span>
+      <b${hasNext ? ` data-countdown="${s.next_run_at}"` : ''}>${hasNext ? relativeSeconds(s.next_run_at, state.tz) : '—'}</b>
+      <span>${hasNext ? fmtClock(s.next_run_at, state.tz) : '已暂停'}</span>
     </div>
     <label class="switch" title="${s.enabled ? '暂停' : '启用'}">
-      <input type="checkbox" data-toggle="${s.id}" ${s.enabled ? 'checked' : ''}><i></i>
+      <input type="checkbox" data-toggle="${s.id}" ${s.enabled ? 'checked' : ''} aria-label="${s.enabled ? '暂停任务' : '启用任务'}"><i></i>
     </label>
-    <button class="btn btn-sm btn-ghost btn-icon" data-edit="${s.id}" title="编辑">${icon('edit')}</button>
-    <button class="btn btn-sm btn-ghost btn-icon" data-del="${s.id}" title="删除">${icon('trash')}</button>
+    <button class="btn btn-sm btn-ghost btn-icon" data-edit="${s.id}" title="编辑" aria-label="编辑任务">${icon('edit')}</button>
+    <button class="btn btn-sm btn-ghost btn-icon" data-del="${s.id}" title="删除" aria-label="删除任务">${icon('trash')}</button>
   </div>`;
 }

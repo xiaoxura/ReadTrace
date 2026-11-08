@@ -15,12 +15,14 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 	_ "time/tzdata" // embed the IANA database so -trimpath builds still resolve zones
 
 	"readtrace/internal/api"
+	"readtrace/internal/checker"
 	"readtrace/internal/engine"
 	"readtrace/internal/notify"
 	"readtrace/internal/sched"
@@ -28,17 +30,22 @@ import (
 	"readtrace/internal/store"
 	"readtrace/internal/webui"
 	"readtrace/internal/weread"
+	"readtrace/internal/wxbot"
 )
 
 var version = "dev"
 
 func main() {
 	addr := flag.String("addr", envAny([]string{"READTRACE_ADDR", "WXREAD_ADDR"}, "127.0.0.1:8720"), "监听地址，例如 127.0.0.1:8720 或 0.0.0.0:8720")
-	dataDir := flag.String("data", envAny([]string{"READTRACE_DATA", "WXREAD_DATA"}, "data"), "数据目录（SQLite 与密钥）")
+	dataDir := flag.String("data", defaultDataDir(), "数据目录（SQLite 与密钥），默认为可执行文件同级的 data 目录")
 	noOpen := flag.Bool("no-open", false, "启动后不自动打开浏览器")
 	level := flag.String("log-level", envAny([]string{"READTRACE_LOG_LEVEL", "WXREAD_LOG_LEVEL"}, "info"), "日志级别 debug/info/warn/error")
 	showVersion := flag.Bool("version", false, "输出版本号")
 	resetPassword := flag.Bool("reset-password", false, "清除面板管理密码（下次启动重新设置）")
+	retainDays := flag.Int("retain-days", envInt([]string{"READTRACE_RETAIN_DAYS", "WXREAD_RETAIN_DAYS"}, 90),
+		"运行记录保留天数（含日志），0 表示永久保留")
+	hostAllow := flag.String("host-allow", envAny([]string{"READTRACE_HOST_ALLOW", "WXREAD_HOST_ALLOW"}, ""),
+		"允许的 Host 白名单（逗号分隔的主机名），为空不校验；绑定 0.0.0.0 时建议设置")
 	flag.Parse()
 
 	if *showVersion {
@@ -59,13 +66,13 @@ func main() {
 	}))
 	slog.SetDefault(logger)
 
-	if err := run(*addr, *dataDir, !*noOpen, logger); err != nil {
+	if err := run(*addr, *dataDir, !*noOpen, *retainDays, *hostAllow, logger); err != nil {
 		logger.Error("启动失败", "err", err)
 		os.Exit(1)
 	}
 }
 
-func run(addr, dataDir string, openBrowser bool, logger *slog.Logger) error {
+func run(addr, dataDir string, openBrowser bool, retainDays int, hostAllow string, logger *slog.Logger) error {
 	box, err := secure.New(dataDir)
 	if err != nil {
 		return fmt.Errorf("初始化加密密钥失败: %w", err)
@@ -80,6 +87,16 @@ func run(addr, dataDir string, openBrowser bool, logger *slog.Logger) error {
 		logger.Warn("清理中断运行记录失败", "err", err)
 	}
 	_ = st.PurgeSessions()
+
+	// Purge old history now and once a day, so the DB does not grow forever.
+	if n, err := st.PurgeHistory(retainDays); err != nil {
+		logger.Warn("清理历史运行记录失败", "err", err)
+	} else if n > 0 {
+		logger.Info("已清理历史运行记录", "runs", n)
+	} else if retainDays > 0 {
+		logger.Info("历史运行记录保留策略", "retain_days", retainDays)
+	}
+	go purgeDaily(st, retainDays, logger)
 
 	// Seed defaults on first run.
 	if v, _ := st.GetSetting("site_name"); strings.TrimSpace(v) == "" {
@@ -106,9 +123,19 @@ func run(addr, dataDir string, openBrowser bool, logger *slog.Logger) error {
 	if err := sch.Start(loc); err != nil {
 		return fmt.Errorf("启动定时任务失败: %w", err)
 	}
-	defer sch.Stop()
+	// 后台账号状态检测：按设置中的间隔自动校验登录态，发现失效可推送提醒。
+	chk := checker.New(st, eng, client, nt, logger)
+	chk.Start()
+	defer chk.Wait()
 
-	srv := api.New(st, eng, sch, nt, client, webui.FS(), version, logger)
+	// 微信机器人渠道：绑定后即可在微信里登录账号、开跑阅读、管理定时任务。
+	bot := wxbot.New(st, client, eng, sch, hub, logger)
+	bot.EnsureOwnerAdmin()
+	if wxbot.Enabled(st) {
+		bot.Start()
+	}
+
+	srv := api.New(st, eng, sch, nt, client, bot, webui.FS(), version, parseHostAllow(hostAllow), logger)
 	httpServer := &http.Server{
 		Addr:              addr,
 		Handler:           srv.Handler(),
@@ -141,13 +168,45 @@ func run(addr, dataDir string, openBrowser bool, logger *slog.Logger) error {
 	<-stop
 	logger.Info("收到退出信号，正在停止任务...")
 
+	// Stop producing first, then release SSE subscribers so the HTTP server
+	// has no long-lived connections left to wait on.
+	bot.Stop()
+	sch.Stop()
+	eng.StopAll()
+	eng.Hub().CloseAll()
 	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 	defer cancel()
 	_ = httpServer.Shutdown(ctx)
-	eng.StopAll()
-	sch.Stop()
 	logger.Info("已安全退出")
 	return nil
+}
+
+// purgeDaily re-runs history retention once a day while the process lives.
+func purgeDaily(st *store.Store, retainDays int, logger *slog.Logger) {
+	if retainDays <= 0 {
+		return
+	}
+	t := time.NewTicker(24 * time.Hour)
+	defer t.Stop()
+	for range t.C {
+		if n, err := st.PurgeHistory(retainDays); err != nil {
+			logger.Warn("清理历史运行记录失败", "err", err)
+		} else if n > 0 {
+			logger.Info("已清理历史运行记录", "runs", n)
+		}
+	}
+}
+
+// parseHostAllow turns a comma-separated allowlist into a normalized list.
+func parseHostAllow(s string) []string {
+	var out []string
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
 }
 
 func resetPanelPassword(dataDir string) error {
@@ -201,6 +260,29 @@ func absPath(p string) string {
 	return abs
 }
 
+// defaultDataDir keeps the binary and its data together: unless READTRACE_DATA
+// (or the legacy WXREAD_DATA) is set, data lives in the `data` directory next
+// to the executable rather than next to the working directory.
+func defaultDataDir() string {
+	for _, key := range []string{"READTRACE_DATA", "WXREAD_DATA"} {
+		if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+			return v
+		}
+	}
+	return filepath.Join(exeDir(), "data")
+}
+
+func exeDir() string {
+	p, err := os.Executable()
+	if err != nil {
+		return "."
+	}
+	if resolved, err := filepath.EvalSymlinks(p); err == nil {
+		p = resolved
+	}
+	return filepath.Dir(p)
+}
+
 func dbFilePath(dataDir string) string {
 	newPath := filepath.Join(dataDir, "readtrace.db")
 	legacy := filepath.Join(dataDir, "wxread.db")
@@ -226,11 +308,16 @@ func envAny(keys []string, def string) string {
 	return def
 }
 
-func envOr(key, def string) string {
-	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
-		return v
+func envInt(keys []string, def int) int {
+	v := envAny(keys, "")
+	if v == "" {
+		return def
 	}
-	return def
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return def
+	}
+	return n
 }
 
 func parseLevel(s string) slog.Level {

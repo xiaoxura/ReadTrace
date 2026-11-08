@@ -12,8 +12,8 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"readtrace/internal/engine"
@@ -21,6 +21,7 @@ import (
 	"readtrace/internal/sched"
 	"readtrace/internal/store"
 	"readtrace/internal/weread"
+	"readtrace/internal/wxbot"
 )
 
 // Server bundles the HTTP dependencies.
@@ -30,24 +31,40 @@ type Server struct {
 	sch     *sched.Scheduler
 	nt      *notify.Sender
 	wc      *weread.Client
+	wxBot   *wxbot.Bot
 	qr      *qrManager
 	log     *slog.Logger
 	assets  fs.FS
 	version string
 	started time.Time
 	limiter *loginLimiter
+
+	allowedHosts []string                      // optional Host allowlist (DNS-rebinding defense)
+	tz           atomic.Pointer[time.Location] // cached site timezone
 }
 
-// New creates the API server.
+// New creates the API server. allowedHosts, when non-empty, restricts which
+// Host headers the panel answers to (a DNS-rebinding defense for when the
+// service is exposed beyond loopback); each entry is a bare hostname or IP.
 func New(st *store.Store, eng *engine.Engine, sch *sched.Scheduler, nt *notify.Sender,
-	wc *weread.Client, assets fs.FS, version string, log *slog.Logger) *Server {
+	wc *weread.Client, bot *wxbot.Bot, assets fs.FS, version string, allowedHosts []string, log *slog.Logger) *Server {
 	s := &Server{
-		st: st, eng: eng, sch: sch, nt: nt, wc: wc, log: log,
+		st: st, eng: eng, sch: sch, nt: nt, wc: wc, wxBot: bot, log: log,
 		assets: assets, version: version, started: time.Now(),
-		limiter: newLoginLimiter(),
+		limiter: newLoginLimiter(), allowedHosts: allowedHosts,
 	}
-	s.qr = newQRManager(st, wc, log)
+	if tz, err := time.LoadLocation(strings.TrimSpace(mustSetting(st, keyTimezone))); err == nil {
+		s.tz.Store(tz)
+	} else {
+		s.tz.Store(time.Local)
+	}
+	s.qr = newQRManager(st, wc, log, eng.IsRunning)
 	return s
+}
+
+func mustSetting(st *store.Store, key string) string {
+	v, _ := st.GetSetting(key)
+	return v
 }
 
 // Handler builds the router with middleware.
@@ -105,6 +122,21 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/settings", s.auth(s.handleSettingsUpdate))
 	mux.HandleFunc("POST /api/settings/password", s.auth(s.handlePasswordChange))
 
+	// WeChat bot management (admin panel).
+	mux.HandleFunc("GET /api/wxbot", s.auth(s.handleWxBotStatus))
+	mux.HandleFunc("POST /api/wxbot/login", s.auth(s.handleWxBotLogin))
+	mux.HandleFunc("GET /api/wxbot/login", s.auth(s.handleWxBotLoginStatus))
+	mux.HandleFunc("POST /api/wxbot/login/otp", s.auth(s.handleWxBotLoginOTP))
+	mux.HandleFunc("POST /api/wxbot/enabled", s.auth(s.handleWxBotEnabled))
+	mux.HandleFunc("POST /api/wxbot/push", s.auth(s.handleWxBotPush))
+	mux.HandleFunc("GET /api/wxbot/users", s.auth(s.handleWxBotUsers))
+	mux.HandleFunc("GET /api/wxbot/messages", s.auth(s.handleWxBotMessages))
+	mux.HandleFunc("POST /api/wxbot/users/admin", s.auth(s.handleWxBotUserAdmin))
+	mux.HandleFunc("DELETE /api/wxbot/users/{uid}", s.auth(s.handleWxBotUserDelete))
+	mux.HandleFunc("POST /api/wxbot/bind", s.auth(s.handleWxBotBind))
+	mux.HandleFunc("POST /api/wxbot/unbind", s.auth(s.handleWxBotUnbind))
+	mux.HandleFunc("POST /api/wxbot/logout", s.auth(s.handleWxBotLogout))
+
 	// Static UI.
 	fileServer := http.FileServerFS(s.assets)
 	mux.Handle("GET /assets/", http.StripPrefix("/assets/", cacheControl(fileServer)))
@@ -129,6 +161,10 @@ func (s *Server) recoverMW(next http.Handler) http.Handler {
 
 func (s *Server) securityMW(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if len(s.allowedHosts) > 0 && !hostAllowed(r.Host, s.allowedHosts) {
+			s.writeErr(w, http.StatusForbidden, "拒绝访问：Host 不在白名单中")
+			return
+		}
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "same-origin")
@@ -136,6 +172,25 @@ func (s *Server) securityMW(next http.Handler) http.Handler {
 			"default-src 'self'; img-src 'self' data: https:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'")
 		next.ServeHTTP(w, r)
 	})
+}
+
+// hostAllowed compares the request Host (port stripped) against the allowlist,
+// case-insensitively. Loopback forms are always rejected-or-allowed by the
+// list itself; the list is the single source of truth.
+func hostAllowed(host string, allowed []string) bool {
+	name := strings.ToLower(strings.TrimSpace(host))
+	if name == "" {
+		return false
+	}
+	if h, _, err := net.SplitHostPort(name); err == nil && h != "" {
+		name = strings.ToLower(h)
+	}
+	for _, a := range allowed {
+		if a = strings.ToLower(strings.TrimSpace(a)); a != "" && name == a {
+			return true
+		}
+	}
+	return false
 }
 
 type statusWriter struct {
@@ -183,6 +238,11 @@ func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 			s.clearSessionCookie(w)
 			s.writeErr(w, http.StatusUnauthorized, "登录已过期，请重新登录")
 			return
+		}
+		// Rolling TTL: extend a session once fewer than 15 days remain so
+		// active users are never logged out mid-use.
+		if ses.ExpiresAt-time.Now().Unix() < int64(15*24*time.Hour.Seconds()) {
+			_ = s.st.ExtendSession(id, sessionTTL)
 		}
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			if subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Requested-With")), []byte("readtrace")) != 1 {
@@ -243,9 +303,11 @@ func (s *Server) decode(w http.ResponseWriter, r *http.Request, v any) bool {
 	return true
 }
 
-func pathID(r *http.Request) int64 {
-	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
-	return id
+func pathID(r *http.Request) (int64, bool) {
+	if id, ok := parseInt64(r.PathValue("id")); ok {
+		return id, true
+	}
+	return 0, false
 }
 
 func (s *Server) accountOrErr(w http.ResponseWriter, id int64) (*store.Account, bool) {
@@ -262,15 +324,15 @@ func (s *Server) accountOrErr(w http.ResponseWriter, id int64) (*store.Account, 
 }
 
 func (s *Server) timezone() *time.Location {
-	tz, _ := s.st.GetSetting("timezone")
-	if tz == "" {
-		return time.Local
+	if loc := s.tz.Load(); loc != nil {
+		return loc
 	}
-	loc, err := time.LoadLocation(tz)
-	if err != nil {
-		return time.Local
-	}
-	return loc
+	return time.Local
+}
+
+// setTimezone caches a validated timezone after a settings change.
+func (s *Server) setTimezone(loc *time.Location) {
+	s.tz.Store(loc)
 }
 
 func clientIP(r *http.Request) string {

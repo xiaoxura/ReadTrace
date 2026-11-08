@@ -2,19 +2,25 @@ package store
 
 import "database/sql"
 
-const pushCols = `id, name, type, config_enc, enabled, created_at`
+const pushCols = `id, name, type, config_enc, templates_enc, enabled, created_at`
 
 func (s *Store) scanPush(sc interface{ Scan(...any) error }) (*PushChannel, error) {
 	var v PushChannel
-	var enc []byte
+	var enc, tplEnc []byte
 	var enabled int
-	if err := sc.Scan(&v.ID, &v.Name, &v.Type, &enc, &enabled, &v.CreatedAt); err != nil {
+	if err := sc.Scan(&v.ID, &v.Name, &v.Type, &enc, &tplEnc, &enabled, &v.CreatedAt); err != nil {
 		return nil, err
 	}
 	v.Enabled = enabled == 1
 	v.Config = map[string]string{}
+	v.Templates = map[string]string{}
 	if len(enc) > 0 {
 		if err := s.openJSON(enc, &v.Config); err != nil {
+			return nil, err
+		}
+	}
+	if len(tplEnc) > 0 {
+		if err := s.openJSON(tplEnc, &v.Templates); err != nil {
 			return nil, err
 		}
 	}
@@ -27,12 +33,19 @@ func (s *Store) CreatePushChannel(v *PushChannel) error {
 	if err != nil {
 		return err
 	}
+	tpl, err := s.sealJSON(v.Templates)
+	if err != nil {
+		return err
+	}
+	if len(v.Templates) == 0 {
+		tpl = nil
+	}
 	en := 0
 	if v.Enabled {
 		en = 1
 	}
-	res, err := s.db.Exec(`INSERT INTO push_channels (name, type, config_enc, enabled, created_at)
-		VALUES (?,?,?,?,?)`, v.Name, v.Type, cfg, en, now())
+	res, err := s.db.Exec(`INSERT INTO push_channels (name, type, config_enc, templates_enc, enabled, created_at)
+		VALUES (?,?,?,?,?,?)`, v.Name, v.Type, cfg, tpl, en, now())
 	if err != nil {
 		return err
 	}
@@ -44,18 +57,25 @@ func (s *Store) CreatePushChannel(v *PushChannel) error {
 	return nil
 }
 
-// UpdatePushChannel updates name/type/config/enabled.
+// UpdatePushChannel updates name/type/config/templates/enabled.
 func (s *Store) UpdatePushChannel(v *PushChannel) error {
 	cfg, err := s.sealJSON(v.Config)
 	if err != nil {
 		return err
 	}
+	tpl, err := s.sealJSON(v.Templates)
+	if err != nil {
+		return err
+	}
+	if len(v.Templates) == 0 {
+		tpl = nil
+	}
 	en := 0
 	if v.Enabled {
 		en = 1
 	}
-	_, err = s.db.Exec(`UPDATE push_channels SET name = ?, type = ?, config_enc = ?, enabled = ? WHERE id = ?`,
-		v.Name, v.Type, cfg, en, v.ID)
+	_, err = s.db.Exec(`UPDATE push_channels SET name = ?, type = ?, config_enc = ?, templates_enc = ?, enabled = ? WHERE id = ?`,
+		v.Name, v.Type, cfg, tpl, en, v.ID)
 	return err
 }
 

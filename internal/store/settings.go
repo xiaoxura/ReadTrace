@@ -66,6 +66,15 @@ func (s *Store) GetSession(id string) (*Session, error) {
 	return &ses, nil
 }
 
+// ExtendSession pushes the expiry forward for a live session. Used for
+// rolling TTLs so active users are not logged out after 30 days.
+func (s *Store) ExtendSession(id string, ttl time.Duration) error {
+	until := time.Now().Add(ttl).Unix()
+	_, err := s.db.Exec(`UPDATE sessions SET expires_at = ? WHERE id = ? AND expires_at > ?`,
+		until, id, time.Now().Unix())
+	return err
+}
+
 // DeleteSession removes one session.
 func (s *Store) DeleteSession(id string) error {
 	_, err := s.db.Exec(`DELETE FROM sessions WHERE id = ?`, id)

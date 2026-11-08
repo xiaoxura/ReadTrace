@@ -89,7 +89,11 @@ func (s *Server) handleScheduleCreate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleScheduleUpdate(w http.ResponseWriter, r *http.Request) {
-	id := pathID(r)
+	id, ok := pathID(r)
+	if !ok {
+		s.writeErr(w, http.StatusBadRequest, "无效的定时任务 ID")
+		return
+	}
 	v, err := s.st.GetSchedule(id)
 	if err != nil {
 		s.writeErr(w, http.StatusInternalServerError, "读取定时任务失败")
@@ -144,7 +148,11 @@ func (s *Server) handleScheduleUpdate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleScheduleDelete(w http.ResponseWriter, r *http.Request) {
-	id := pathID(r)
+	id, ok := pathID(r)
+	if !ok {
+		s.writeErr(w, http.StatusBadRequest, "无效的定时任务 ID")
+		return
+	}
 	s.sch.Remove(id)
 	if err := s.st.DeleteSchedule(id); err != nil {
 		s.writeErr(w, http.StatusInternalServerError, "删除定时任务失败")

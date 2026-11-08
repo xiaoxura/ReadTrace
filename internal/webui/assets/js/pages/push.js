@@ -2,7 +2,8 @@ import { api } from '../api.js';
 import { state, refreshChannels } from '../state.js';
 import { icon } from '../icons.js';
 import { pushChannelDialog } from '../components.js';
-import { $, $$, escapeHtml, toast, setLoading, confirmDialog } from '../util.js';
+import { renderError, skeletonHTML, bindEnabledToggle } from '../helpers.js';
+import { $, $$, escapeHtml, toast, setLoading, confirmDialog, pageHeaderHTML } from '../util.js';
 
 const TYPES = {
   pushplus: { label: 'PushPlus', icon: 'bell', color: 'var(--amber)' },
@@ -30,27 +31,24 @@ function summary(ch) {
 
 export async function renderPush(ctx) {
   const { root } = ctx;
-  root.innerHTML = `<div class="page-loading"><div class="skeleton" style="height:70px;width:45%"></div><div class="skeleton" style="height:200px"></div></div>`;
+  root.innerHTML = skeletonHTML(['height:70px;width:45%', 'height:200px']);
 
   try {
     await refreshChannels();
   } catch (e) {
-    root.innerHTML = `<div class="card"><div class="empty"><div class="empty-ico">${icon('alert')}</div><h3>加载失败</h3><p>${escapeHtml(e.message)}</p></div></div>`;
+    renderError(root, e, { onRetry: () => ctx.reload() });
     return;
   }
+  if (!ctx.isActive()) return;
 
   const list = state.channels;
   root.innerHTML = `
-    <div class="topbar">
-      <div>
-        <div class="page-kicker">推送</div>
-        <h1 class="page-title">阅读结果，及时送达</h1>
-        <div class="page-sub">${list.length ? `已配置 ${list.length} 个渠道 · ${list.filter((c) => c.enabled).length} 个启用中` : '支持 PushPlus、WxPusher、Telegram、ServerChan'}</div>
-      </div>
-      <div class="top-actions">
-        <button class="btn btn-primary" id="btn-add">${icon('plus')}<span>添加渠道</span></button>
-      </div>
-    </div>
+    ${pageHeaderHTML({
+      kicker: '推送',
+      title: '推送渠道',
+      sub: list.length ? `${list.length} 个渠道 · ${list.filter((c) => c.enabled).length} 个启用中` : '阅读完成后把结果推送到微信或 Telegram',
+      actions: `<button class="btn btn-primary" id="btn-add">${icon('plus')}<span>添加渠道</span></button>`,
+    })}
 
     ${list.length ? `<div class="accounts-grid">${list.map(card).join('')}</div>` : `
       <article class="card"><div class="empty" style="padding:54px 20px">
@@ -64,6 +62,7 @@ export async function renderPush(ctx) {
       <div>推送配置（Token、SPT 等）使用本机密钥加密存储。测试消息会立即发送，请确认渠道配置正确。</div>
     </div>
   `;
+  if (!ctx.isActive()) return;
 
   const openAdd = () => pushChannelDialog({ onDone: () => ctx.reload() });
   $('#btn-add', root)?.addEventListener('click', openAdd);
@@ -71,11 +70,13 @@ export async function renderPush(ctx) {
 
   $$('[data-edit]', root).forEach((btn) => btn.addEventListener('click', () => {
     const ch = state.channels.find((c) => c.id === Number(btn.dataset.edit));
+    if (!ch) return;
     pushChannelDialog({ channel: ch, onDone: () => ctx.reload() });
   }));
 
   $$('[data-del]', root).forEach((btn) => btn.addEventListener('click', async () => {
     const ch = state.channels.find((c) => c.id === Number(btn.dataset.del));
+    if (!ch) return;
     const ok = await confirmDialog({
       title: '删除推送渠道',
       message: `确定删除「${ch.name}」吗？使用该渠道的账号将不再推送。`,
@@ -104,17 +105,14 @@ export async function renderPush(ctx) {
     }
   }));
 
-  $$('[data-toggle]', root).forEach((input) => input.addEventListener('change', async () => {
-    const ch = state.channels.find((c) => c.id === Number(input.dataset.toggle));
-    try {
-      await api.updatePush(ch.id, { enabled: input.checked });
-      toast(input.checked ? '渠道已启用' : '渠道已停用', 'ok');
-      ch.enabled = input.checked;
-    } catch (e) {
-      input.checked = !input.checked;
-      toast(e.message, 'error');
-    }
-  }));
+  bindEnabledToggle($$('[data-toggle]', root), {
+    call: (input) => api.updatePush(Number(input.dataset.toggle), { enabled: input.checked }),
+    labels: { on: '渠道已启用', off: '渠道已停用' },
+    onSuccess: (input) => {
+      const ch = state.channels.find((c) => c.id === Number(input.dataset.toggle));
+      if (ch) ch.enabled = input.checked;
+    },
+  });
 }
 
 function card(ch) {
@@ -129,13 +127,13 @@ function card(ch) {
         <div class="account-sub">${meta.label} · ${summary(ch)}</div>
       </div>
       <label class="switch" title="${ch.enabled ? '停用' : '启用'}">
-        <input type="checkbox" data-toggle="${ch.id}" ${ch.enabled ? 'checked' : ''}><i></i>
+        <input type="checkbox" data-toggle="${ch.id}" ${ch.enabled ? 'checked' : ''} aria-label="${ch.enabled ? '停用渠道' : '启用渠道'}"><i></i>
       </label>
     </div>
     <div class="account-actions">
       <button class="btn btn-sm" data-test="${ch.id}">${icon('bell')}测试</button>
       <button class="btn btn-sm btn-ghost" data-edit="${ch.id}">${icon('edit')}编辑</button>
-      <button class="btn btn-sm btn-ghost btn-icon" data-del="${ch.id}" title="删除">${icon('trash')}</button>
+      <button class="btn btn-sm btn-ghost btn-icon" data-del="${ch.id}" title="删除" aria-label="删除渠道">${icon('trash')}</button>
     </div>
   </article>`;
 }

@@ -46,6 +46,17 @@ func (h *Hub) Unsubscribe(id int) {
 	}
 }
 
+// CloseAll removes and closes every subscriber. Called on shutdown so SSE
+// handlers stop waiting on their channel and the HTTP server can go idle.
+func (h *Hub) CloseAll() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for id, ch := range h.subs {
+		delete(h.subs, id)
+		close(ch)
+	}
+}
+
 // Publish broadcasts an event without blocking.
 func (h *Hub) Publish(ev Event) {
 	h.mu.Lock()

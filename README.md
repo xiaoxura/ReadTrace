@@ -2,6 +2,13 @@
 
 > 每一次阅读，都留下痕迹。
 
+> [!WARNING]
+> 本项目与腾讯 / 微信读书官方无关。它通过模拟微信读书网页端的心跳请求保持阅读时长，**可能违反微信读书用户协议并导致账号被限制或封禁**。请仅用于个人学习与自托管研究：
+>
+> - 不要公开运营、不要提供代刷服务、不要收费或大规模滥用；
+> - 多用户部署请自行完成个人信息保护、数据安全与当地法律合规评估；
+> - 开源代码不构成对第三方服务的授权，作者不对账号封禁、数据丢失、协议变更或任何法律纠纷负责。
+
 一个单文件、可自托管的微信读书阅读面板。扫码登录，实时看进度，自动跑定时，把阅读时长和数据都留在自己手里。
 
 原版 [findmover/wxread](https://github.com/findmover/wxread) 用环境变量 + 控制台日志 + 一次性定时任务完成“刷时长”，好用但看不见、管不住、不好排错。阅迹把它重做成一个带可视化面板的常驻服务：**Go 单二进制 + SQLite + 内嵌前端**，打开浏览器就能管理账号、看实时进度、查历史趋势、配推送与定时任务。
@@ -34,7 +41,11 @@
 - **实时阅读面板**：进度环、已读分钟、心跳成功/失败次数、实时日志流，卡片随 SSE 自动更新。
 - **历史与趋势**：今日/本周/累计时长、连续阅读天数、最近 14 天柱状图、每次运行的完整日志。
 - **多账号**：每个账号独立设置默认时长、心跳间隔、阅读模式、绑定书籍、推送渠道。
+- **微信机器人**：接入微信官方机器人（腾讯 iLink Bot），多人可在微信里完成登录账号、开始/停止阅读、查统计、配定时任务；绑定关系逐账号隔离，杜绝越权。
 - **可视化定时任务**：5 段 cron、常见时间预设、未来 3 次执行预览、启停开关、下次执行倒计时。
+- **账号状态检测**：后台按设定间隔自动校验登录态（可关闭），发现失效立即在面板标注，并可通过绑定的推送渠道提醒。
+- **阅读自动重试**：单账号可配置失败自动重试次数与间隔；登录已失效的情况不会盲目重试。
+- **自定义推送模板**：阅读成功 / 阅读失败 / 账号失效三类事件可分别自定义标题与内容，支持 `{{account}}`、`{{elapsed}}` 等变量。
 - **四种推送**：PushPlus、WxPusher、Telegram（支持代理）、ServerChan，支持发送测试消息。
 - **响应式界面**：桌面侧边栏 / 移动端底部导航，深色与浅色主题，跟随系统。
 - **数据本地化**：SQLite 单文件，账号 Cookie 与推送 Token 加密存储；复制数据目录即可迁移。
@@ -49,6 +60,10 @@
     <td><img src="docs/screenshots/settings.png" alt="设置" /></td>
   </tr>
   <tr>
+    <td><img src="docs/screenshots/wechat.png" alt="微信机器人" /></td>
+    <td><img src="docs/screenshots/wechat-chat.png" alt="微信对话记录" /></td>
+  </tr>
+  <tr>
     <td><img src="docs/screenshots/dashboard-light.png" alt="浅色主题" /></td>
     <td><img src="docs/screenshots/mobile.png" alt="移动端" /></td>
   </tr>
@@ -60,20 +75,20 @@
 
 ### 1. 构建
 
-需要 **Go 1.26+**。
+需要 **Go 1.27+**。
 
 ```bash
 # Linux / macOS
-./build.sh 1.1.0
+./build.sh 1.2.0
 
 # Windows PowerShell
-.\build.ps1 -Version 1.1.0
+.\build.ps1 -Version 1.2.0
 ```
 
 也可以直接用发布页的二进制，或在项目根目录执行：
 
 ```bash
-go build -trimpath -ldflags "-s -w -X main.version=1.1.0" -o readtrace ./cmd/readtrace
+go build -trimpath -ldflags "-s -w -X main.version=1.2.0" -o readtrace ./cmd/readtrace
 ```
 
 ### 2. 启动
@@ -102,6 +117,32 @@ go build -trimpath -ldflags "-s -w -X main.version=1.1.0" -o readtrace ./cmd/rea
 - 在「定时」页新建任务，例如每天 01:00 自动阅读 30 分钟。
 - 在「推送」页添加渠道，并在账号设置里选择完成后推送到哪个渠道。
 
+### 5. 微信机器人（可选）
+
+在侧栏「**微信**」页点 **绑定机器人**：用你的个人微信扫码（手机显示数字时在面板输入），扫码人自动成为微信侧管理员。页面提供机器人 ID、绑定账号列表（含所有者）、微信用户管理，以及**用户与机器人的完整对话记录**（实时更新，随数据保留天数自动清理）。之后任意微信用户给机器人发送：
+
+| 指令 | 作用 |
+| --- | --- |
+| `菜单` / `帮助` | 查看全部指令 |
+| `登录` | 扫码绑定新的微信读书账号（二维码以图片直发微信，手机显示数字时直接回复数字） |
+| `我的账号` | 已绑定账号与状态 |
+| `开始 序号 分钟` | 立即开始阅读 |
+| `停止 序号` | 停止阅读（缺省为全部账号） |
+| `进度` / `今日` / `最近` | 实时进度 / 今日统计 / 运行记录 |
+| `定时 列表` / `定时 新增 [序号] 22:30 30` | 查看 / 新增定时任务 |
+| `定时 开/关/删 任务编号` | 启停 / 删除任务 |
+| `解绑 序号` | 解除该账号与你微信的绑定 |
+
+**权限模型（防越权）**：
+
+- 谁扫微信读书的登录码，谁就是该账号在微信侧的**唯一所有者**；一个微信用户可以绑定多个账号，一个账号同一时刻只属于一个微信用户（重新扫码即换绑，再次扫码要求持有该微信读书账号的凭据，即持有权即所有权）。
+- 微信用户只可能查到、操作**自己绑定的账号**及其定时任务、统计、运行记录；接口层不提供越过绑定关系的通道。
+- 扫码绑定机器人的人自动成为**管理员**；管理员可在「微信」页查看全部用户、在微信里操作全部账号、手动改绑/解绑。
+- 「运行结束直推」开启时，某账号阅读结束会推送结果到其绑定的微信用户。
+- 机器人侧凭据（iLink bot_token）与微信读书 Cookie 一样经 AES-256-GCM 加密后落库。
+
+> 协议说明：该渠道使用 iLink Bot 的 HTTP 长轮询收消息与加密 CDN 媒体接口，按公开接口行为独立实现；协议可能随时变化，字段与行为以实现为准。本项目不包含任何第三方插件源代码。
+
 ---
 
 ## 命令行
@@ -109,13 +150,15 @@ go build -trimpath -ldflags "-s -w -X main.version=1.1.0" -o readtrace ./cmd/rea
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
 | `-addr` | `127.0.0.1:8720` | 监听地址。局域网访问用 `0.0.0.0:8720` |
-| `-data` | `./data` | 数据目录，存放 SQLite 与密钥文件 |
+| `-data` | 可执行文件同级的 `data` 目录 | 数据目录，存放 SQLite 与密钥文件；也可用 `READTRACE_DATA` 指定 |
 | `-no-open` | `false` | 启动后不自动打开浏览器 |
 | `-log-level` | `info` | `debug` / `info` / `warn` / `error` |
+| `-retain-days` | `90` | 运行记录（含日志）保留天数，超期自动清理，`0` 表示永久保留 |
+| `-host-allow` | 空 | Host 白名单（逗号分隔主机名），为空不校验。绑定 `0.0.0.0` 时建议设置，可防 DNS 重绑定 |
 | `-version` | | 输出版本号 |
 | `-reset-password` | | 清除面板密码（下次启动重新初始化），账号数据保留 |
 
-对应环境变量：`READTRACE_ADDR`、`READTRACE_DATA`、`READTRACE_LOG_LEVEL`。旧版的 `WXREAD_*` 仍会自动识别，`wxread.db` 也会在首次启动时重命名为 `readtrace.db`。
+对应环境变量：`READTRACE_ADDR`、`READTRACE_DATA`、`READTRACE_LOG_LEVEL`、`READTRACE_RETAIN_DAYS`、`READTRACE_HOST_ALLOW`。旧版的 `WXREAD_*` 仍会自动识别，`wxread.db` 也会在首次启动时重命名为 `readtrace.db`。
 
 示例：
 
@@ -131,9 +174,10 @@ READTRACE_ADDR=0.0.0.0:8720 READTRACE_DATA=/volume1/docker/readtrace ./readtrace
 
 ## 数据与安全
 
-数据目录结构：
+数据目录结构（默认与二进制同目录，例如 `C:\ReadTrace\readtrace.exe` + `C:\ReadTrace\data\`）：
 
 ```
+readtrace(.exe)
 data/
 ├── readtrace.db      # SQLite：账号、运行记录、日志、定时任务、推送渠道、设置
 ├── readtrace.db-wal  # SQLite WAL
@@ -145,6 +189,7 @@ data/
 - 所有修改类接口要求同源会话 + `X-Requested-With` 头；默认只监听 `127.0.0.1`。
 - 迁移：停止服务，把整个 `data/` 目录复制到新机器即可。
 - 备份：定期复制 `data/` 目录；**丢失 `secret.key` 后加密数据无法恢复**，需要重新登录账号。
+- 保留策略：运行记录及其日志默认保留 **90 天**（`-retain-days` 可调，`0` 为永久），启动时与每日自动清理超期数据。
 
 > 通过公网访问时，请在前面加一层 HTTPS 反向代理（Nginx / Caddy / Traefik），否则管理密码与会话会以明文经过网络。HTTPS 下服务会自动给会话 Cookie 加上 `Secure`。
 
@@ -152,16 +197,24 @@ data/
 
 ## 部署
 
+### Linux 服务器
+
+二进制放哪个目录，数据就生成在同级 `data/` 目录（例如 `/opt/readtrace/readtrace` + `/opt/readtrace/data`），无需传 `-data`；同一份代码交叉编译即可：
+
+```bash
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w -X main.version=1.2.0" -o readtrace ./cmd/readtrace
+```
+
 ### Windows 开机自启
 
-将 `readtrace.exe` 放入一个固定目录，创建一个快捷方式放到 `shell:startup`：
+将 `readtrace.exe` 放入一个固定目录（建议 `C:\ReadTrace`），首次运行后会在同级自动生成 `data` 目录。创建一个快捷方式放到 `shell:startup`：
 
 ```
-目标： "C:\ReadTrace\readtrace.exe" -data "C:\ReadTrace\data"
+目标： "C:\ReadTrace\readtrace.exe"
 起始位置： C:\ReadTrace
 ```
 
-或者用任务计划程序，触发器设为“登录时”，操作指向 exe，参数 `-data "C:\ReadTrace\data" -no-open`。
+或者用任务计划程序，触发器设为“登录时”，操作指向 exe，参数 `-no-open`。数据默认就在 exe 同级的 `data` 目录，也可以用 `-data` 显式指定。
 
 ### Linux systemd
 
@@ -195,7 +248,7 @@ sudo chown -R 10001:10001 data   # 容器内以非 root 用户运行
 docker compose up -d
 ```
 
-`docker-compose.yml` 默认映射 `8720:8720`，数据落在 `./data`。容器内默认监听 `0.0.0.0`，请务必设置管理密码，并建议只在局域网或反代后暴露。
+`docker-compose.yml` 默认映射 `8720:8720`，数据落在 `./data`（挂载到容器内 `/opt/readtrace/data`，与二进制同目录）。容器内默认监听 `0.0.0.0`，请务必设置管理密码，并建议只在局域网或反代后暴露。
 
 ### 反向代理（Nginx）
 
@@ -245,6 +298,14 @@ location / {
 ### 定时任务
 
 使用 `robfig/cron` 解析标准 5 段表达式，时区跟随「设置」中的站点时区。任务触发时如果账号已在阅读，会跳过并记录原因。
+
+### 账号状态检测
+
+后台任务按「设置 → 账号状态检测」配置的间隔自动校验每个账号的登录态（校验逻辑与手动「检查登录状态」一致：先验证，必要时续期一次再复判）。正在阅读的账号会跳过——它们的循环本身就在续期。检测确认失效后会把账号标记为「已失效」，并在该账号绑定了推送渠道时推送一次「账号失效」提醒（`expired` 模板可自定义）。
+
+### 阅读自动重试
+
+每个账号可配置失败自动重试次数与间隔（「账号 → 编辑」）。一次阅读会话（续期 + 心跳循环）失败后，若仍有重试额度且失败属于可重试类型，引擎会在间隔后重新开始会话，已读进度与心跳计数累计保留；登录已确认失效的情况不会自动重试。
 
 ---
 
@@ -316,12 +377,14 @@ go run ./cmd/readtrace -addr 127.0.0.1:8720 -data ./data
 ```
 cmd/readtrace/      入口：参数、启动、优雅退出
 internal/api/          HTTP API、认证、SSE、扫码流程
+internal/checker/      后台账号状态自动检测
 internal/engine/       阅读心跳引擎、事件中心
 internal/sched/        cron 调度
-internal/notify/       推送渠道
+internal/notify/       推送渠道与消息模板
 internal/store/        SQLite 数据层与迁移
 internal/secure/       AES-GCM 加密
 internal/weread/       微信读书客户端、签名、curl 解析
+internal/wxbot/        微信官方机器人渠道（iLink Bot 协议）
 internal/webui/assets/ 内嵌前端（原生 ES Module，无构建步骤）
 docs/screenshots/      README 截图
 ```

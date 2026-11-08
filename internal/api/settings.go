@@ -3,32 +3,43 @@ package api
 import (
 	"net/http"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
+
+	"readtrace/internal/checker"
 )
 
 func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 	hash, _ := s.st.GetSetting(keyPasswordHash)
 	all, _ := s.st.AllSettings()
 	delete(all, keyPasswordHash)
+	interval := checker.DefaultInterval
+	if raw, ok := all[checker.SettingInterval]; ok && raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n >= 0 && n <= 24*60 {
+			interval = n
+		}
+	}
 	s.writeJSON(w, http.StatusOK, map[string]any{
-		"site_name":      s.siteName(),
-		"timezone":       s.timezone().String(),
-		"password_set":   hash != "",
-		"version":        s.version,
-		"go_version":     runtime.Version(),
-		"uptime_seconds": int(time.Since(s.started).Seconds()),
-		"started_at":     s.started.Unix(),
-		"settings":       all,
+		"site_name":        s.siteName(),
+		"timezone":         s.timezone().String(),
+		"password_set":     hash != "",
+		"version":          s.version,
+		"go_version":       runtime.Version(),
+		"uptime_seconds":   int(time.Since(s.started).Seconds()),
+		"started_at":       s.started.Unix(),
+		"check_interval":   interval,
+		"settings":         all,
 	})
 }
 
 func (s *Server) handleSettingsUpdate(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		SiteName string `json:"site_name"`
-		Timezone string `json:"timezone"`
+		SiteName             string `json:"site_name"`
+		Timezone             string `json:"timezone"`
+		CheckIntervalMinutes *int   `json:"check_interval_minutes"`
 	}
 	if !s.decode(w, r, &body) {
 		return
@@ -50,8 +61,22 @@ func (s *Server) handleSettingsUpdate(w http.ResponseWriter, r *http.Request) {
 			s.writeErr(w, http.StatusInternalServerError, "保存时区失败")
 			return
 		}
+		s.setTimezone(loc)
 		if err := s.sch.Start(loc); err != nil {
 			s.writeErr(w, http.StatusInternalServerError, "重建定时任务失败："+err.Error())
+			return
+		}
+	}
+	// 0 disables the background account check; the checker picks the new
+	// value up on its next poll without a restart.
+	if body.CheckIntervalMinutes != nil {
+		v := *body.CheckIntervalMinutes
+		if v < 0 || v > 24*60 {
+			s.writeErr(w, http.StatusBadRequest, "自动检测间隔需在 0~1440 分钟之间，0 表示关闭")
+			return
+		}
+		if err := s.st.SetSetting(checker.SettingInterval, strconv.Itoa(v)); err != nil {
+			s.writeErr(w, http.StatusInternalServerError, "保存检测设置失败")
 			return
 		}
 	}

@@ -11,19 +11,27 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"readtrace/internal/store"
 )
 
+// wxPusherMaximum is the documented SPT content limit (40000 chars); sending
+// near it via a JSON body is fine, so nothing is URL-encoded any more.
+const wxPusherMaximum = 39000
+
 // Sender sends notifications.
 type Sender struct {
 	HTTP *http.Client
+
+	proxyMu      sync.Mutex
+	proxyClients map[string]*http.Client // telegram proxy -> client, reused
 }
 
 // New creates a Sender.
 func New() *Sender {
-	return &Sender{HTTP: &http.Client{Timeout: 20 * time.Second}}
+	return &Sender{HTTP: &http.Client{Timeout: 20 * time.Second}, proxyClients: map[string]*http.Client{}}
 }
 
 // Send dispatches one message through the channel's type.
@@ -81,21 +89,15 @@ func (s *Sender) wxPusher(ctx context.Context, spt, content string) error {
 	if spt == "" {
 		return fmt.Errorf("缺少 SPT")
 	}
-	endpoint := "https://wxpusher.zjiecode.com/api/send/message/" + url.PathEscape(spt) + "/" + url.PathEscape(content)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return err
+	// The SPT POST API accepts arbitrary content length; the old GET-in-URL
+	// form broke on long messages (URL length limits).
+	if len(content) > wxPusherMaximum {
+		content = truncate(content)
 	}
-	resp, err := s.HTTP.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 256<<10))
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncate(string(body)))
-	}
-	return nil
+	_, err := s.postJSON(ctx, "https://wxpusher.zjiecode.com/api/send/message/simple-push", map[string]any{
+		"spt": spt, "content": content, "summary": truncate(content), "contentType": 1,
+	})
+	return err
 }
 
 func (s *Sender) telegram(ctx context.Context, cfg map[string]string, text string) error {
@@ -112,7 +114,7 @@ func (s *Sender) telegram(ctx context.Context, cfg map[string]string, text strin
 		if err != nil {
 			return fmt.Errorf("代理地址无效: %w", err)
 		}
-		client = &http.Client{Timeout: 30 * time.Second, Transport: &http.Transport{Proxy: http.ProxyURL(u)}}
+		client = s.clientForProxy(u)
 	}
 	// Reuse postJSON with a custom client by issuing the request manually.
 	buf, _ := json.Marshal(payload)
@@ -143,10 +145,26 @@ func (s *Sender) serverChan(ctx context.Context, sendkey, title, content string)
 	return err
 }
 
+// clientForProxy returns a cached HTTP client per proxy URL so successive
+// pushes reuse Transport/connections instead of leaking them until the idle
+// timeout.
+func (s *Sender) clientForProxy(u *url.URL) *http.Client {
+	key := u.String()
+	s.proxyMu.Lock()
+	defer s.proxyMu.Unlock()
+	if c, ok := s.proxyClients[key]; ok {
+		return c
+	}
+	c := &http.Client{Timeout: 30 * time.Second, Transport: &http.Transport{Proxy: http.ProxyURL(u)}}
+	s.proxyClients[key] = c
+	return c
+}
+
 func truncate(s string) string {
 	s = strings.TrimSpace(s)
-	if len(s) > 200 {
-		return s[:200]
+	r := []rune(s)
+	if len(r) > 200 {
+		return string(r[:200])
 	}
 	return s
 }

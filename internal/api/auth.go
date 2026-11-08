@@ -194,7 +194,13 @@ func (l *loginLimiter) Allow(ip string) (bool, time.Duration) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	e, ok := l.entries[ip]
-	if !ok || time.Now().After(e.reset) {
+	if !ok {
+		return true, 0
+	}
+	if time.Now().After(e.reset) {
+		// Expired window: drop the entry so rotating attacker IPs cannot grow
+		// the map without bound.
+		delete(l.entries, ip)
 		return true, 0
 	}
 	if e.fails < maxLoginFails {
@@ -206,9 +212,10 @@ func (l *loginLimiter) Allow(ip string) (bool, time.Duration) {
 func (l *loginLimiter) Fail(ip string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	now := time.Now()
 	e, ok := l.entries[ip]
-	if !ok || time.Now().After(e.reset) {
-		l.entries[ip] = &limitEntry{fails: 1, reset: time.Now().Add(loginWindow)}
+	if !ok || now.After(e.reset) {
+		l.entries[ip] = &limitEntry{fails: 1, reset: now.Add(loginWindow)}
 		return
 	}
 	e.fails++

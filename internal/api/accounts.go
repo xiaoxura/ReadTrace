@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"readtrace/internal/checker"
 	"readtrace/internal/store"
 	"readtrace/internal/weread"
 )
@@ -33,7 +34,12 @@ func (s *Server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAccountGet(w http.ResponseWriter, r *http.Request) {
-	acc, ok := s.accountOrErr(w, pathID(r))
+	id, ok := pathID(r)
+	if !ok {
+		s.writeErr(w, http.StatusBadRequest, "无效的账号 ID")
+		return
+	}
+	acc, ok := s.accountOrErr(w, id)
 	if !ok {
 		return
 	}
@@ -110,6 +116,13 @@ func (s *Server) handleAccountImport(w http.ResponseWriter, r *http.Request) {
 
 	vid := ck["wr_vid"]
 	if existing, _ := s.st.FindAccountByVid(vid); existing != nil {
+		if s.eng.IsRunning(existing.ID) {
+			// A running loop holds its own cookie copy and rewrites it on
+			// renewal; accepting new credentials here would silently lose
+			// them on the next tick.
+			s.writeErr(w, http.StatusConflict, "该账号正在阅读中，请先停止任务再更新登录凭据")
+			return
+		}
 		if err := s.st.SaveCookies(existing.ID, map[string]string(ck)); err != nil {
 			s.writeErr(w, http.StatusInternalServerError, "保存 Cookie 失败")
 			return
@@ -138,6 +151,7 @@ func (s *Server) handleAccountImport(w http.ResponseWriter, r *http.Request) {
 	if name == "" {
 		name = "微信读书账号"
 	}
+	name = truncateRunes(name, 60)
 	id, err := s.st.CreateAccount(store.Account{
 		Name: name, Vid: vid, Nickname: nickname, Avatar: avatar,
 		Status: status, LastError: validateErrString(validateErr), LastCheckAt: time.Now().Unix(),
@@ -159,7 +173,12 @@ func validateErrString(err error) string {
 }
 
 func (s *Server) handleAccountUpdate(w http.ResponseWriter, r *http.Request) {
-	acc, ok := s.accountOrErr(w, pathID(r))
+	id, ok := pathID(r)
+	if !ok {
+		s.writeErr(w, http.StatusBadRequest, "无效的账号 ID")
+		return
+	}
+	acc, ok := s.accountOrErr(w, id)
 	if !ok {
 		return
 	}
@@ -167,6 +186,8 @@ func (s *Server) handleAccountUpdate(w http.ResponseWriter, r *http.Request) {
 		Name           *string `json:"name"`
 		DefaultMinutes *int    `json:"default_minutes"`
 		TickSeconds    *int    `json:"tick_seconds"`
+		MaxRetries     *int    `json:"max_retries"`
+		RetryDelay     *int    `json:"retry_delay"`
 		BookID         *string `json:"book_id"`
 		BookTitle      *string `json:"book_title"`
 		ChapterID      *string `json:"chapter_id"`
@@ -183,7 +204,7 @@ func (s *Server) handleAccountUpdate(w http.ResponseWriter, r *http.Request) {
 			s.writeErr(w, http.StatusBadRequest, "账号名称不能为空")
 			return
 		}
-		acc.Name = name
+		acc.Name = truncateRunes(name, 60)
 	}
 	if body.DefaultMinutes != nil {
 		if *body.DefaultMinutes < 1 || *body.DefaultMinutes > 24*60 {
@@ -198,6 +219,20 @@ func (s *Server) handleAccountUpdate(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		acc.TickSeconds = *body.TickSeconds
+	}
+	if body.MaxRetries != nil {
+		if *body.MaxRetries < 0 || *body.MaxRetries > 10 {
+			s.writeErr(w, http.StatusBadRequest, "自动重试次数需在 0~10 之间，0 表示不重试")
+			return
+		}
+		acc.MaxRetries = *body.MaxRetries
+	}
+	if body.RetryDelay != nil {
+		if *body.RetryDelay <= 0 || *body.RetryDelay > 600 {
+			s.writeErr(w, http.StatusBadRequest, "重试间隔需在 1~600 秒之间")
+			return
+		}
+		acc.RetryDelay = *body.RetryDelay
 	}
 	if body.BookID != nil {
 		acc.BookID = strings.TrimSpace(*body.BookID)
@@ -240,11 +275,25 @@ func (s *Server) handleAccountUpdate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAccountDelete(w http.ResponseWriter, r *http.Request) {
-	id := pathID(r)
+	id, ok := pathID(r)
+	if !ok {
+		s.writeErr(w, http.StatusBadRequest, "无效的账号 ID")
+		return
+	}
 	if s.eng.IsRunning(id) {
 		s.writeErr(w, http.StatusConflict, "该账号正在阅读，请先停止")
 		return
 	}
+	// Drop the account's schedules from the live scheduler before its DB rows
+	// disappear, and stop any run that may have started in the race window
+	// (e.g. a cron trigger between the check above and this point).
+	schedules, _ := s.st.ListSchedules()
+	for _, v := range schedules {
+		if v.AccountID == id {
+			s.sch.Remove(v.ID)
+		}
+	}
+	s.eng.StopByAccount(id)
 	if err := s.st.DeleteAccount(id); err != nil {
 		s.writeErr(w, http.StatusInternalServerError, "删除账号失败")
 		return
@@ -252,8 +301,29 @@ func (s *Server) handleAccountDelete(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
+// checkLoginClassified validates the cookie, renewing exactly once on a true
+// auth failure. It returns a three-way outcome; the shared implementation
+// (also used by the background auto-checker) lives in internal/checker.
+//   - "active":  session valid (possibly after an in-place renewal)
+//   - "expired": WeRead explicitly rejected the session after a renewal retry
+//   - "error":   transient failure (network, proxy, unexpected API code or
+//     risk control HTML); the caller must NOT expire the account
+//
+// /web/user can reject non-dead sessions with odd codes (e.g. -2003
+// 参数格式错误 after recent API changes), so an unknown failure on a not-running
+// account gets one renewal probe: a live session can always renew, a dead one
+// is refused — that decides liveness more reliably than /web/user itself.
+func (s *Server) checkLoginClassified(ctx context.Context, accountID int64, ck weread.Cookies) (string, error) {
+	return checker.CheckLogin(ctx, s.st, s.wc, s.eng.IsRunning, accountID, ck)
+}
+
 func (s *Server) handleAccountRefresh(w http.ResponseWriter, r *http.Request) {
-	acc, ok := s.accountOrErr(w, pathID(r))
+	id, ok := pathID(r)
+	if !ok {
+		s.writeErr(w, http.StatusBadRequest, "无效的账号 ID")
+		return
+	}
+	acc, ok := s.accountOrErr(w, id)
 	if !ok {
 		return
 	}
@@ -266,28 +336,32 @@ func (s *Server) handleAccountRefresh(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 35*time.Second)
 	defer cancel()
 
-	key, err := s.wc.Renew(ctx, ck)
-	if err != nil || key == "" {
+	status, err := s.checkLoginClassified(ctx, acc.ID, ck)
+	switch status {
+	case "active":
+		nickname, avatar := s.wc.UserInfo(ctx, ck, ck["wr_vid"])
+		_ = s.st.UpdateIdentity(acc.ID, ck["wr_vid"], nickname, avatar)
+		_ = s.st.SetAccountStatus(acc.ID, "active", "", time.Now().Unix())
+		acc, _ = s.st.GetAccount(acc.ID)
+		s.writeJSON(w, http.StatusOK, map[string]any{"ok": true, "account": acc})
+	case "error":
+		// Transient failure: keep the account's current status and ask the
+		// user to retry instead of killing a possibly healthy session.
+		_ = s.st.SetAccountStatus(acc.ID, acc.Status, "刷新遇到临时问题："+validateErrString(err), time.Now().Unix())
+		s.writeErr(w, http.StatusBadGateway, "刷新未完成（可能是网络或接口波动），账号状态未改动，请稍后重试："+validateErrString(err))
+	default: // "expired"
 		_ = s.st.SetAccountStatus(acc.ID, "expired", "续期失败："+validateErrString(err), time.Now().Unix())
-		s.writeErr(w, http.StatusBadGateway, "续期失败，请重新扫码登录："+validateErrString(err))
-		return
+		s.writeErr(w, http.StatusBadGateway, "登录凭据已确认失效，请重新扫码登录："+validateErrString(err))
 	}
-	_ = s.st.SaveCookies(acc.ID, map[string]string(ck))
-
-	if err := s.wc.Validate(ctx, ck); err != nil {
-		_ = s.st.SetAccountStatus(acc.ID, "expired", err.Error(), time.Now().Unix())
-		s.writeErr(w, http.StatusBadGateway, "Cookie 已失效，请重新扫码登录："+err.Error())
-		return
-	}
-	nickname, avatar := s.wc.UserInfo(ctx, ck, ck["wr_vid"])
-	_ = s.st.UpdateIdentity(acc.ID, ck["wr_vid"], nickname, avatar)
-	_ = s.st.SetAccountStatus(acc.ID, "active", "", time.Now().Unix())
-	acc, _ = s.st.GetAccount(acc.ID)
-	s.writeJSON(w, http.StatusOK, map[string]any{"ok": true, "account": acc})
 }
 
 func (s *Server) handleAccountCheck(w http.ResponseWriter, r *http.Request) {
-	acc, ok := s.accountOrErr(w, pathID(r))
+	id, ok := pathID(r)
+	if !ok {
+		s.writeErr(w, http.StatusBadRequest, "无效的账号 ID")
+		return
+	}
+	acc, ok := s.accountOrErr(w, id)
 	if !ok {
 		return
 	}
@@ -300,26 +374,28 @@ func (s *Server) handleAccountCheck(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 35*time.Second)
 	defer cancel()
 
-	checkErr := s.wc.Validate(ctx, ck)
-	if checkErr != nil {
-		if key, renewErr := s.wc.Renew(ctx, ck); renewErr == nil && key != "" {
-			_ = s.st.SaveCookies(acc.ID, map[string]string(ck))
-			checkErr = s.wc.Validate(ctx, ck)
-		}
+	outcome, verifyErr := s.checkLoginClassified(ctx, acc.ID, ck)
+	switch outcome {
+	case "active":
+		_ = s.st.SetAccountStatus(acc.ID, "active", "", time.Now().Unix())
+	case "expired":
+		_ = s.st.SetAccountStatus(acc.ID, "expired", validateErrString(verifyErr), time.Now().Unix())
+	default: // "error": transient trouble — refresh last_error but never expire.
+		_ = s.st.SetAccountStatus(acc.ID, acc.Status, "检查遇到临时问题："+validateErrString(verifyErr), time.Now().Unix())
 	}
-	status := "active"
-	if checkErr != nil {
-		status = "expired"
-	}
-	_ = s.st.SetAccountStatus(acc.ID, status, validateErrString(checkErr), time.Now().Unix())
 	acc, _ = s.st.GetAccount(acc.ID)
 	s.writeJSON(w, http.StatusOK, map[string]any{
-		"ok": checkErr == nil, "status": status, "error": validateErrString(checkErr), "account": acc,
+		"ok": outcome == "active", "status": outcome, "error": validateErrString(verifyErr), "account": acc,
 	})
 }
 
 func (s *Server) handleAccountPayload(w http.ResponseWriter, r *http.Request) {
-	acc, ok := s.accountOrErr(w, pathID(r))
+	id, ok := pathID(r)
+	if !ok {
+		s.writeErr(w, http.StatusBadRequest, "无效的账号 ID")
+		return
+	}
+	acc, ok := s.accountOrErr(w, id)
 	if !ok {
 		return
 	}
@@ -347,7 +423,12 @@ func (s *Server) handleAccountPayload(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleAccountPayloadDelete(w http.ResponseWriter, r *http.Request) {
-	acc, ok := s.accountOrErr(w, pathID(r))
+	id, ok := pathID(r)
+	if !ok {
+		s.writeErr(w, http.StatusBadRequest, "无效的账号 ID")
+		return
+	}
+	acc, ok := s.accountOrErr(w, id)
 	if !ok {
 		return
 	}

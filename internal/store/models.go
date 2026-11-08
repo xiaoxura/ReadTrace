@@ -3,6 +3,7 @@ package store
 // Account is a bound WeRead account.
 type Account struct {
 	ID             int64  `json:"id"`
+	Seq            int64  `json:"seq"` // 本项目生成的展示 ID：从 0 开始逐个增加
 	Name           string `json:"name"`
 	Vid            string `json:"vid"`
 	Nickname       string `json:"nickname"`
@@ -12,6 +13,8 @@ type Account struct {
 	LastCheckAt    int64  `json:"last_check_at"`
 	DefaultMinutes int    `json:"default_minutes"`
 	TickSeconds    int    `json:"tick_seconds"`
+	MaxRetries     int    `json:"max_retries"`  // 阅读失败自动重试次数，0 表示不重试
+	RetryDelay     int    `json:"retry_delay"`  // 重试间隔，秒
 	BookID         string `json:"book_id"`
 	BookTitle      string `json:"book_title"`
 	ChapterID      string `json:"chapter_id"`
@@ -69,6 +72,7 @@ type PushChannel struct {
 	Name      string            `json:"name"`
 	Type      string            `json:"type"`
 	Config    map[string]string `json:"config"`
+	Templates map[string]string `json:"templates"` // 各事件类型的自定义消息模板，可空
 	Enabled   bool              `json:"enabled"`
 	CreatedAt int64             `json:"created_at"`
 }

@@ -19,12 +19,6 @@ export function fmtDuration(seconds) {
   return rm ? `${h} 小时 ${rm} 分` : `${h} 小时`;
 }
 
-export function fmtNumber(seconds) {
-  const s = Math.max(0, Math.round(Number(seconds) || 0));
-  if (s < 60) return String(s);
-  return String(Math.round(s / 6) / 10);
-}
-
 export function fmtMinutes(seconds) {
   const s = Math.max(0, Number(seconds) || 0);
   return (s / 60).toFixed(s % 60 === 0 ? 0 : 1);
@@ -136,8 +130,11 @@ export function toast(message, type = 'info', duration = 3600) {
   if (!wrap) {
     wrap = document.createElement('div');
     wrap.className = 'toasts';
+    wrap.setAttribute('role', 'status');
+    wrap.setAttribute('aria-live', 'polite');
     document.body.appendChild(wrap);
   }
+  while (wrap.children.length >= 6) wrap.firstElementChild.remove();
   const icons = { ok: 'check', error: 'alert', warn: 'alert', info: 'info' };
   const el = document.createElement('div');
   el.className = `toast ${type}`;
@@ -149,7 +146,17 @@ export function toast(message, type = 'info', duration = 3600) {
   }, duration);
 }
 
-let modalStack = 0;
+let dialogDepth = 0;
+
+export function lockScroll() {
+  dialogDepth++;
+  document.body.style.overflow = 'hidden';
+}
+
+export function unlockScroll() {
+  dialogDepth = Math.max(0, dialogDepth - 1);
+  if (dialogDepth === 0) document.body.style.overflow = '';
+}
 
 export function openModal({ title, subtitle = '', body = '', footer = '', wide, narrow, onClose, onMount }) {
   const mask = document.createElement('div');
@@ -159,7 +166,7 @@ export function openModal({ title, subtitle = '', body = '', footer = '', wide, 
       <div class="modal-head">
         <div>
           <div class="modal-title">${escapeHtml(title)}</div>
-          ${subtitle ? `<div class="modal-sub">${subtitle}</div>` : ''}
+          ${subtitle ? `<div class="modal-sub">${escapeHtml(subtitle)}</div>` : ''}
         </div>
         <button class="modal-close" aria-label="关闭">${icon('close')}</button>
       </div>
@@ -167,21 +174,45 @@ export function openModal({ title, subtitle = '', body = '', footer = '', wide, 
       ${footer ? `<div class="modal-foot">${footer}</div>` : ''}
     </div>`;
   document.body.appendChild(mask);
-  modalStack++;
-  document.body.style.overflow = 'hidden';
+  lockScroll();
+
+  const previouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  const focusables = () => $$(
+    'button:not([disabled]), [href], input:not([disabled]):not([type="hidden"]):not([type="checkbox"]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+    mask,
+  ).filter((el) => el.offsetParent !== null);
 
   const close = () => {
     if (!mask.isConnected) return;
     mask.remove();
-    modalStack = Math.max(0, modalStack - 1);
-    if (modalStack === 0) document.body.style.overflow = '';
+    unlockScroll();
     document.removeEventListener('keydown', onKey);
+    previouslyFocused?.focus?.();
     onClose?.();
   };
-  const onKey = (e) => { if (e.key === 'Escape') close(); };
+  const onKey = (e) => {
+    if (e.key === 'Escape') {
+      close();
+      return;
+    }
+    if (e.key === 'Tab') {
+      const list = focusables();
+      if (!list.length) return;
+      const first = list[0];
+      const last = list[list.length - 1];
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      }
+    }
+  };
   document.addEventListener('keydown', onKey);
   mask.addEventListener('mousedown', (e) => { if (e.target === mask) close(); });
   $('.modal-close', mask).addEventListener('click', close);
+  (mask.querySelector('input:not([type="hidden"]), select, textarea') || focusables()[0])?.focus();
   onMount?.(mask, close);
   return { mask, close, modal: $('.modal', mask) };
 }
@@ -208,13 +239,29 @@ export function confirmDialog({ title, message, confirmText = '确认', danger =
 }
 
 export async function copyText(text) {
+  const legacyCopy = () => {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.cssText = 'position:fixed;left:-9999px;top:0;opacity:0';
+    document.body.appendChild(ta);
+    ta.select();
+    let ok = false;
+    try {
+      ok = document.execCommand('copy');
+      toast(ok ? '已复制到剪贴板' : '复制失败，请手动选择文本', ok ? 'ok' : 'error');
+    } catch {
+      toast('复制失败，请手动选择文本', 'error');
+    }
+    ta.remove();
+    return ok;
+  };
   try {
+    if (!navigator.clipboard) return legacyCopy();
     await navigator.clipboard.writeText(text);
     toast('已复制到剪贴板', 'ok');
     return true;
   } catch {
-    toast('复制失败，请手动选择文本', 'error');
-    return false;
+    return legacyCopy();
   }
 }
 
@@ -272,7 +319,43 @@ export function resolveTheme(pref) {
   return pref === 'light' ? 'light' : 'dark';
 }
 
+const THEME_COLOR = { dark: '#070a0f', light: '#f5f3ee' };
+
+export function syncThemeColor(theme) {
+  document.querySelector('meta[name="theme-color"]')?.setAttribute('content', THEME_COLOR[theme] || THEME_COLOR.dark);
+}
+
 export function applyTheme(pref) {
   localStorage.setItem('wxread-theme', pref);
-  document.documentElement.dataset.theme = resolveTheme(pref);
+  const theme = resolveTheme(pref);
+  document.documentElement.dataset.theme = theme;
+  syncThemeColor(theme);
+}
+/**
+ * 统一页面标题区。kicker / title / sub 会被转义，actions 由调用方提供
+ * 已经转义好的按钮 HTML。
+ */
+export function pageHeaderHTML({ kicker = '', title = '', sub = '', actions = '' } = {}) {
+  return `<div class="topbar">
+    <div class="topbar-main">
+      ${kicker ? `<div class="page-kicker">${escapeHtml(kicker)}</div>` : ''}
+      ${title ? `<h1 class="page-title">${escapeHtml(title)}</h1>` : ''}
+      ${sub ? `<div class="page-sub">${escapeHtml(sub)}</div>` : ''}
+    </div>
+    ${actions ? `<div class="top-actions">${actions}</div>` : ''}
+  </div>`;
+}
+
+/**
+ * 页面二级菜单：渲染 tabs + 切换回调。actions 为 tabbar 右侧的操作区
+ * HTML（由调用方在重建后自行 wire 事件）。
+ */
+export function renderTabs({ container, tabs, active, onChange, actions = '' }) {
+  container.innerHTML = `<div class="tabs">
+    ${tabs.map((t) => `<button class="tab ${t.key === active ? 'active' : ''}" data-tab="${t.key}">${t.label}</button>`).join('')}
+    <div class="tabbar-actions">${actions}</div>
+  </div>`;
+  $$('[data-tab]', container).forEach((btn) => {
+    btn.addEventListener('click', () => onChange(btn.dataset.tab));
+  });
 }

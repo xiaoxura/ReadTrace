@@ -45,10 +45,16 @@ type qrManager struct {
 	st    *store.Store
 	wc    *weread.Client
 	log   *slog.Logger
+	// isRunning reports whether an account already has an active reading run;
+	// rebinding such an account would race with the engine's cookie renewal.
+	isRunning func(accountID int64) bool
 }
 
-func newQRManager(st *store.Store, wc *weread.Client, log *slog.Logger) *qrManager {
-	return &qrManager{flows: map[string]*qrFlow{}, st: st, wc: wc, log: log}
+func newQRManager(st *store.Store, wc *weread.Client, log *slog.Logger, isRunning func(int64) bool) *qrManager {
+	if isRunning == nil {
+		isRunning = func(int64) bool { return false }
+	}
+	return &qrManager{flows: map[string]*qrFlow{}, st: st, wc: wc, log: log, isRunning: isRunning}
 }
 
 // Start creates a fresh QR login flow.
@@ -74,7 +80,22 @@ func (m *qrManager) Start(ctx context.Context) (*qrFlow, error) {
 	m.flows[uid] = flow
 	m.mu.Unlock()
 
-	go m.poll(pollCtx, flow)
+	go func() {
+		defer func() {
+			// The poll loop must not panic the whole process; a broken flow
+			// simply fails with a refresh suggestion.
+			if r := recover(); r != nil {
+				m.log.Error("扫码轮询 panic", "uid", uid, "panic", r)
+				m.set(uid, func(fl *qrFlow) {
+					if fl.Status != "confirmed" {
+						fl.Status = "failed"
+						fl.Error = "服务内部错误，请刷新二维码重试"
+					}
+				})
+			}
+		}()
+		m.poll(pollCtx, flow)
+	}()
 	go m.expire(uid)
 
 	return flow, nil
@@ -206,6 +227,10 @@ func (m *qrManager) bind(f *qrFlow, res *weread.LoginPoll) {
 		return
 	}
 	if acc != nil {
+		if m.isRunning(acc.ID) {
+			m.fail(f, "该账号正在阅读中，请先停止任务，再重新扫码绑定")
+			return
+		}
 		if err := m.st.SaveCookies(acc.ID, map[string]string(ck)); err != nil {
 			m.fail(f, "保存登录状态失败："+err.Error())
 			return
@@ -223,6 +248,7 @@ func (m *qrManager) bind(f *qrFlow, res *weread.LoginPoll) {
 	if name == "" {
 		name = "微信读书账号"
 	}
+	name = truncateRunes(name, 60)
 	id, err := m.st.CreateAccount(store.Account{
 		Name:           name,
 		Vid:            vid,

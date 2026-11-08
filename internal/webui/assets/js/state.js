@@ -38,7 +38,3 @@ export function accountById(id) {
 export function accountName(id) {
   return accountById(id)?.name || `账号 #${id}`;
 }
-
-export function emitChanged(scope = 'all') {
-  window.dispatchEvent(new CustomEvent('data:changed', { detail: { scope } }));
-}

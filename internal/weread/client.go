@@ -23,6 +23,15 @@ const DefaultUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 
 // JSON, which usually means the session tripped a bot check.
 var ErrRiskControl = errors.New("接口返回了 HTML 页面，可能触发了风控或登录已失效")
 
+// ErrUnauthorized is returned when the session is no longer valid
+// (errCode -2012/-2013/401). Callers check errors.Is to distinguish true
+// login expiry from transient network/API failures.
+var ErrUnauthorized = errors.New("登录状态异常")
+
+func isAuthCode(code int) bool {
+	return code == -2012 || code == -2013 || code == 401
+}
+
 // Client is a small WeRead web API client.
 type Client struct {
 	HTTP *http.Client
@@ -39,6 +48,7 @@ func NewClient() *Client {
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ResponseHeaderTimeout: 70 * time.Second,
+		ForceAttemptHTTP2:     true,
 	}
 	return &Client{
 		HTTP: &http.Client{Timeout: 90 * time.Second, Transport: tr},
@@ -170,6 +180,9 @@ func (c *Client) Read(ctx context.Context, ck Cookies, payload map[string]any) (
 
 // Renew refreshes the wr_skey cookie via /web/login/renewal. The endpoint
 // accepts a few different payload shapes, so all known variants are tried.
+// New cookies are captured even from non-2xx responses: the endpoint
+// occasionally answers with an unusual status code while still handing out a
+// fresh session key.
 func (c *Client) Renew(ctx context.Context, ck Cookies) (string, error) {
 	variants := []map[string]any{
 		{"rq": "/web/book/read", "ql": false},
@@ -178,17 +191,34 @@ func (c *Client) Renew(ctx context.Context, ck Cookies) (string, error) {
 	}
 	var lastErr error
 	for _, body := range variants {
-		resp, err := c.doJSON(ctx, http.MethodPost, "/web/login/renewal", ck, body, nil)
+		req, err := c.newRequest(ctx, http.MethodPost, "/web/login/renewal", ck, body)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		resp, err := c.HTTP.Do(req)
 		if err != nil {
 			lastErr = err
 			continue
 		}
 		for _, rc := range resp.Cookies() {
 			if rc.Name == "wr_skey" && rc.Value != "" {
+				_ = resp.Body.Close()
 				ck["wr_skey"] = rc.Value
 				return rc.Value, nil
 			}
 		}
+		_, readErr := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		resp.Body.Close()
+		if readErr != nil {
+			lastErr = readErr
+			continue
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
+			continue
+		}
+		lastErr = errors.New("renewal 未返回新的 wr_skey")
 	}
 	if lastErr == nil {
 		lastErr = errors.New("renewal 未返回新的 wr_skey")
@@ -206,16 +236,45 @@ func (c *Client) FixSyncKey(ctx context.Context, ck Cookies, bookID string) erro
 	return err
 }
 
-// Validate checks whether the session is still alive.
+// Validate checks whether the session is still alive. True login failures wrap
+// ErrUnauthorized (check with errors.Is); everything else — network trouble,
+// odd API codes — is transient and must not expire the account.
 func (c *Client) Validate(ctx context.Context, ck Cookies) error {
 	var raw map[string]any
 	if _, err := c.doJSON(ctx, http.MethodGet, "/web/user", ck, nil, &raw); err != nil {
 		return err
 	}
 	if code := toInt(raw["errCode"]); code != 0 {
-		return fmt.Errorf("登录状态异常（errCode=%d）", code)
+		if isAuthCode(code) {
+			return fmt.Errorf("%w（errCode=%d）%s", ErrUnauthorized, code, apiErrText(raw, code))
+		}
+		return fmt.Errorf("%s（errCode=%d）", apiErrText(raw, code), code)
 	}
 	return nil
+}
+
+// apiErrText renders a server-provided message when available, else a short
+// translation for codes the community has already pinned down (-2003
+// 参数格式错误, -2014 限频, -2041 缺 synckey, -2010 用户不存在).
+func apiErrText(raw map[string]any, code int) string {
+	if s, ok := raw["errMsg"].(string); ok && s != "" {
+		return s
+	}
+	if s, ok := raw["errmsg"].(string); ok && s != "" {
+		return s
+	}
+	switch code {
+	case -2003:
+		return "参数格式错误"
+	case -2010:
+		return "用户不存在"
+	case -2014:
+		return "请求频率过高"
+	case -2041:
+		return "缺少 synckey"
+	default:
+		return "接口返回异常"
+	}
 }
 
 // UserInfo fetches the nickname and avatar bound to a user id.

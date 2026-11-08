@@ -1,4 +1,4 @@
-import { cssVar, fmtMinutes } from './util.js';
+import { cssVar, fmtMinutes, escapeHtml } from './util.js';
 
 let ringSeq = 0;
 
@@ -32,7 +32,14 @@ function paintBar(host) {
   const barW = Math.max(3, Math.min(26, step * 0.54));
   const radius = Math.min(4, barW / 2);
 
-  const gridColor = cssVar('--line');
+  // 循环外一次取齐颜色变量，避免循环内反复触发 getComputedStyle
+  const colorLine = cssVar('--line');
+  const colorMuted = cssVar('--muted');
+  const colorSurface3 = cssVar('--surface-3');
+  const colorAccent = cssVar('--accent');
+  const colorAccent2 = cssVar('--accent-2');
+
+  const gridColor = colorLine;
   let grid = '';
   for (let i = 0; i <= 3; i++) {
     const y = pad.t + (innerH / 3) * i;
@@ -50,7 +57,7 @@ function paintBar(host) {
     if (h >= 2) {
       bars += `<rect class="chart-bar" data-i="${i}" x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${h.toFixed(1)}" rx="${radius}" fill="url(#barGrad)" opacity="${op}"/>`;
     } else {
-      bars += `<rect class="chart-bar" data-i="${i}" x="${x.toFixed(1)}" y="${(pad.t + innerH - 2).toFixed(1)}" width="${barW.toFixed(1)}" height="2" rx="1" fill="${cssVar('--surface-3')}" opacity="1"/>`;
+      bars += `<rect class="chart-bar" data-i="${i}" x="${x.toFixed(1)}" y="${(pad.t + innerH - 2).toFixed(1)}" width="${barW.toFixed(1)}" height="2" rx="1" fill="${colorSurface3}" opacity="1"/>`;
     }
   });
 
@@ -60,15 +67,15 @@ function paintBar(host) {
   data.forEach((d, i) => {
     if (i % labelEvery !== 0) return;
     const x = pad.l + step * i + step / 2;
-    labels += `<text x="${x.toFixed(1)}" y="${height - 6}" text-anchor="middle" font-size="9.5" fill="${cssVar('--muted')}" font-family="var(--font)">${d.label}</text>`;
+    labels += `<text x="${x.toFixed(1)}" y="${height - 6}" text-anchor="middle" font-size="9.5" fill="${colorMuted}" font-family="var(--font)">${escapeHtml(d.label)}</text>`;
   });
 
   host.innerHTML = `
     <svg class="chart-svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">
       <defs>
         <linearGradient id="barGrad" x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stop-color="${cssVar('--accent-2')}"/>
-          <stop offset="100%" stop-color="${cssVar('--accent')}"/>
+          <stop offset="0%" stop-color="${colorAccent2}"/>
+          <stop offset="100%" stop-color="${colorAccent}"/>
         </linearGradient>
       </defs>
       ${grid}
@@ -79,16 +86,18 @@ function paintBar(host) {
 
   const tip = host.querySelector('.chart-tip');
   host.querySelectorAll('rect.chart-bar').forEach((rect) => {
-    rect.addEventListener('mouseenter', (e) => {
+    const showTip = () => {
       const i = Number(rect.dataset.i);
       const d = data[i];
       const hostRect = host.getBoundingClientRect();
       const r = rect.getBoundingClientRect();
-      tip.innerHTML = `${d.label} · <b>${format(d.value)}</b>`;
+      tip.innerHTML = `${escapeHtml(d.label)} · <b>${escapeHtml(format(d.value))}</b>`;
       tip.style.display = 'block';
       tip.style.left = `${r.left - hostRect.left + r.width / 2}px`;
       tip.style.top = `${r.top - hostRect.top + 2}px`;
-    });
+    };
+    rect.addEventListener('mouseenter', showTip);
+    rect.addEventListener('click', showTip);
     rect.addEventListener('mouseleave', () => {
       tip.style.display = 'none';
     });

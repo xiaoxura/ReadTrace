@@ -39,6 +39,7 @@ const P = {
   dot: '<circle cx="12" cy="12" r="3" fill="currentColor" stroke="none"/>',
   filter: '<path d="M4 5.5h16l-6.2 7.3v6.1L10.2 21v-8.2z"/>',
   copy: '<rect x="8.5" y="8.5" width="12" height="12" rx="2.4"/><path d="M15.5 8.5v-2A2.5 2.5 0 0 0 13 4H6.5A2.5 2.5 0 0 0 4 6.5V13a2.5 2.5 0 0 0 2.5 2.5h2"/>',
+  wechat: '<path d="M8.6 4.2C5 4.2 2.2 6.7 2.2 9.8c0 1.8 1 3.4 2.5 4.5l-.6 2.1 2.3-1.2c.7.2 1.4.3 2.2.3h.6a4.7 4.7 0 0 1-.2-1.4c0-2.9 2.7-5.2 6-5.2h.5c-.6-2.5-3-4.7-6.9-4.7z"/><circle cx="6.4" cy="8.5" r=".8" fill="currentColor" stroke="none"/><circle cx="10.8" cy="8.5" r=".8" fill="currentColor" stroke="none"/><path d="M21.8 14.1c0-2.6-2.4-4.7-5.4-4.7s-5.4 2.1-5.4 4.7 2.4 4.7 5.4 4.7c.6 0 1.2-.1 1.8-.3l1.9 1-.5-1.8a4.4 4.4 0 0 0 2.2-3.6z"/><circle cx="19.2" cy="12.9" r=".7" fill="currentColor" stroke="none"/><circle cx="13.6" cy="12.9" r=".7" fill="currentColor" stroke="none"/>'
 };
 
 export function icon(name, cls = '') {

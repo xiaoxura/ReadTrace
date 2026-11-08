@@ -31,7 +31,11 @@ func (s *Server) handleRunStart(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRunStop(w http.ResponseWriter, r *http.Request) {
-	id := pathID(r)
+	id, ok := pathID(r)
+	if !ok {
+		s.writeErr(w, http.StatusBadRequest, "无效的运行 ID")
+		return
+	}
 	if err := s.eng.Stop(id); err != nil {
 		s.writeErr(w, http.StatusBadRequest, err.Error())
 		return
@@ -51,7 +55,12 @@ func (s *Server) handleRunList(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRunGet(w http.ResponseWriter, r *http.Request) {
-	run, err := s.st.GetRun(pathID(r))
+	id, ok := pathID(r)
+	if !ok {
+		s.writeErr(w, http.StatusBadRequest, "无效的运行 ID")
+		return
+	}
+	run, err := s.st.GetRun(id)
 	if err != nil {
 		s.writeErr(w, http.StatusInternalServerError, "读取运行记录失败")
 		return
@@ -60,12 +69,21 @@ func (s *Server) handleRunGet(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, http.StatusNotFound, "运行记录不存在")
 		return
 	}
-	logs, _ := s.st.ListLogs(run.ID, 0, 300)
-	s.writeJSON(w, http.StatusOK, map[string]any{"run": run, "logs": logs})
+	logs, logErr := s.st.ListLogs(run.ID, 0, 300)
+	resp := map[string]any{"run": run, "logs": logs}
+	if logErr != nil {
+		// Keep the run payload usable even when logs briefly fail to load.
+		resp["logs_error"] = "读取日志失败：" + logErr.Error()
+	}
+	s.writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) handleRunLogs(w http.ResponseWriter, r *http.Request) {
-	id := pathID(r)
+	id, ok := pathID(r)
+	if !ok {
+		s.writeErr(w, http.StatusBadRequest, "无效的运行 ID")
+		return
+	}
 	afterID, _ := strconv.ParseInt(r.URL.Query().Get("after_id"), 10, 64)
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	var logs []store.RunLog

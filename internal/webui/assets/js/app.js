@@ -3,13 +3,14 @@ import { state, refreshAccounts, refreshChannels } from './state.js';
 import { icon } from './icons.js';
 import { redrawCharts } from './charts.js';
 import {
-  $, $$, escapeHtml, toast, applyTheme, themePreference, resolveTheme, setLoading,
+  $, $$, escapeHtml, toast, applyTheme, setLoading, openModal,
 } from './util.js';
 import { renderDashboard } from './pages/dashboard.js';
 import { renderAccounts } from './pages/accounts.js';
 import { renderRuns } from './pages/runs.js';
 import { renderSchedules } from './pages/schedules.js';
 import { renderPush } from './pages/push.js';
+import { renderWechat } from './pages/wechat.js';
 import { renderSettings } from './pages/settings.js';
 
 const PAGES = {
@@ -18,6 +19,7 @@ const PAGES = {
   runs: renderRuns,
   schedules: renderSchedules,
   push: renderPush,
+  wechat: renderWechat,
   settings: renderSettings,
 };
 
@@ -27,22 +29,45 @@ const NAV = [
   { key: 'runs', label: '记录', icon: 'list' },
   { key: 'schedules', label: '定时', icon: 'calendar' },
   { key: 'push', label: '推送', icon: 'bell' },
+  { key: 'wechat', label: '微信', icon: 'wechat' },
   { key: 'settings', label: '设置', icon: 'settings' },
 ];
+
+// 移动端底部只放最常用的 5 个入口，其余收进「更多」，避免 7 项挤在 390px 里。
+const MOBILE_PRIMARY = ['dashboard', 'accounts', 'runs', 'schedules', 'wechat'];
+const PAGE_TITLES = {
+  dashboard: '总览', accounts: '账号', runs: '记录', schedules: '定时',
+  push: '推送', wechat: '微信', settings: '设置',
+};
 
 let currentHandler = null;
 let cleanups = [];
 let authActive = false;
 let es = null;
+let esReconnect = null;
+let esDelay = 1000;
+let everConnected = false;
 let routeToken = 0;
 
+function hashKey(raw = location.hash) {
+  return (raw || '').replace(/^#\/?/, '').split('?')[0];
+}
+
 function routeKey() {
-  const raw = (location.hash || '').replace(/^#\/?/, '').split('?')[0];
-  return PAGES[raw] ? raw : 'dashboard';
+  const key = hashKey();
+  return PAGES[key] ? key : 'dashboard';
 }
 
 function setActiveNav(key) {
-  $$('[data-nav]').forEach((el) => el.classList.toggle('active', el.dataset.nav === key));
+  $$('[data-nav]').forEach((el) => {
+    const active = el.dataset.nav === key;
+    el.classList.toggle('active', active);
+    if (active) el.setAttribute('aria-current', 'page');
+    else el.removeAttribute('aria-current');
+  });
+  $$('[data-more]').forEach((el) => {
+    el.classList.toggle('active', !MOBILE_PRIMARY.includes(key));
+  });
 }
 
 function updateNavCount() {
@@ -53,18 +78,22 @@ function updateNavCount() {
 }
 
 function updateConn(on) {
+  const prev = state.connected;
   state.connected = on;
+  if (prev === true && on === false) toast('实时连接已断开，正在重连…', 'warn');
+  if (prev === false && on === true && everConnected) toast('实时连接已恢复', 'ok', 2500);
+  if (on) everConnected = true;
   const el = $('#conn');
   if (!el) return;
   el.className = `conn ${on ? 'online' : 'offline'}`;
-  const label = el.querySelector('span:last-child');
-  if (label) label.textContent = on ? '实时连接' : '连接断开';
+  el.querySelector('[data-conn-label]')?.replaceChildren(on ? '实时连接' : '正在重连…');
 }
 
 async function renderRoute() {
   const token = ++routeToken;
   const key = routeKey();
   state.page = key;
+  document.title = `${PAGE_TITLES[key] || '总览'} · ${state.status?.site_name || '阅迹'}`;
   setActiveNav(key);
   currentHandler = null;
   cleanups.forEach((fn) => { try { fn(); } catch { /* ignore */ } });
@@ -76,9 +105,10 @@ async function renderRoute() {
 
   const ctx = {
     root,
-    setHandler: (fn) => { currentHandler = fn; },
-    onCleanup: (fn) => { cleanups.push(fn); },
-    reload: () => renderRoute(),
+    isActive: () => token === routeToken,
+    setHandler: (fn) => { if (token === routeToken) currentHandler = fn; },
+    onCleanup: (fn) => { if (token === routeToken) cleanups.push(fn); },
+    reload: () => { if (token === routeToken) renderRoute(); },
   };
 
   try {
@@ -90,7 +120,7 @@ async function renderRoute() {
       <h3>页面加载失败</h3><p>${escapeHtml(e.message)}</p>
       <button class="btn" data-retry>重新加载</button>
     </div></article>`;
-    root.querySelector('[data-retry]')?.addEventListener('click', () => location.reload());
+    root.querySelector('[data-retry]')?.addEventListener('click', () => renderRoute());
   }
   window.scrollTo({ top: 0, behavior: 'instant' });
 }
@@ -102,8 +132,10 @@ function shellHTML(me) {
       ${n.key === 'accounts' ? '<span class="nav-count" data-count="accounts"></span>' : ''}
     </a>`).join('');
 
-  const mobileHTML = NAV.map((n) => `
-    <a href="#/${n.key}" data-nav="${n.key}">${icon(n.icon)}<span>${n.label}</span></a>`).join('');
+  const mobileHTML = NAV
+    .filter((n) => MOBILE_PRIMARY.includes(n.key))
+    .map((n) => `<a href="#/${n.key}" data-nav="${n.key}">${icon(n.icon)}<span>${n.label}</span></a>`)
+    .join('');
 
   return `<div class="app-shell">
     <aside class="sidebar">
@@ -117,7 +149,7 @@ function shellHTML(me) {
       <div class="nav-section">工作台</div>
       ${navHTML}
       <div class="sidebar-footer">
-        <div class="conn" id="conn"><span class="dot"></span><span>连接中…</span></div>
+        <div class="conn" id="conn"><span class="dot"></span><span data-conn-label>连接中…</span></div>
         <div class="sidebar-actions">
           <button class="side-btn" id="btn-theme">${icon('sun')}<span>主题</span></button>
           <button class="side-btn" id="btn-logout">${icon('logout')}<span>退出</span></button>
@@ -125,7 +157,10 @@ function shellHTML(me) {
       </div>
     </aside>
     <main class="main"><div class="page-inner"><div id="page"></div></div></main>
-    <nav class="mobile-nav">${mobileHTML}</nav>
+    <nav class="mobile-nav">
+      ${mobileHTML}
+      <button class="mobile-more" type="button" data-more id="btn-more" aria-label="更多入口">${icon('more')}<span>更多</span></button>
+    </nav>
   </div>`;
 }
 
@@ -136,7 +171,7 @@ function renderShell(me) {
   document.title = `${me.site_name || '阅迹'} · ReadTrace`;
 
   updateNavCount();
-  updateConn(false);
+  state.connected = false;
 
   $('#btn-theme').addEventListener('click', () => {
     const cur = document.documentElement.dataset.theme;
@@ -151,20 +186,73 @@ function renderShell(me) {
     try { await api.logout(); } catch { /* ignore */ }
     location.reload();
   });
+
+  $('#btn-more')?.addEventListener('click', openMoreSheet);
+}
+
+function openMoreSheet() {
+  const links = NAV.filter((n) => !MOBILE_PRIMARY.includes(n.key));
+  const desc = { push: '推送渠道、模板与测试', settings: '站点、安全与运行信息' };
+  const { mask, close } = openModal({
+    title: '更多',
+    subtitle: '推送与站点设置',
+    narrow: true,
+    body: `<div class="more-list">
+      ${links.map((n) => `<a class="more-item" href="#/${n.key}" data-more-link>
+        ${icon(n.icon)}
+        <span class="more-text"><b>${n.label}</b><span>${desc[n.key] || ''}</span></span>
+      </a>`).join('')}
+    </div>`,
+  });
+  $$('[data-more-link]', mask).forEach((a) => a.addEventListener('click', () => close()));
+}
+
+function teardownEvents() {
+  clearTimeout(esReconnect);
+  if (es) {
+    es.close();
+    es = null;
+  }
 }
 
 function connectEvents() {
+  clearTimeout(esReconnect);
   if (es) es.close();
   es = new EventSource('/api/events');
-  es.onopen = () => updateConn(true);
+  es.onopen = () => {
+    esDelay = 1000;
+    updateConn(true);
+  };
   es.addEventListener('hello', () => updateConn(true));
   es.addEventListener('message', (e) => {
     let ev;
     try { ev = JSON.parse(e.data); } catch { return; }
     window.dispatchEvent(new CustomEvent('app:event', { detail: ev }));
     onGlobalEvent(ev);
+    currentHandler?.(ev);
   });
-  es.onerror = () => updateConn(false);
+  es.onerror = () => {
+    updateConn(false);
+    if (es?.readyState === EventSource.CLOSED) scheduleReconnect();
+  };
+}
+
+function scheduleReconnect() {
+  if (es) {
+    es.close();
+    es = null;
+  }
+  clearTimeout(esReconnect);
+  esReconnect = setTimeout(async () => {
+    if (authActive) return;
+    try {
+      await api.me();
+      connectEvents();
+    } catch {
+      scheduleReconnect();
+    }
+  }, esDelay);
+  esDelay = Math.min(30000, esDelay * 2);
 }
 
 function onGlobalEvent(ev) {
@@ -201,11 +289,12 @@ function authHTML(mode) {
   return `<div class="auth-minimal">
     <form class="auth-minimal-form" id="auth-form" autocomplete="off">
       <div class="auth-error" id="auth-error">${icon('alert')}<span></span></div>
-      ${setup ? `<input class="input auth-input" id="site-name" placeholder="站点名称（可选）" maxlength="40">` : ''}
+      ${setup ? `<input class="input auth-input" id="site-name" placeholder="站点名称（可选）" maxlength="40" aria-label="站点名称">` : ''}
       <input class="input auth-input" id="password" type="password"
         placeholder="${setup ? '设置管理密码（至少 6 位）' : '管理密码'}"
+        aria-label="${setup ? '设置管理密码' : '管理密码'}"
         autocomplete="${setup ? 'new-password' : 'current-password'}" autofocus>
-      ${setup ? `<input class="input auth-input" id="password2" type="password" placeholder="确认密码" autocomplete="new-password">` : ''}
+      ${setup ? `<input class="input auth-input" id="password2" type="password" placeholder="确认密码" aria-label="确认密码" autocomplete="new-password">` : ''}
       <button class="btn btn-primary auth-submit" id="auth-submit" type="submit">
         ${setup ? '创建并进入' : '登录'}
       </button>
@@ -215,7 +304,9 @@ function authHTML(mode) {
 
 function showAuth(mode, info = {}) {
   authActive = true;
-  if (es) { es.close(); es = null; }
+  teardownEvents();
+  currentHandler = null;
+  cleanups = [];
   document.title = `${info.site_name || '阅迹'} · ReadTrace`;
   $('#app').innerHTML = authHTML(mode);
 
@@ -273,7 +364,7 @@ async function boot() {
     renderShell(me);
     connectEvents();
     window.addEventListener('hashchange', renderRoute);
-    if (!location.hash || !PAGES[location.hash.replace(/^#\/?/, '').split('?')[0]]) {
+    if (!location.hash || !PAGES[hashKey()]) {
       location.hash = '#/dashboard';
     }
     await renderRoute();
