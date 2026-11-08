@@ -21,7 +21,6 @@ import (
 	"readtrace/internal/sched"
 	"readtrace/internal/store"
 	"readtrace/internal/weread"
-	"readtrace/internal/wxbot"
 )
 
 // Server bundles the HTTP dependencies.
@@ -31,7 +30,6 @@ type Server struct {
 	sch     *sched.Scheduler
 	nt      *notify.Sender
 	wc      *weread.Client
-	wxBot   *wxbot.Bot
 	qr      *qrManager
 	log     *slog.Logger
 	assets  fs.FS
@@ -47,9 +45,9 @@ type Server struct {
 // Host headers the panel answers to (a DNS-rebinding defense for when the
 // service is exposed beyond loopback); each entry is a bare hostname or IP.
 func New(st *store.Store, eng *engine.Engine, sch *sched.Scheduler, nt *notify.Sender,
-	wc *weread.Client, bot *wxbot.Bot, assets fs.FS, version string, allowedHosts []string, log *slog.Logger) *Server {
+	wc *weread.Client, assets fs.FS, version string, allowedHosts []string, log *slog.Logger) *Server {
 	s := &Server{
-		st: st, eng: eng, sch: sch, nt: nt, wc: wc, wxBot: bot, log: log,
+		st: st, eng: eng, sch: sch, nt: nt, wc: wc, log: log,
 		assets: assets, version: version, started: time.Now(),
 		limiter: newLoginLimiter(), allowedHosts: allowedHosts,
 	}
@@ -121,21 +119,6 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/settings", s.auth(s.handleSettingsGet))
 	mux.HandleFunc("PUT /api/settings", s.auth(s.handleSettingsUpdate))
 	mux.HandleFunc("POST /api/settings/password", s.auth(s.handlePasswordChange))
-
-	// WeChat bot management (admin panel).
-	mux.HandleFunc("GET /api/wxbot", s.auth(s.handleWxBotStatus))
-	mux.HandleFunc("POST /api/wxbot/login", s.auth(s.handleWxBotLogin))
-	mux.HandleFunc("GET /api/wxbot/login", s.auth(s.handleWxBotLoginStatus))
-	mux.HandleFunc("POST /api/wxbot/login/otp", s.auth(s.handleWxBotLoginOTP))
-	mux.HandleFunc("POST /api/wxbot/enabled", s.auth(s.handleWxBotEnabled))
-	mux.HandleFunc("POST /api/wxbot/push", s.auth(s.handleWxBotPush))
-	mux.HandleFunc("GET /api/wxbot/users", s.auth(s.handleWxBotUsers))
-	mux.HandleFunc("GET /api/wxbot/messages", s.auth(s.handleWxBotMessages))
-	mux.HandleFunc("POST /api/wxbot/users/admin", s.auth(s.handleWxBotUserAdmin))
-	mux.HandleFunc("DELETE /api/wxbot/users/{uid}", s.auth(s.handleWxBotUserDelete))
-	mux.HandleFunc("POST /api/wxbot/bind", s.auth(s.handleWxBotBind))
-	mux.HandleFunc("POST /api/wxbot/unbind", s.auth(s.handleWxBotUnbind))
-	mux.HandleFunc("POST /api/wxbot/logout", s.auth(s.handleWxBotLogout))
 
 	// Static UI.
 	fileServer := http.FileServerFS(s.assets)

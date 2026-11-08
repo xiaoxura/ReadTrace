@@ -87,19 +87,4 @@ export const api = {
   settings: () => request('/api/settings'),
   updateSettings: (payload) => request('/api/settings', { method: 'PUT', body: payload }),
   changePassword: (current, next) => request('/api/settings/password', { method: 'POST', body: { current, new: next } }),
-
-  wxBotStatus: () => request('/api/wxbot'),
-  wxBotLogin: () => request('/api/wxbot/login', { method: 'POST', body: {} }),
-  wxBotLoginStatus: () => request('/api/wxbot/login'),
-  wxBotLoginOTP: (code) => request('/api/wxbot/login/otp', { method: 'POST', body: { code } }),
-  wxBotEnabled: (enabled) => request('/api/wxbot/enabled', { method: 'POST', body: { enabled } }),
-  wxBotPush: (enabled) => request('/api/wxbot/push', { method: 'POST', body: { enabled } }),
-  wxBotUsers: () => request('/api/wxbot/users'),
-  wxBotMessages: (userId, { beforeId = 0, limit = 50 } = {}) =>
-    request(`/api/wxbot/messages?user_id=${encodeURIComponent(userId)}&before_id=${beforeId}&limit=${limit}`),
-  wxBotUserAdmin: (userId, admin) => request('/api/wxbot/users/admin', { method: 'POST', body: { user_id: userId, admin } }),
-  wxBotUserDelete: (uid) => request(`/api/wxbot/users/${encodeURIComponent(uid)}`, { method: 'DELETE' }),
-  wxBotBind: (userId, accountId) => request('/api/wxbot/bind', { method: 'POST', body: { user_id: userId, account_id: accountId } }),
-  wxBotUnbind: (accountId, userId = '') => request('/api/wxbot/unbind', { method: 'POST', body: { user_id: userId, account_id: accountId } }),
-  wxBotLogout: () => request('/api/wxbot/logout', { method: 'POST', body: {} }),
 };

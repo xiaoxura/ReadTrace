@@ -205,9 +205,6 @@ func (s *Store) DeleteAccount(id int64) error {
 	if _, err := tx.Exec(`DELETE FROM schedules WHERE account_id = ?`, id); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`DELETE FROM bot_bindings WHERE account_id = ?`, id); err != nil {
-		return err
-	}
 	if _, err := tx.Exec(`DELETE FROM accounts WHERE id = ?`, id); err != nil {
 		return err
 	}

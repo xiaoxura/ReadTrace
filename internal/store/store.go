@@ -104,45 +104,11 @@ CREATE TABLE IF NOT EXISTS push_channels (
 	created_at    INTEGER NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS bot_logins (
-	id              INTEGER PRIMARY KEY AUTOINCREMENT,
-	bot_id          TEXT NOT NULL DEFAULT '',
-	user_id         TEXT NOT NULL DEFAULT '',
-	token_enc       BLOB,
-	base_url        TEXT NOT NULL DEFAULT 'https://ilinkai.weixin.qq.com',
-	get_updates_buf BLOB,
-	updated_at      INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE TABLE IF NOT EXISTS bot_users (
-	user_id    TEXT PRIMARY KEY,
-	is_admin   INTEGER NOT NULL DEFAULT 0,
-	first_seen INTEGER NOT NULL,
-	last_seen  INTEGER NOT NULL
-);
-
--- One account has exactly one owner WeChat user; a user may own many.
-CREATE TABLE IF NOT EXISTS bot_bindings (
-	id         INTEGER PRIMARY KEY AUTOINCREMENT,
-	user_id    TEXT NOT NULL,
-	account_id INTEGER NOT NULL UNIQUE,
-	created_at INTEGER NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_bot_bindings_user ON bot_bindings(user_id);
-
--- 用户与机器人之间的往来消息（对话记录面板用）。
-CREATE TABLE IF NOT EXISTS bot_messages (
-	id        INTEGER PRIMARY KEY AUTOINCREMENT,
-	user_id   TEXT NOT NULL,
-	direction TEXT NOT NULL DEFAULT 'in', -- in = 用户发出, out = 机器人回复
-	kind      TEXT NOT NULL DEFAULT 'text',
-	content   TEXT NOT NULL DEFAULT '',
-	msg_ref   TEXT NOT NULL DEFAULT '',
-	ts        INTEGER NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_bot_messages_user ON bot_messages(user_id, id);
+-- 微信机器人渠道已移除：旧库中的遗留表在此清理。
+DROP TABLE IF EXISTS bot_logins;
+DROP TABLE IF EXISTS bot_users;
+DROP TABLE IF EXISTS bot_bindings;
+DROP TABLE IF EXISTS bot_messages;
 
 CREATE INDEX IF NOT EXISTS idx_runs_account_started ON runs(account_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_started ON runs(started_at);

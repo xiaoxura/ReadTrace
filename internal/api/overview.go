@@ -160,11 +160,6 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 			scheduleCount++
 		}
 	}
-	wxStats := map[string]any{}
-	if s.wxBot != nil {
-		wxStats = s.wxBot.Status()
-	}
-
 	s.writeJSON(w, http.StatusOK, map[string]any{
 		"today_seconds":     todaySec,
 		"yesterday_seconds": yesterdaySec,
@@ -180,7 +175,6 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 		"account_count":     len(accounts),
 		"expired_accounts":  expiredAccounts,
 		"schedule_count":    scheduleCount,
-		"wxbot":             wxStats,
 		"next_runs":         upcoming,
 		"today":             today.Format("2006-01-02"),
 		"timezone":          loc.String(),

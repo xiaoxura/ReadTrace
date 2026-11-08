@@ -10,7 +10,6 @@ import { renderAccounts } from './pages/accounts.js';
 import { renderRuns } from './pages/runs.js';
 import { renderSchedules } from './pages/schedules.js';
 import { renderPush } from './pages/push.js';
-import { renderWechat } from './pages/wechat.js';
 import { renderSettings } from './pages/settings.js';
 
 const PAGES = {
@@ -19,7 +18,6 @@ const PAGES = {
   runs: renderRuns,
   schedules: renderSchedules,
   push: renderPush,
-  wechat: renderWechat,
   settings: renderSettings,
 };
 
@@ -29,15 +27,14 @@ const NAV = [
   { key: 'runs', label: '记录', icon: 'list' },
   { key: 'schedules', label: '定时', icon: 'calendar' },
   { key: 'push', label: '推送', icon: 'bell' },
-  { key: 'wechat', label: '微信', icon: 'wechat' },
   { key: 'settings', label: '设置', icon: 'settings' },
 ];
 
 // 移动端底部只放最常用的 5 个入口，其余收进「更多」，避免 7 项挤在 390px 里。
-const MOBILE_PRIMARY = ['dashboard', 'accounts', 'runs', 'schedules', 'wechat'];
+const MOBILE_PRIMARY = ['dashboard', 'accounts', 'runs', 'schedules', 'push'];
 const PAGE_TITLES = {
   dashboard: '总览', accounts: '账号', runs: '记录', schedules: '定时',
-  push: '推送', wechat: '微信', settings: '设置',
+  push: '推送', settings: '设置',
 };
 
 let currentHandler = null;

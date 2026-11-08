@@ -24,11 +24,5 @@ secret.key
 .vscode/
 .DS_Store
 
-# 第三方源码/协议资料：不随本仓库发布
-/plugin-unpacked/
-/openclaw-repo/
-/*.tgz
-/微信iLink-官方机器人协议.md
-
 # 日志
 *.log

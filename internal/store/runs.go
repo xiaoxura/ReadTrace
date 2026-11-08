@@ -127,8 +127,7 @@ func (s *Store) PurgeHistory(retainDays int) (int64, error) {
 }
 
 // PurgeHistoryBefore deletes finished runs with finished_at < cutoff.
-// Exposed as-is so tests can pin the cutoff. Bot chat history shares the
-// same retention window with keyed cleanup below.
+// Exposed as-is so tests can pin the cutoff.
 func (s *Store) PurgeHistoryBefore(cutoff int64) (int64, error) {
 	if _, err := s.db.Exec(`DELETE FROM run_logs WHERE run_id IN
 		(SELECT id FROM runs WHERE finished_at > 0 AND finished_at < ?)`, cutoff); err != nil {
@@ -139,7 +138,6 @@ func (s *Store) PurgeHistoryBefore(cutoff int64) (int64, error) {
 		return 0, err
 	}
 	n, _ := res.RowsAffected()
-	_, _ = s.db.Exec(`DELETE FROM bot_messages WHERE ts < ?`, cutoff)
 	return n, nil
 }
 

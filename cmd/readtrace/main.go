@@ -30,7 +30,6 @@ import (
 	"readtrace/internal/store"
 	"readtrace/internal/webui"
 	"readtrace/internal/weread"
-	"readtrace/internal/wxbot"
 )
 
 var version = "dev"
@@ -128,14 +127,7 @@ func run(addr, dataDir string, openBrowser bool, retainDays int, hostAllow strin
 	chk.Start()
 	defer chk.Wait()
 
-	// 微信机器人渠道：绑定后即可在微信里登录账号、开跑阅读、管理定时任务。
-	bot := wxbot.New(st, client, eng, sch, hub, logger)
-	bot.EnsureOwnerAdmin()
-	if wxbot.Enabled(st) {
-		bot.Start()
-	}
-
-	srv := api.New(st, eng, sch, nt, client, bot, webui.FS(), version, parseHostAllow(hostAllow), logger)
+	srv := api.New(st, eng, sch, nt, client, webui.FS(), version, parseHostAllow(hostAllow), logger)
 	httpServer := &http.Server{
 		Addr:              addr,
 		Handler:           srv.Handler(),
@@ -170,7 +162,6 @@ func run(addr, dataDir string, openBrowser bool, retainDays int, hostAllow strin
 
 	// Stop producing first, then release SSE subscribers so the HTTP server
 	// has no long-lived connections left to wait on.
-	bot.Stop()
 	sch.Stop()
 	eng.StopAll()
 	eng.Hub().CloseAll()
