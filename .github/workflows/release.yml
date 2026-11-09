@@ -85,7 +85,7 @@ jobs:
           mkdir -p dist
           CGO_ENABLED=0 go build -trimpath -buildvcs=false \
             -ldflags "-s -w -X main.version=${version}" \
-            -o "dist/readtrace_${version}_${label}_${GOARCH}${suffix}" ./cmd/readtrace
+            -o "dist/readtrace_${label}_${GOARCH}${suffix}" ./cmd/readtrace
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
