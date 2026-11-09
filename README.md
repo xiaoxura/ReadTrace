@@ -31,7 +31,7 @@
 | Cookie 维护 | 自动续期，失败时标记失效并提示重扫 |
 | 推送 | **13 种**：PushPlus / WxPusher / Telegram / ServerChan / Server酱³ / Bark / Ntfy / Gotify / PushDeer / 飞书 / 企业微信 / 钉钉 / Apprise，面板内配置与测试 |
 | 数据安全 | **AES-256-GCM 加密落库**，本机密钥 |
-| 移动端 / 暗色 | **响应式 + 明暗主题** |
+| 移动端 / 主题 | **响应式 + 默认浅色，可切换深色** |
 
 ---
 
@@ -50,7 +50,7 @@
 - **阅读自动重试**：新账号默认失败自动重试 5 次、间隔 30 秒，可调整；登录已失效的情况不会盲目重试。
 - **多种推送**：PushPlus、WxPusher、Telegram（支持代理）、ServerChan、Server酱³、Bark、Ntfy、Gotify、PushDeer、飞书、企业微信、钉钉、Apprise（自建 API 服务桥接数十种服务），支持发送测试消息。
 - **安静的问题提醒**：正常完成、手动停止和重试后恢复成功不自动推送；最终仍失败或确认登录失效时才提醒。同一失效状态不会反复提醒，可自定义失败 / 失效消息模板，支持 `{{account}}`、`{{elapsed}}` 等变量。
-- **响应式界面**：桌面侧边栏 / 移动端底部导航，深色与浅色主题，跟随系统。
+- **响应式界面**：桌面侧边栏 / 移动端底部导航，默认浅色主题，可切换深色或跟随系统。
 - **内置更新日志**：「关于」下方的独立版本页，按版本记录已发布的功能与变化。
 - **数据本地化**：SQLite 单文件，账号 Cookie 与推送 Token 加密存储；复制数据目录即可迁移。
 
@@ -68,7 +68,7 @@
     <td><img src="docs/screenshots/settings.png" alt="设置" /></td>
   </tr>
   <tr>
-    <td><img src="docs/screenshots/dashboard-light.png" alt="浅色主题" /></td>
+    <td><img src="docs/screenshots/changelog.png" alt="更新日志" /></td>
     <td><img src="docs/screenshots/mobile.png" alt="移动端" /></td>
   </tr>
 </table>
@@ -340,7 +340,7 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-产物不套压缩包，也不在文件名里带版本号，直接是 `readtrace_linux_amd64`、`readtrace_macos_arm64` 这样的固定文件名（文件名里的 `macos` 即 Go 的 `darwin` 目标；v0.1.0 是带版本号的旧命名）。版本由 Release 标签和 `readtrace -version` 提供，服务器更新脚本始终使用同一个下载路径。Linux / macOS 下载后需要 `chmod +x`：
+产物不套压缩包，也不在文件名里带版本号，直接是 `readtrace_linux_amd64`、`readtrace_macos_arm64` 这样的固定文件名（文件名里的 `macos` 即 Go 的 `darwin` 目标）。版本由 Release 标签和 `readtrace -version` 提供，服务器更新脚本始终使用同一个下载路径。Linux / macOS 下载后需要 `chmod +x`：
 
 ```bash
 # 以后每个版本都使用同一个下载地址

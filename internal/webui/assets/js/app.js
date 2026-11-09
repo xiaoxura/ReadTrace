@@ -137,6 +137,7 @@ async function renderRoute() {
 }
 
 function shellHTML(me) {
+  const theme = document.documentElement.dataset.theme === 'dark' ? 'dark' : 'light';
   const navHTML = NAV.map((n) => `
     <a class="nav-item" href="#/${n.key}" data-nav="${n.key}">
       ${icon(n.icon)}<span>${n.label}</span>
@@ -160,7 +161,7 @@ function shellHTML(me) {
       <div class="sidebar-footer">
         <div class="conn" id="conn"><span class="dot"></span><span data-conn-label>连接中…</span></div>
         <div class="sidebar-actions">
-          <button class="side-btn" id="btn-theme">${icon('sun')}<span>主题</span></button>
+          <button class="side-btn" id="btn-theme">${icon(theme === 'dark' ? 'sun' : 'moon')}<span>主题</span></button>
           <button class="side-btn" id="btn-logout">${icon('logout')}<span>退出</span></button>
         </div>
       </div>
@@ -186,7 +187,7 @@ function renderShell(me) {
     const next = cur === 'dark' ? 'light' : 'dark';
     applyTheme(next);
     redrawCharts();
-    $('#btn-theme').innerHTML = `${icon(next === 'dark' ? 'moon' : 'sun')}<span>主题</span>`;
+    $('#btn-theme').innerHTML = `${icon(next === 'dark' ? 'sun' : 'moon')}<span>主题</span>`;
     toast(`已切换为${next === 'dark' ? '深色' : '浅色'}主题`, 'ok');
   });
 

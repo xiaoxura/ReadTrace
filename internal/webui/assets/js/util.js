@@ -304,7 +304,7 @@ export function downloadText(filename, text) {
 
 export function themePreference() {
   const v = localStorage.getItem('wxread-theme');
-  return v === 'light' || v === 'dark' || v === 'system' ? v : 'dark';
+  return v === 'light' || v === 'dark' || v === 'system' ? v : 'light';
 }
 
 export function resolveTheme(pref) {

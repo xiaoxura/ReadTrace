@@ -116,7 +116,7 @@ function appearanceHTML() {
     <article class="card settings-card">
       <div class="card-head"><div><div class="card-title">${icon('sun')}外观</div><div class="card-sub">主题会记忆在本地浏览器</div></div></div>
       <div class="type-grid" style="grid-template-columns:repeat(3,1fr)">
-        ${[['dark', '深色', 'moon'], ['light', '浅色', 'sun'], ['system', '跟随系统', 'settings']].map(([v, label, ic]) => `
+        ${[['light', '浅色', 'sun'], ['dark', '深色', 'moon'], ['system', '跟随系统', 'settings']].map(([v, label, ic]) => `
           <button class="type-opt ${themePreference() === v ? 'active' : ''}" data-theme-pref="${v}"><b>${label}</b>${icon(ic)}</button>`).join('')}
       </div>
       <div class="hint">当前生效：${resolveTheme(themePreference()) === 'dark' ? '深色' : '浅色'}</div>

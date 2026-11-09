@@ -311,12 +311,10 @@ function archiveStatusHTML(snapshot) {
 
 function redrawShelfPreservingSelection(host) {
   const checked = new Map($$('[data-shelf-book]', host).map((cb) => [cb.dataset.shelfBook, cb.checked]));
-  const checkNew = $('#shelf-check-new', host)?.checked;
   drawShelfPreview();
   $$('[data-shelf-book]', host).forEach((cb) => {
     if (checked.has(cb.dataset.shelfBook)) cb.checked = checked.get(cb.dataset.shelfBook);
   });
-  if (checkNew !== undefined && $('#shelf-check-new', host)) $('#shelf-check-new', host).checked = checkNew;
   const count = $('#shelf-count', host);
   if (count) count.textContent = `(${$$('[data-shelf-book]:checked', host).length})`;
 }
@@ -388,7 +386,7 @@ function drawShelfPreview() {
       <tr class="shelf-row" data-shelf="${escapeHtml(b.id)}" data-blocked="${blocked ? 1 : 0}">
         <td>${blocked
           ? '<input type="checkbox" disabled title="未付费，章节不可读，不导入">'
-          : `<input type="checkbox" data-shelf-book="${escapeHtml(b.id)}" data-title="${escapeHtml(b.title)}" data-author="${escapeHtml(b.author || '')}" data-cover="${escapeHtml(b.cover || '')}" ${inPool.has(b.id) ? '' : 'checked'}>`}</td>
+          : `<input type="checkbox" data-shelf-book="${escapeHtml(b.id)}" data-title="${escapeHtml(b.title)}" data-author="${escapeHtml(b.author || '')}" data-cover="${escapeHtml(b.cover || '')}">`}</td>
         <td><div class="shelf-cover">${b.cover ? `<img loading="lazy" src="${escapeHtml(b.cover)}" alt="">` : ''}</div></td>
         <td class="cell-strong">${escapeHtml(b.title)}</td>
         <td class="cell-muted">${escapeHtml(b.author || '—')}</td>
@@ -399,9 +397,7 @@ function drawShelfPreview() {
   }).join('');
   host.innerHTML = `
     <div class="tool-row" style="margin-top:12px;align-items:center">
-      <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer">
-        <input type="checkbox" id="shelf-check-new" checked> 仅自动勾选未入池的书
-      </label>
+      <span class="hint">勾选要导入的书籍（未付费的不可选）</span>
       <button class="btn" id="shelf-reload">${icon('refresh')}重新拉取</button>
       <span style="flex:1"></span>
       <button class="btn btn-primary" id="shelf-import">${icon('plus')}导入选中 <span id="shelf-count"></span></button>
@@ -420,10 +416,7 @@ function drawShelfPreview() {
     onSize: (size) => { shelfPageSize = size; shelfPage = 1; drawShelfPreview(); },
   });
   const recount = () => { $('#shelf-count', host).textContent = `(${String($$('[data-shelf-book]:checked', host).length)})`; };
-  $('#shelf-check-new', host).addEventListener('change', (e) => {
-    $$('[data-shelf-book]', host).forEach((cb) => { cb.checked = e.target.checked; });
-    recount();
-  });
+  $$('[data-shelf-book]', host).forEach((cb) => cb.addEventListener('change', recount));
   $('#shelf-reload', host).addEventListener('click', () => loadShelf());
   $('#shelf-import', host).addEventListener('click', () => importSelected());
   $('[data-shelf-more]', host)?.addEventListener('click', loadMoreArchive);

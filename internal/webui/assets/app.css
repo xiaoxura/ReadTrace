@@ -381,7 +381,7 @@ h1, h2, h3, h4, p { margin: 0; }
 }
 .check input { accent-color: var(--accent); width: 15px; height: 15px; }
 
-.switch { position: relative; width: 38px; height: 22px; flex: none; }
+.switch { display: inline-block; vertical-align: middle; position: relative; width: 38px; height: 22px; flex: none; }
 .switch i {
   position: absolute;
   inset: 0;
@@ -1380,13 +1380,13 @@ h1, h2, h3, h4, p { margin: 0; }
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
-  font-size: 25px;
+  font-size: 27px;
   font-weight: 760;
   letter-spacing: -.03em;
   line-height: 1.15;
 }
-.release-version .badge { font-size: 10px; }
-.release-meta { color: var(--muted); font-size: 11.5px; margin-top: 6px; letter-spacing: .02em; }
+.release-version .badge { font-size: 11px; }
+.release-meta { color: var(--muted); font-size: 12.5px; margin-top: 6px; letter-spacing: .02em; }
 .release-mark {
   width: 44px;
   height: 44px;
@@ -1401,7 +1401,7 @@ h1, h2, h3, h4, p { margin: 0; }
 .release-mark svg { width: 21px; height: 21px; }
 .release-intro {
   color: var(--text-2);
-  font-size: 12.5px;
+  font-size: 13.5px;
   line-height: 1.8;
   max-width: 76ch;
   margin-top: 14px;
@@ -1424,9 +1424,9 @@ h1, h2, h3, h4, p { margin: 0; }
   display: flex;
   align-items: center;
   gap: 8px;
-  font-size: 13px;
+  font-size: 14px;
   font-weight: 700;
-  margin-bottom: 10px;
+  margin-bottom: 11px;
 }
 .release-group-head svg { width: 15px; height: 15px; color: var(--accent); flex: none; }
 .release-list {
@@ -1435,14 +1435,14 @@ h1, h2, h3, h4, p { margin: 0; }
   padding: 0;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 9px;
 }
 .release-list li {
   position: relative;
   padding-left: 13px;
   color: var(--text-2);
-  font-size: 11.8px;
-  line-height: 1.65;
+  font-size: 13px;
+  line-height: 1.7;
 }
 .release-list li::before {
   content: "";
@@ -1457,7 +1457,7 @@ h1, h2, h3, h4, p { margin: 0; }
 .release-list li b { color: var(--text); font-weight: 650; }
 .release-list code {
   font-family: var(--mono);
-  font-size: 10.8px;
+  font-size: 11.5px;
   padding: 1px 5px;
   border-radius: 5px;
   background: var(--surface-3);
@@ -1465,7 +1465,7 @@ h1, h2, h3, h4, p { margin: 0; }
 }
 @media (max-width: 900px) {
   .release-groups { grid-template-columns: 1fr; }
-  .release-version { font-size: 22px; }
+  .release-version { font-size: 24px; }
   .release-mark { width: 38px; height: 38px; border-radius: 11px; }
   .release-mark svg { width: 18px; height: 18px; }
 }

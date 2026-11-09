@@ -46,21 +46,18 @@ uname -m
 
 ### 2.2 从 Release 下载
 
-当前 `v0.1.0` 的资产名带版本号，例如：
-
-```text
-readtrace_0.1.0_linux_amd64
-```
-
-如果当前版本还没有固定名，去 [Releases](https://github.com/xiaoxura/ReadTrace/releases) 页面选择对应架构的文件，下载后自行重命名为 `readtrace`。
-
-后续版本使用固定文件名：
+Release 使用固定文件名，不带版本号：
 
 ```text
 readtrace_linux_amd64
+readtrace_linux_arm64
+readtrace_macos_amd64
+readtrace_macos_arm64
+readtrace_windows_amd64.exe
+readtrace_windows_arm64.exe
 ```
 
-固定文件名可以配合 `/releases/latest/download/` 使用，服务器更新脚本不用每次改版本号：
+版本由 Release 标签和 `readtrace -version` 提供。固定文件名可以配合 `/releases/latest/download/` 使用，服务器更新脚本不用每次改版本号：
 
 ```bash
 curl -fLO https://github.com/xiaoxura/ReadTrace/releases/latest/download/readtrace_linux_amd64
