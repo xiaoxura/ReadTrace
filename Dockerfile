@@ -5,7 +5,7 @@ ENV CGO_ENABLED=0
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-ARG VERSION=docker
+ARG VERSION=0.1.0
 RUN go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o /out/readtrace ./cmd/readtrace
 
 # 二进制与 data 目录位于同一目录：/opt/readtrace/readtrace + /opt/readtrace/data

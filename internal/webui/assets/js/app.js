@@ -13,6 +13,7 @@ import { renderSchedules } from './pages/schedules.js';
 import { renderPush } from './pages/push.js';
 import { renderSettings } from './pages/settings.js';
 import { renderAbout } from './pages/about.js';
+import { renderChangelog } from './pages/changelog.js';
 
 const PAGES = {
   dashboard: renderDashboard,
@@ -23,6 +24,7 @@ const PAGES = {
   push: renderPush,
   settings: renderSettings,
   about: renderAbout,
+  changelog: renderChangelog,
 };
 
 const NAV = [
@@ -34,12 +36,13 @@ const NAV = [
   { key: 'push', label: '推送', icon: 'bell' },
   { key: 'settings', label: '设置', icon: 'settings' },
   { key: 'about', label: '关于', icon: 'info' },
+  { key: 'changelog', label: '更新日志', icon: 'megaphone' },
 ];
 
 // 移动端入口更多了，「更多」弹层已移除：底部导航横向滚动展示全部页面。
 const PAGE_TITLES = {
   dashboard: '总览', accounts: '账号', runs: '记录', pool: '书池', schedules: '定时',
-  push: '推送', settings: '设置', about: '关于',
+  push: '推送', settings: '设置', about: '关于', changelog: '更新日志',
 };
 
 let currentHandler = null;
@@ -67,6 +70,15 @@ function setActiveNav(key) {
     if (active) el.setAttribute('aria-current', 'page');
     else el.removeAttribute('aria-current');
   });
+  // 底部导航条目已超出一屏，切换页面时把当前项滚进可视区域。
+  const mobileNav = $('.mobile-nav');
+  const activeItem = mobileNav?.querySelector(`[data-nav="${key}"]`);
+  if (mobileNav && activeItem && mobileNav.clientWidth > 0) {
+    mobileNav.scrollTo({
+      left: Math.max(0, activeItem.offsetLeft - (mobileNav.clientWidth - activeItem.offsetWidth) / 2),
+      behavior: 'smooth',
+    });
+  }
 }
 
 function updateNavCount() {

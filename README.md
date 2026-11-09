@@ -51,6 +51,7 @@
 - **多种推送**：PushPlus、WxPusher、Telegram（支持代理）、ServerChan、Server酱³、Bark、Ntfy、Gotify、PushDeer、飞书、企业微信、钉钉、Apprise（自建 API 服务桥接数十种服务），支持发送测试消息。
 - **安静的问题提醒**：正常完成、手动停止和重试后恢复成功不自动推送；最终仍失败或确认登录失效时才提醒。同一失效状态不会反复提醒，可自定义失败 / 失效消息模板，支持 `{{account}}`、`{{elapsed}}` 等变量。
 - **响应式界面**：桌面侧边栏 / 移动端底部导航，深色与浅色主题，跟随系统。
+- **内置更新日志**：「关于」下方的独立版本页，按版本记录已发布的功能与变化。
 - **数据本地化**：SQLite 单文件，账号 Cookie 与推送 Token 加密存储；复制数据目录即可迁移。
 
 <table>
@@ -82,16 +83,16 @@
 
 ```bash
 # Linux / macOS
-./build.sh 1.2.0
+./build.sh 0.1.0
 
 # Windows PowerShell
-.\build.ps1 -Version 1.2.0
+.\build.ps1 -Version 0.1.0
 ```
 
 也可以直接用发布页的二进制，或在项目根目录执行：
 
 ```bash
-go build -trimpath -ldflags "-s -w -X main.version=1.2.0" -o readtrace ./cmd/readtrace
+go build -trimpath -ldflags "-s -w -X main.version=0.1.0" -o readtrace ./cmd/readtrace
 ```
 
 ### 2. 启动
@@ -186,7 +187,7 @@ data/
 二进制放哪个目录，数据就生成在同级 `data/` 目录（例如 `/opt/readtrace/readtrace` + `/opt/readtrace/data`），无需传 `-data`；同一份代码交叉编译即可：
 
 ```bash
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w -X main.version=1.2.0" -o readtrace ./cmd/readtrace
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w -X main.version=0.1.0" -o readtrace ./cmd/readtrace
 ```
 
 ### Windows 开机自启
@@ -365,6 +366,31 @@ docs/screenshots/      README 截图
 ```
 
 前端刻意不使用打包器：`go:embed` 直接嵌入原生 ES Module、CSS 与 SVG 图标，改样式不需要 Node 工具链，保证“单二进制”这一目标。
+
+### 发布 Release
+
+仓库内置了 [`.github/workflows/release.yml`](.github/workflows/release.yml)。推送 `v*` 标签后会自动：
+
+1. 在 Linux 上执行 `go test ./...`；
+2. 交叉编译 `linux`、`macOS`、`windows` 的 `amd64` / `arm64` 版本；
+3. 生成 `SHA256SUMS`；
+4. 创建同名 GitHub Release，上传 6 个**单文件可执行程序**和校验文件。
+
+发布时推送标签：
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+产物不套压缩包，直接是 `readtrace_0.1.0_linux_amd64`、`readtrace_0.1.0_macos_arm64` 这样的可执行文件（文件名里的 `macos` 即 Go 的 `darwin` 目标）；Linux / macOS 下载后需要 `chmod +x`：
+
+```bash
+chmod +x readtrace_0.1.0_linux_amd64
+./readtrace_0.1.0_linux_amd64
+```
+
+也可以在 GitHub 的 **Releases → Draft a new release** 中新建 `v0.1.0` 标签并发布；如果该标签没有自动触发构建，到 **Actions → Release → Run workflow** 填入同一个标签即可补发产物。`main.version` 会取自标签（去掉开头的 `v`），所以设置页显示的版本与 Release 标签一致。
 
 ---
 
