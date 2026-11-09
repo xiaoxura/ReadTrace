@@ -238,6 +238,52 @@ docker run -d --name readtrace -p 8720:8720 \
 
 默认监听 `0.0.0.0`，请务必设置管理密码，并建议只在局域网或反代后暴露。
 
+### 1Panel
+
+1Panel 的 Go 运行环境/容器可以直接运行 Release 里的预编译二进制，不需要在服务器上安装 Go。下面以运行目录 `/opt/ReadTrace` 为例（Linux 路径区分大小写，改了目录就同步改启动命令和挂载路径）。
+
+先确认服务器架构并准备目录：
+
+```bash
+uname -m   # x86_64 用 linux_amd64，aarch64/arm64 用 linux_arm64
+mkdir -p /opt/ReadTrace/data
+# 从 Release 下载对应架构的二进制，重命名为 readtrace 后放到 /opt/ReadTrace/
+chmod +x /opt/ReadTrace/readtrace
+```
+
+当前 v0.1.0 的资产名带版本号（如 `readtrace_0.1.0_linux_amd64`），后续版本使用固定名 `readtrace_linux_amd64`。
+
+创建容器时按下表填写：
+
+| 字段 | 填写 |
+| --- | --- |
+| 名称 | `ReadTrace` |
+| 应用 | 选 Go 1.27；面板只有 Go 1.26 也可以，但必须运行预编译二进制，不能 `go run` |
+| 运行目录 | `/opt/ReadTrace` |
+| 启动命令 | `/app/readtrace -addr 0.0.0.0:8720 -no-open -data /app/data` |
+| 容器名称 | `ReadTrace` |
+| 端口 | 容器端口 `8720` |
+| 主机映射 | 宿主 `8720` → 容器 `8720`，宿主端口被占用时换成其他端口 |
+| 挂载 | 不需要。1Panel 已把宿主运行目录挂载到容器 `/app` |
+| 环境变量 | 可选 `TZ=Asia/Shanghai`；用域名访问时可加 `READTRACE_HOST_ALLOW=你的域名` |
+
+1Panel 的 Go 运行环境本质上是 `golang` 容器，工作目录是 `/app`，宿主运行目录会挂载到 `/app`：
+
+- 宿主 `/opt/ReadTrace/readtrace` ↔ 容器 `/app/readtrace`
+- 宿主 `/opt/ReadTrace/data` ↔ 容器 `/app/data`
+
+所以启动命令要写容器内路径 `/app/readtrace`，不能写宿主路径 `/opt/ReadTrace/readtrace`；数据也写在运行目录下的 `data/`，天然就会持久化，不需要再单独挂载。只有把数据放到运行目录以外时才需要额外加挂载。
+
+三个启动参数不要省：
+
+- `-addr 0.0.0.0:8720`：容器内必须监听 `0.0.0.0`，否则端口映射后访问不到。
+- `-no-open`：服务器没有浏览器，禁止启动时自动打开。
+- `-data /app/data`：SQLite 与密钥都放在运行目录的 `data/` 下，随运行目录一起持久化。
+
+项目 `go.mod` 要求 Go 1.27+，所以如果面板走源码编译，必须选 1.27；选 1.26 会报 `go.mod requires go >= 1.27.0`。上传预编译二进制则不依赖 Go 版本。
+
+启动后访问 `http://服务器IP:8720` 设置管理密码。更新时在 1Panel 停止容器，替换宿主 `/opt/ReadTrace/readtrace`，再启动容器即可，`/opt/ReadTrace/data/` 不要删。若容器以非 root 用户运行且数据目录不可写，需把宿主 `/opt/ReadTrace/data` 的所有权交给容器用户。
+
 ---
 
 ## 工作原理
