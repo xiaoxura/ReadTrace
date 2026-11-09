@@ -237,3 +237,104 @@ func TestDefaultTemplateRoundTrip(t *testing.T) {
 		t.Fatal("template not cleared")
 	}
 }
+
+// AddChapters 是批量导入的单事务入口：新增/已在池/修复空 book_id 的计数语义
+// 必须与逐条的 AddChapterItem 一致，且同样的列表重复执行应当全部变成“已在池”。
+func TestAddChaptersBatch(t *testing.T) {
+	st := newTestStore(t)
+	acc := seedAccount(t, st, "A")
+	chs := []NewChapter{
+		{Value: "ch1", Title: "书 · 第一章", WordCount: 3000, ChapterIndex: 1},
+		{Value: "ch2", Title: "书 · 第二章", WordCount: 3200, ChapterIndex: 2},
+		// 修复路径：这条先手动加成无归属章节，再由整本导入补 book_id。
+	}
+	if _, err := st.AddPoolItem(KindBook, "book1", "测试书", acc); err != nil {
+		t.Fatalf("add book: %v", err)
+	}
+	// 老的手动导入章节没有 book 关联（AddPoolItem 加的 chapter 行 book_id 空）。
+	if _, err := st.AddPoolItem(KindChapter, "ch3", "", acc); err != nil {
+		t.Fatalf("seed unlinked chapter: %v", err)
+	}
+	chs = append(chs, NewChapter{Value: "ch3", Title: "书 · 第三章", WordCount: 2800, ChapterIndex: 3})
+
+	added, existed, err := st.AddChapters(acc, "book1", chs)
+	if err != nil {
+		t.Fatalf("add chapters: %v", err)
+	}
+	if added != 3 || existed != 0 {
+		t.Fatalf("first run added=%d existed=%d, want 3/0", added, existed)
+	}
+	items, err := st.PoolChaptersOf("book1", acc)
+	if err != nil || len(items) != 3 {
+		t.Fatalf("chapters of book1 = %d, err = %v, want 3", len(items), err)
+	}
+	for _, it := range items {
+		if it.BookID != "book1" {
+			t.Fatalf("chapter %s book_id = %q, want book1", it.Value, it.BookID)
+		}
+	}
+	for _, it := range items {
+		want := map[string]int{"ch1": 1, "ch2": 2, "ch3": 3}[it.Value]
+		if it.ChapterIndex != want {
+			t.Fatalf("chapter %s chapter_index = %d, want %d", it.Value, it.ChapterIndex, want)
+		}
+	}
+	var ch1 *PoolItem
+	for i := range items {
+		if items[i].Value == "ch1" {
+			ch1 = &items[i]
+		}
+	}
+	if ch1 == nil || ch1.Title != "书 · 第一章" || ch1.WordCount != 3000 {
+		t.Fatalf("chapter ch1 meta wrong: %+v", ch1)
+	}
+
+	added, existed, err = st.AddChapters(acc, "book1", chs)
+	if err != nil {
+		t.Fatalf("re-add chapters: %v", err)
+	}
+	if added != 0 || existed != 3 {
+		t.Fatalf("second run added=%d existed=%d, want 0/3", added, existed)
+	}
+
+	// 空输入直接返回，正常账号下不报错。
+	if added, existed, err := st.AddChapters(acc, "book1", nil); err != nil || added != 0 || existed != 0 {
+		t.Fatalf("empty batch = %d/%d, %v", added, existed, err)
+	}
+}
+
+// 清空书籍池会级联删除这些书的章节（与逐本删除的语义一致）。
+func TestClearBooksCascadesChapters(t *testing.T) {
+	st := newTestStore(t)
+	acc := seedAccount(t, st, "A")
+	other := seedAccount(t, st, "B")
+	if _, err := st.AddPoolItem(KindBook, "book1", "书", acc); err != nil {
+		t.Fatalf("add book: %v", err)
+	}
+	if _, _, err := st.AddChapters(acc, "book1", []NewChapter{{Value: "c1", Title: "书 · c1", WordCount: 100}}); err != nil {
+		t.Fatalf("add chapters: %v", err)
+	}
+	if _, _, err := st.AddChapters(other, "book1", []NewChapter{{Value: "c2", Title: "B · c2", WordCount: 100}}); err != nil {
+		t.Fatalf("add chapters other: %v", err)
+	}
+	if err := st.ClearPoolFor(KindBook, acc); err != nil {
+		t.Fatalf("clear: %v", err)
+	}
+	for _, it := range []struct {
+		kind string
+		n    int
+		msg  string
+	}{
+		{KindBook, 0, "account books"},
+		{KindChapter, 0, "account chapters"},
+	} {
+		items, err := st.PoolItemsForAccount(it.kind, acc)
+		if err != nil || len(items) != it.n {
+			t.Fatalf("after clear %s = %d, err = %v, want 0", it.msg, len(items), err)
+		}
+	}
+	// 其他账号的同类条目必须保留。
+	if items, err := st.PoolItemsForAccount(KindChapter, other); err != nil || len(items) != 1 {
+		t.Fatalf("other account chapters = %d, err = %v, want 1", len(items), err)
+	}
+}

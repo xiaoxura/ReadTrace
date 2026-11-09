@@ -131,6 +131,7 @@ CREATE TABLE IF NOT EXISTS pool_items (
 	enabled     INTEGER NOT NULL DEFAULT 1,
 	sort_order  INTEGER NOT NULL DEFAULT 0,
 	word_count  INTEGER NOT NULL DEFAULT 0,
+	chapter_index  INTEGER NOT NULL DEFAULT 0,
 	created_at  INTEGER NOT NULL,
 	UNIQUE(kind, value, account_id)
 );
@@ -147,6 +148,10 @@ CREATE INDEX IF NOT EXISTS idx_run_statistics_account_started ON run_statistics(
 CREATE INDEX IF NOT EXISTS idx_run_logs_run ON run_logs(run_id, id);
 CREATE INDEX IF NOT EXISTS idx_schedules_account ON schedules(account_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
+-- 书池查询的主力索引：PoolItemsForAccount / PoolChaptersPage（COUNT+LIMIT）
+-- / PoolChapterCountsForAccount / AddChapters 去重都按 (account_id, kind) 起
+-- 步，章节还带 book_id 过滤。UNIQUE(kind, value, account_id) 救不了它们。
+CREATE INDEX IF NOT EXISTS idx_pool_account_kind_book ON pool_items(account_id, kind, book_id);
 `
 
 // Open creates/opens the database and applies the schema.
@@ -290,6 +295,11 @@ func migrate(db *sql.DB) error {
 		return err
 	}
 	if err := rebuildPoolUniqueKey(tx); err != nil {
+		return err
+	}
+	// 心跳 payload 的 ci（章节下标）：导入目录时随 word_count 一起保存。
+	// 历史章节保持 0，引擎就回落到模板里的 ci；重建后补齐。
+	if _, err := addColumnIfMissing(tx, "pool_items", "chapter_index", `INTEGER NOT NULL DEFAULT 0`); err != nil {
 		return err
 	}
 	// 共享池已移除：account_id=0 的历史条目归属到第一个已绑定账号。
@@ -472,6 +482,7 @@ func rebuildPoolUniqueKey(tx *sql.Tx) error {
 			enabled     INTEGER NOT NULL DEFAULT 1,
 			sort_order  INTEGER NOT NULL DEFAULT 0,
 			word_count  INTEGER NOT NULL DEFAULT 0,
+			chapter_index INTEGER NOT NULL DEFAULT 0,
 			created_at  INTEGER NOT NULL,
 			UNIQUE(kind, value, account_id)
 		)`,

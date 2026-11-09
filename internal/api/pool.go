@@ -64,9 +64,11 @@ func (a BookAudit) Label() (string, string) {
 	return text, cls
 }
 
-// auditBooks 并发拉取本页书籍目录，统计每本书的付费结构。
-func (s *Server) auditBooks(ctx context.Context, accountID int64, ck map[string]string, books []weread.Book) map[string]BookAudit {
+// auditBooks 并发拉取本页书籍目录，统计每本书的付费结构。返回（审计结果，
+// 每本审计失败的错误信息）——失败的书在结果里缺省，调用方可以展示原因。
+func (s *Server) auditBooks(ctx context.Context, accountID int64, ck map[string]string, books []weread.Book) (map[string]BookAudit, map[string]string) {
 	out := map[string]BookAudit{}
+	errs := map[string]string{}
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, 3)
@@ -78,7 +80,12 @@ func (s *Server) auditBooks(ctx context.Context, accountID int64, ck map[string]
 			defer func() { <-sem }()
 			chs, err := s.chapterInfos(ctx, accountID, ck, bid)
 			if err != nil {
-				return // 审计失败就缺省，不阻塞主流程
+				// 审计失败不阻塞主流程，但把原因带给调用方，不让用户对着
+				// 满屏「未知」猜是不是坏了。
+				mu.Lock()
+				errs[bid] = err.Error()
+				mu.Unlock()
+				return
 			}
 			a := BookAudit{Total: len(chs)}
 			for _, ch := range chs {
@@ -95,11 +102,12 @@ func (s *Server) auditBooks(ctx context.Context, accountID int64, ck map[string]
 		}(b.ID)
 	}
 	wg.Wait()
-	return out
+	return out, errs
 }
 
-// handlePoolShelf 通过协议拉取某个账号的微信读书书架：全部书籍（含归档分组）
-// + 官方 bookCount + 每本书的付费结构（免费/已付费/部分付费/未付费）。
+// handlePoolShelf 通过协议拉取某个账号的微信读书书架：全部书籍（含归档分
+// 组）+ 官方 bookCount。付费结构不在响应里，由 POST /api/pool/audit 按页
+// 懒加载，避免整架书架的目录请求拖慢首次拉取。
 func (s *Server) handlePoolShelf(w http.ResponseWriter, r *http.Request) {
 	archiveOffset := 0
 	if raw := r.URL.Query().Get("archive_offset"); raw != "" {
@@ -205,7 +213,9 @@ func (s *Server) handlePoolShelf(w http.ResponseWriter, r *http.Request) {
 	if end < len(archiveIDs) {
 		nextArchiveOffset = end
 	}
-	audit := s.auditBooks(ctx, acc.ID, ck, books)
+	// 付费结构审计不再随书架请求同步给出：整架几百本书意味着几百次目录
+	// 请求，会把这个接口拖到分钟级并触发 120s 超时。审计由前端翻到哪一页
+	// 就按 POST /api/pool/audit 请求哪一页（结果带 10 分钟目录缓存）。
 
 	// 「已在池中」按本账号视角标注（含共享）。
 	items, err := s.st.PoolItemsForAccount(store.KindBook, acc.ID)
@@ -220,11 +230,62 @@ func (s *Server) handlePoolShelf(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s.writeJSON(w, http.StatusOK, map[string]any{
-		"books": books, "audit": audit, "in_pool": inPool, "account_id": acc.ID,
+		"books": books, "in_pool": inPool, "account_id": acc.ID,
 		"declared": shelf.Declared, "archived": archived, "archive_groups": shelf.ArchiveCount,
 		"archive_total": len(archiveIDs), "archive_processed": end,
 		"archive_revision":    revision,
 		"next_archive_offset": nextArchiveOffset, "archive_failures": archiveFailures,
+	})
+}
+
+// handlePoolAudit 批量审计指定书籍的付费结构（账号视角）。书架列表接口为
+// 了速度不再附带审计结果；前端展示到哪一页就只请求这一页的书籍（≤100），
+// 重复翻页由目录缓存兜住。
+func (s *Server) handlePoolAudit(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		AccountID int64    `json:"account_id"`
+		Books     []string `json:"books"`
+	}
+	if !s.decode(w, r, &body) {
+		return
+	}
+	if len(body.Books) == 0 {
+		s.writeErr(w, http.StatusBadRequest, "未指定任何书籍 ID")
+		return
+	}
+	if len(body.Books) > 100 {
+		s.writeErr(w, http.StatusBadRequest, "一次最多审计 100 本书")
+		return
+	}
+	if body.AccountID < 0 {
+		s.writeErr(w, http.StatusBadRequest, "无效的账号 ID")
+		return
+	}
+	for _, v := range body.Books {
+		if strings.TrimSpace(v) == "" || utf8.RuneCountInString(v) > 64 {
+			s.writeErr(w, http.StatusBadRequest, "书籍 ID 无效")
+			return
+		}
+	}
+	acc, err := s.resolveAccount(body.AccountID)
+	if err != nil {
+		s.writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	ck, err := s.accountCookies(acc)
+	if err != nil {
+		s.writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+	targets := make([]weread.Book, 0, len(body.Books))
+	for _, id := range body.Books {
+		targets = append(targets, weread.Book{ID: id})
+	}
+	audit, errs := s.auditBooks(ctx, acc.ID, ck, targets)
+	s.writeJSON(w, http.StatusOK, map[string]any{
+		"audit": audit, "errors": errs, "account_id": acc.ID,
 	})
 }
 
@@ -386,16 +447,16 @@ type shelfImportBook struct {
 // into the chapter pool（账号视角，标题形如「书名 · 章节名」）。付费未购章节
 // (官方目录 price=-1 或 price>0 且 paid=0) 默认不写入——它们读不开；目录无法
 // 区分「已购/会员可读」，所以 ignorePaid=true 时由调用方显式声明不过滤。
-// 返回（新增数，已在池数）；重复导入时"已在池"不为零，不算失败。
+// 返回（新增数，已在池数）；重复导入时"已在池"不为零，不算失败。章节入库
+// 用单事务批量写：每章一条 autocommit 会把整本导入变成几千个写事务。
 func (s *Server) fetchChaptersIntoPool(ctx context.Context, ck map[string]string, accountID int64, b shelfImportBook, per int, ignorePaid bool) (int, int, error) {
 	chs, err := s.chapterInfos(ctx, accountID, ck, b.BookID)
 	if err != nil {
 		return 0, 0, fmt.Errorf("拉取目录失败：%w", err)
 	}
-	added := 0
-	existed := 0
+	targets := make([]store.NewChapter, 0, len(chs))
 	for _, ch := range chs {
-		if per > 0 && added+existed >= per {
+		if per > 0 && len(targets) >= per {
 			break // per<=0 表示不限制章数
 		}
 		// 「封面 / 版权信息 / 第一部」这类无正文的目录页（wordCount 1~4）不适合
@@ -406,13 +467,14 @@ func (s *Server) fetchChaptersIntoPool(ctx context.Context, ck map[string]string
 		if ch.ID == "" || (!ignorePaid && ch.Unpaid()) {
 			continue
 		}
-		if _, err := s.st.AddChapterItem(accountID, b.BookID, ch.ID, truncateRunes(b.Title+" · "+ch.Title, 60), ch.WordCount); err == nil {
-			added++
-		} else if errors.Is(err, store.ErrPoolItemExists) {
-			existed++
-		}
+		targets = append(targets, store.NewChapter{
+			Value:        ch.ID,
+			Title:        truncateRunes(b.Title+" · "+ch.Title, 60),
+			WordCount:    ch.WordCount,
+			ChapterIndex: ch.Index,
+		})
 	}
-	return added, existed, nil
+	return s.st.AddChapters(accountID, b.BookID, targets)
 }
 
 // accountCookiesResolve 解析账号并取 Cookie。
@@ -900,6 +962,36 @@ func kindLabel(kind string) string {
 // scoped by account because paid/unpaid flags are account-specific.
 const chapterInfoTTL = 10 * time.Minute
 
+// chapterCacheMax bounds the in-memory TOC cache. Entries are complete chapter
+// lists (with per-chapter titles); without a cap a big multi-account shelf
+// could keep tens of MB of live payloads until restart.
+const chapterCacheMax = 200
+
+// putChapterCache stores fetched chs under key, dropping expired entries first
+// and then the soonest-to-expire entry when the cap is still exceeded.
+func (s *Server) putChapterCache(key string, chs []weread.Chapter) {
+	now := time.Now()
+	if len(s.chapterCache) >= chapterCacheMax {
+		for k, v := range s.chapterCache {
+			if now.After(v.expires) {
+				delete(s.chapterCache, k)
+			}
+		}
+	}
+	if len(s.chapterCache) >= chapterCacheMax {
+		oldestKey := ""
+		var oldest time.Time
+		first := true
+		for k, v := range s.chapterCache {
+			if first || v.expires.Before(oldest) {
+				oldestKey, oldest, first = k, v.expires, false
+			}
+		}
+		delete(s.chapterCache, oldestKey)
+	}
+	s.chapterCache[key] = chapterCacheEntry{chapters: chs, expires: now.Add(chapterInfoTTL)}
+}
+
 func (s *Server) chapterInfos(ctx context.Context, accountID int64, ck map[string]string, bookID string) ([]weread.Chapter, error) {
 	key := fmt.Sprintf("%d:%s", accountID, bookID)
 	if accountID > 0 {
@@ -922,7 +1014,7 @@ func (s *Server) chapterInfos(ctx context.Context, accountID int64, ck map[strin
 		if s.chapterCache == nil {
 			s.chapterCache = map[string]chapterCacheEntry{}
 		}
-		s.chapterCache[key] = chapterCacheEntry{chapters: chs, expires: time.Now().Add(chapterInfoTTL)}
+		s.putChapterCache(key, chs)
 		s.chapterMu.Unlock()
 	}
 	return chs, nil

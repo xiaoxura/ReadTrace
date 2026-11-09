@@ -520,8 +520,10 @@ export function editAccountDialog(acc, { onDone } = {}) {
         <label class="label">请求模板 ${acc.has_payload ? '<span class="opt">已保存</span>' : '<span class="opt">可选 · 所有模式共用</span>'}</label>
         <textarea class="textarea" id="acc-payload" data-payload placeholder="粘贴 read 请求的 curl 或 JSON 请求体" aria-label="请求模板"></textarea>
         <div class="hint">获取方法：浏览器打开 weread.qq.com 阅读任意一本书 → F12 → Network → 找到名为 <code>read</code> 的请求（每 30 秒一条）→ 右键 → 「Copy as cURL (bash)」→ 粘贴到这里。签名 s/sg 自动重算，不用手写。</div>
+        <div class="hint">不想抓包？点下面的「生成模板」即可：会自动从这本书的阅读页拉取指纹并保存，签名 s/sg 自动重算。</div>
         <div class="row" style="margin-top:8px">
-          <button class="btn btn-sm" data-save-payload>${icon('check')}保存模板</button>
+          <button class="btn btn-sm" data-generate-payload title="免抓包：从书池第一本书的阅读页自动生成">${icon('download')}生成模板（免抓包）</button>
+          <button class="btn btn-sm" data-save-payload>${icon('check')}保存粘贴的模板</button>
           ${acc.has_payload ? `<button class="btn btn-sm btn-ghost" data-clear-payload>清除（回到全局指纹模板）</button>` : ''}
           <span class="hint" data-payload-state>${acc.has_payload ? '当前使用该账号的专属指纹模板' : '当前使用全局指纹模板（设置页）'}</span>
         </div>
@@ -557,6 +559,22 @@ export function editAccountDialog(acc, { onDone } = {}) {
       const v = e.target.value;
       const hit = (poolBooks || []).find((b) => b.value === v);
       book = v ? { id: v, title: (hit && hit.title) || book.title || '' } : { id: '', title: '' };
+    });
+    $('[data-generate-payload]', modeExtra)?.addEventListener('click', async (e) => {
+      const btn = e.currentTarget;
+      setLoading(btn, true);
+      try {
+        const res = await api.generatePayload(acc.id);
+        acc.has_payload = true;
+        const box = $('[data-payload]', modeExtra);
+        if (box) box.value = '';
+        renderModeExtra();
+        toast(`已生成专属模板（${res.book_title || res.book_id}），可开始阅读`, 'ok');
+      } catch (err) {
+        toast(err.message, 'error');
+      } finally {
+        setLoading(btn, false);
+      }
     });
     $('[data-save-payload]', modeExtra)?.addEventListener('click', async (e) => {
       const btn = e.currentTarget;

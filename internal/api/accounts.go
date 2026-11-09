@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -545,4 +546,118 @@ func (s *Server) handleAccountPayloadDelete(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	s.writeJSON(w, http.StatusOK, map[string]any{"ok": true, "has_payload": false})
+}
+
+// handleAccountGeneratePayload 一键生成该账号的专属 read 模板，全程不抓包：
+// 1) 从书池挑一本可读书（或 body.book_id 指定）；2) 拉官方目录取首个可读
+// 章节的 chapterUid/章节下标；3) GET 阅读页从 window.__INITIAL_STATE__ 解析
+// psvts/pclts；4) appId 按官方公式由 User-Agent 推导；ps/pc 同理自算或兜底
+// _e(ct)。签名 s/sg 由引擎每次心跳现算，模板里不需要保存。
+// 生成结果直接覆盖该账号的专属模板（可在设置里清除回到全局模板）。
+func (s *Server) handleAccountGeneratePayload(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(r)
+	if !ok {
+		s.writeErr(w, http.StatusBadRequest, "无效的账号 ID")
+		return
+	}
+	acc, ok := s.accountOrErr(w, id)
+	if !ok {
+		return
+	}
+	var body struct {
+		BookID string `json:"book_id"`
+	}
+	if !s.decode(w, r, &body) {
+		return
+	}
+
+	bookID := strings.TrimSpace(body.BookID)
+	if bookID == "" {
+		albums, err := s.st.PoolItemsForAccount(store.KindBook, acc.ID)
+		if err != nil {
+			s.writeErr(w, http.StatusInternalServerError, "读取书池失败")
+			return
+		}
+		for _, b := range albums {
+			if b.Value != "" {
+				bookID = b.Value
+				break
+			}
+		}
+	}
+	if bookID == "" {
+		s.writeErr(w, http.StatusBadRequest, "书池是空的：请先在「书池 · 书籍导入」导入书籍，再生成模板")
+		return
+	}
+
+	ck, err := s.accountCookies(acc)
+	if err != nil {
+		s.writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+
+	chs, err := s.chapterInfos(ctx, acc.ID, ck, bookID)
+	if err != nil {
+		s.writeErr(w, http.StatusBadGateway, "读取目录失败："+err.Error())
+		return
+	}
+	chapter := poolChapterFromTOC(chs)
+	if chapter == nil {
+		s.writeErr(w, http.StatusBadGateway, "这本书在官方目录里没有可读章节，换一本书试试")
+		return
+	}
+
+	state, err := s.wc.FetchReaderState(ctx, ck, bookID)
+	if err != nil {
+		s.writeErr(w, http.StatusBadGateway, "生成模板失败："+err.Error())
+		return
+	}
+	pc := state.PCLTS
+	if pc == "" || pc == "0" {
+		// 官方前端的兜底：pc = _e(ct)。
+		pc = weread.NormalizePayloadID(strconv.FormatInt(time.Now().Unix(), 10))
+	}
+	pl := map[string]any{
+		"appId": weread.DeriveAppID(s.wc.UA),
+		"b":     weread.NormalizePayloadID(bookID),
+		"c":     chapter.ID,
+		"ci":    chapter.Index,
+		"co":    100 + int(time.Now().UnixNano()%300),
+		"sm":    truncateRunes(chapter.Title, 24),
+		"pr":    0,
+		"ps":    state.PSVTS,
+		"pc":    pc,
+	}
+	if err := s.st.SavePayload(acc.ID, pl); err != nil {
+		s.writeErr(w, http.StatusInternalServerError, "保存模板失败")
+		return
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "has_payload": true,
+		"book_id": bookID, "chapter_id": chapter.ID, "ci": chapter.Index,
+		"book_title": truncateRunes(chapter.Title, 60),
+	})
+}
+
+// poolChapterFromTOC 从章节目录中挑选生成模板所用章节：优先取有正文的实章
+// （wordCount 足够大），把封面页/版权页过滤掉。
+func poolChapterFromTOC(chs []weread.Chapter) *weread.Chapter {
+	candidate := -1
+	for i, ch := range chs {
+		if ch.UID == 0 || ch.ID == "" {
+			continue
+		}
+		if candidate < 0 {
+			candidate = i // 兜底用第一个有效章节
+		}
+		if ch.WordCount >= 5 {
+			return &chs[i]
+		}
+	}
+	if candidate < 0 {
+		return nil
+	}
+	return &chs[candidate]
 }

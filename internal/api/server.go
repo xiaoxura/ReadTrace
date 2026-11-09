@@ -102,6 +102,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/accounts/{id}/refresh", s.auth(s.handleAccountRefresh))
 	mux.HandleFunc("POST /api/accounts/{id}/check", s.auth(s.handleAccountCheck))
 	mux.HandleFunc("POST /api/accounts/{id}/payload", s.auth(s.handleAccountPayload))
+	mux.HandleFunc("POST /api/accounts/{id}/payload/generate", s.auth(s.handleAccountGeneratePayload))
 	mux.HandleFunc("DELETE /api/accounts/{id}/payload", s.auth(s.handleAccountPayloadDelete))
 
 	mux.HandleFunc("POST /api/qr", s.auth(s.handleQRStart))
@@ -113,6 +114,7 @@ func (s *Server) Handler() http.Handler {
 
 	// 阅读书池/章节池与账号指纹模板管理。
 	mux.HandleFunc("GET /api/pool", s.auth(s.handlePoolGet))
+	mux.HandleFunc("POST /api/pool/audit", s.auth(s.handlePoolAudit))
 	mux.HandleFunc("GET /api/pool/book/{value}/chapters", s.auth(s.handlePoolBookChapters))
 	mux.HandleFunc("POST /api/pool/book/{value}/prune", s.auth(s.handlePoolBookPrune))
 	mux.HandleFunc("POST /api/pool/add", s.auth(s.handlePoolAdd))

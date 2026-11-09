@@ -13,7 +13,7 @@ const POOL_TABS = [
 let poolTab = 'import';
 
 let manageAccount = 0;    // 书池管理当前所属账号（0=未选，展示时回退第一个账号）
-let shelfCache = null;    // 最近一次书架审查数据（books / audit / in_pool）
+let shelfCache = null;    // 最近一次书架审查数据（books / 懒加载的 audit / in_pool）
 let poolCache = null;     // 最近一次书池数据
 let poolPage = 1;         // 书池列表分页状态
 let poolPageSize = 20;
@@ -274,6 +274,9 @@ async function loadShelf() {
       ...data,
       account_id: accountId,
       books: data.books || [],
+      audit: {},
+      audit_errors: {},
+      audit_inflight: new Set(),
       archive_failures: data.archive_failures || {},
       archive_error: '',
     };
@@ -343,7 +346,6 @@ async function loadMoreArchive() {
         seen.add(book.id);
       }
     }
-    snapshot.audit = { ...(snapshot.audit || {}), ...(data.audit || {}) };
     snapshot.in_pool = [...new Set([...(snapshot.in_pool || []), ...(data.in_pool || [])])];
     snapshot.archive_failures = { ...(snapshot.archive_failures || {}), ...(data.archive_failures || {}) };
     for (const book of data.books || []) delete snapshot.archive_failures[book.id];
@@ -379,9 +381,17 @@ function drawShelfPreview() {
   const pages = Math.max(1, Math.ceil(books.length / shelfPageSize));
   if (shelfPage > pages) shelfPage = pages;
   const pageBooks = pageSlice(books, shelfPage, shelfPageSize);
+  const auditErrors = shelfCache.audit_errors || {};
+  const inflight = shelfCache.audit_inflight || new Set();
   const rows = pageBooks.map((b) => {
     const lab = auditLabel(audit[b.id]);
     const blocked = lab.unpaid;
+    // 付费徽标四态：已审计 / 审计失败 / 审计中（懒加载在路上）/ 其余未知。
+    let payBadge;
+    if (audit[b.id]) payBadge = `<span class="badge ${lab.cls}">${lab.text}</span>`;
+    else if (auditErrors[b.id]) payBadge = `<span class="badge neutral" title="审计失败：${escapeHtml(auditErrors[b.id])}">审计失败</span>`;
+    else if (inflight.has(b.id)) payBadge = '<span class="badge neutral" title="正在拉取这本书的付费结构">审计中…</span>';
+    else payBadge = `<span class="badge ${lab.cls}">${lab.text}</span>`;
     return `
       <tr class="shelf-row" data-shelf="${escapeHtml(b.id)}" data-blocked="${blocked ? 1 : 0}">
         <td>${blocked
@@ -390,7 +400,7 @@ function drawShelfPreview() {
         <td><div class="shelf-cover">${b.cover ? `<img loading="lazy" src="${escapeHtml(b.cover)}" alt="">` : ''}</div></td>
         <td class="cell-strong">${escapeHtml(b.title)}</td>
         <td class="cell-muted">${escapeHtml(b.author || '—')}</td>
-        <td><span class="badge ${lab.cls}">${lab.text}</span></td>
+        <td>${payBadge}</td>
         <td>${inPool.has(b.id) ? '<span class="badge ok">已在池中</span>' : '<span class="badge neutral">未入池</span>'}</td>
       </tr>
     `;
@@ -421,6 +431,40 @@ function drawShelfPreview() {
   $('#shelf-import', host).addEventListener('click', () => importSelected());
   $('[data-shelf-more]', host)?.addEventListener('click', loadMoreArchive);
   recount();
+  // 本页书籍的付费审计懒加载：结果回来后合并进缓存并保留勾选重绘。
+  scheduleShelfAudit(pageBooks.map((b) => b.id));
+}
+
+// scheduleShelfAudit 只请求当前没有结果也没有在途请求的书。失败的书标记进
+// audit_errors，避免每次重绘都连锁重发；想重试就点「重新拉取」重置缓存。
+async function scheduleShelfAudit(bookIds) {
+  const snapshot = shelfCache;
+  if (!snapshot || !Array.isArray(bookIds) || !bookIds.length) return;
+  const accountId = snapshot.account_id;
+  const inflight = snapshot.audit_inflight || new Set();
+  const pending = bookIds.filter((id) => !(snapshot.audit || {})[id]
+    && !(snapshot.audit_errors || {})[id]
+    && !inflight.has(id));
+  if (!pending.length) return;
+  const epoch = importEpoch;
+  const host = $('[data-import-result]');
+  pending.forEach((id) => inflight.add(id));
+  try {
+    const res = await api.poolAudit(accountId, pending);
+    if (shelfCache !== snapshot || epoch !== importEpoch) return;
+    snapshot.audit = { ...(snapshot.audit || {}), ...(res.audit || {}) };
+    snapshot.audit_errors = { ...(snapshot.audit_errors || {}), ...(res.errors || {}) };
+  } catch (e) {
+    if (shelfCache !== snapshot || epoch !== importEpoch) return;
+    snapshot.audit_errors = {
+      ...(snapshot.audit_errors || {}),
+      ...Object.fromEntries(pending.filter((id) => !(snapshot.audit_errors || {})[id])
+        .map((id) => [id, e.message || '审计请求失败'])),
+    };
+  } finally {
+    if (snapshot === shelfCache) pending.forEach((id) => snapshot.audit_inflight?.delete(id));
+    if (snapshot === shelfCache && epoch === importEpoch) redrawShelfPreservingSelection(host);
+  }
 }
 
 async function importSelected() {

@@ -62,11 +62,13 @@ type activeRun struct {
 	pagePending     map[string]any // candidate reused until a heartbeat succeeds
 
 	// 书/章节的可读标题（value → title），写日志展示用；章节词数用于按
-	// 字数折算每个章节需要多少次心跳。
+	// 字数折算每个章节需要多少次心跳。chapterIdxs 是官方目录的章节下标，
+	// 心跳 payload 的 ci 按它填写，保持与真实阅读一致。
 	bookTitles        map[string]string
 	chapterTitles     map[string]string
 	chapterTitlesRaw  map[string]string
 	chapterWordCounts map[string]int
+	chapterIdxs       map[string]int
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -264,6 +266,14 @@ func (e *Engine) Start(acc *store.Account, minutes int, trigger string) (*store.
 	bookTitles, _ := e.st.PoolTitleMapForAccount(store.KindBook, acc.ID)
 	chapterTitlesRaw, _ := e.st.PoolTitleMapForAccount(store.KindChapter, acc.ID)
 	chapterWordCounts, _ := e.st.PoolWordCountMapForAccount(store.KindChapter, acc.ID)
+	// 章节下标（payload 的 ci）：读一份池内章节行把下标对齐到 value。
+	chapterItems, _ := e.st.PoolItemsForAccount(store.KindChapter, acc.ID)
+	chapterIdxs := make(map[string]int, len(chapterItems))
+	for _, it := range chapterItems {
+		if it.ChapterIndex > 0 && it.Value != "" {
+			chapterIdxs[it.Value] = it.ChapterIndex
+		}
+	}
 	// 心跳 payload 里的 b/c 是 NormalizePayloadID 之后的形态（纯数字书 ID 会被
 	// 编码），标题映射的键也要换成同一形态，日志才能查到名字。
 	bookTitlesN := make(map[string]string, len(bookTitles))
@@ -300,7 +310,7 @@ func (e *Engine) Start(acc *store.Account, minutes int, trigger string) (*store.
 	// 所有模式都需要一份模板作为请求基底（设备/会话字段），书/章节由模式决定。
 	if len(template) == 0 {
 		e.mu.Unlock()
-		return nil, errors.New("没有可用的阅读模板：请在账号设置保存抓包模板，或在「设置 · 账号指纹模板」配置一份全局模板")
+		return nil, errors.New("没有可用的阅读模板：在账号设置点「生成模板」一键免抓包生成，或粘贴抓包模板，或在「设置 · 账号指纹模板」配置全局模板")
 	}
 	switch acc.Mode {
 	case "custom":
@@ -345,6 +355,7 @@ func (e *Engine) Start(acc *store.Account, minutes int, trigger string) (*store.
 		chapterTitles:        chapterTitlesN,
 		chapterTitlesRaw:     chapterTitlesRaw,
 		chapterWordCounts:    chapterWordCounts,
+		chapterIdxs:          chapterIdxs,
 		ctx:                  ctx, cancel: cancel, done: make(chan struct{}),
 	}
 	e.act[run.ID] = ar
@@ -938,7 +949,17 @@ func (e *Engine) applyRotatePayload(ar *activeRun, p map[string]any, rnd *rand.R
 		delete(p, "c") // defensive: never pair this book with the template chapter
 		return
 	}
-	p["c"] = weread.NormalizePayloadID(chapters[rnd.Intn(len(chapters))])
+	chapter := chapters[rnd.Intn(len(chapters))]
+	p["c"] = weread.NormalizePayloadID(chapter)
+	e.applyChapterIndex(ar, p, chapter)
+}
+
+// applyChapterIndex 把当前章节的官方下标填进 payload 的 ci（缺失/历史数据为
+// 0 时保持模板原值）。同时同步 ps/pc 之外的这张表由 Start 一次性读出。
+func (e *Engine) applyChapterIndex(ar *activeRun, p map[string]any, chapter string) {
+	if idx := ar.chapterIdxs[chapter]; idx > 0 {
+		p["ci"] = idx
+	}
 }
 
 func (e *Engine) buildPayload(ar *activeRun, template map[string]any, acc *store.Account, rnd *rand.Rand) map[string]any {
@@ -980,6 +1001,10 @@ func (e *Engine) buildPayload(ar *activeRun, template map[string]any, acc *store
 		chapter := chapters[ci]
 		p["b"] = weread.NormalizePayloadID(book)
 		p["c"] = weread.NormalizePayloadID(chapter)
+		p["ci"] = ci + 1 // payload 的 ci 是官方章节下标（1 起），序列位置 0 起
+		if raw := ar.chapterIdxs[chapter]; raw > 0 {
+			p["ci"] = raw // 池里存过官方下标就用官方值
+		}
 		e.applyPagePayload(ar, p, rnd)
 		ar.seqPos = pos
 		ar.seqMark = seqMark{bi: pos.Bi, ci: ci, chapters: chapters, rawChapter: chapter}
@@ -990,7 +1015,9 @@ func (e *Engine) buildPayload(ar *activeRun, template map[string]any, acc *store
 			p["b"] = weread.NormalizePayloadID(acc.BookID)
 		}
 		if acc.ChapterID != "" {
-			p["c"] = weread.NormalizePayloadID(acc.ChapterID)
+			chap := weread.NormalizePayloadID(acc.ChapterID)
+			p["c"] = chap
+			e.applyChapterIndex(ar, p, chap)
 		}
 		e.applyPagePayload(ar, p, rnd)
 	}

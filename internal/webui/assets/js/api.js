@@ -51,6 +51,8 @@ export const api = {
   refreshAccount: (id) => request(`/api/accounts/${id}/refresh`, { method: 'POST', body: {} }),
   checkAccount: (id) => request(`/api/accounts/${id}/check`, { method: 'POST', body: {} }),
   savePayload: (id, payload) => request(`/api/accounts/${id}/payload`, { method: 'POST', body: payload }),
+  generatePayload: (id) =>
+    request(`/api/accounts/${id}/payload/generate`, { method: 'POST', body: {} }),
   clearPayload: (id) => request(`/api/accounts/${id}/payload`, { method: 'DELETE' }),
 
   qrStart: () => request('/api/qr', { method: 'POST', body: {} }),
@@ -63,6 +65,8 @@ export const api = {
     request(`/api/books/${encodeURIComponent(bookId)}?account_id=${accountId}`),
 
   pool: (accountId = 0) => request(`/api/pool?account_id=${accountId}`),
+  poolAudit: (account_id, bookIds) =>
+    request('/api/pool/audit', { method: 'POST', body: { account_id, books: bookIds } }),
   poolBookChapters: (bookId, { refresh = false, account_id = 0, limit = 50, offset = 0 } = {}) =>
     request(`/api/pool/book/${encodeURIComponent(bookId)}/chapters?account_id=${account_id}&limit=${limit}&offset=${offset}${refresh ? '&refresh=1' : ''}`),
   poolBookPrune: (bookId, account_id = 0) =>

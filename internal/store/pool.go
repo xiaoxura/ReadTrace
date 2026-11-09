@@ -24,8 +24,9 @@ const (
 	KindChapter = "chapter"
 )
 
-// KeyDefaultReadPayload 保存稳定模板缺失账号抓包数据时使用的默认书模板
-// （完整 read 请求 payload 的 JSON）。为空时引擎回落到 weread.DefaultTemplate。
+// KeyDefaultReadPayload 保存全局默认 read 模板（完整请求 payload 的 JSON）。
+// 账号无专属模板时作为回落基底；账号可用「生成模板」一键免抓包生成专属
+// 模板（appId/ps/pc 等指纹字段按官方公式自动推导，无需内置常量模板）。
 const KeyDefaultReadPayload = "read_default_payload"
 
 // SharedAccountID 保留为 0 的历史值：共享池已移除，所有条目都归属某个账号，
@@ -37,36 +38,38 @@ const SharedAccountID int64 = 0
 // kind=book 行的 Author/Cover 用于书架式展示；kind=chapter 行的 BookID 记录
 // 所属书籍的 value（bookId），供按书查看与按书抽取。
 type PoolItem struct {
-	ID        int64  `json:"id"`
-	Kind      string `json:"kind"`
-	Value     string `json:"value"`
-	Title     string `json:"title"`
-	Author    string `json:"author,omitempty"`
-	Cover     string `json:"cover,omitempty"`
-	BookID    string `json:"book_id,omitempty"`
-	AccountID int64  `json:"account_id"`
-	Enabled   bool   `json:"enabled"`
-	SortOrder int    `json:"sort_order"`
-	WordCount int    `json:"word_count"`
+	ID           int64  `json:"id"`
+	Kind         string `json:"kind"`
+	Value        string `json:"value"`
+	Title        string `json:"title"`
+	Author       string `json:"author,omitempty"`
+	Cover        string `json:"cover,omitempty"`
+	BookID       string `json:"book_id,omitempty"`
+	AccountID    int64  `json:"account_id"`
+	Enabled      bool   `json:"enabled"`
+	SortOrder    int    `json:"sort_order"`
+	WordCount    int    `json:"word_count"`
+	ChapterIndex int    `json:"chapter_index"`
 }
 
 func scanPoolItems(rows *sql.Rows) ([]PoolItem, error) {
 	out := []PoolItem{}
 	for rows.Next() {
 		var it PoolItem
-		var enabled, sortOrder, wordCount int
-		if err := rows.Scan(&it.ID, &it.Kind, &it.Value, &it.Title, &it.Author, &it.Cover, &it.BookID, &it.AccountID, &enabled, &sortOrder, &wordCount); err != nil {
+		var enabled, sortOrder, wordCount, chapterIndex int
+		if err := rows.Scan(&it.ID, &it.Kind, &it.Value, &it.Title, &it.Author, &it.Cover, &it.BookID, &it.AccountID, &enabled, &sortOrder, &wordCount, &chapterIndex); err != nil {
 			return nil, err
 		}
 		it.Enabled = enabled != 0
 		it.SortOrder = sortOrder
 		it.WordCount = wordCount
+		it.ChapterIndex = chapterIndex
 		out = append(out, it)
 	}
 	return out, rows.Err()
 }
 
-const poolSelectCols = `SELECT id, kind, value, title, author, cover, book_id, account_id, enabled, sort_order, word_count FROM pool_items`
+const poolSelectCols = `SELECT id, kind, value, title, author, cover, book_id, account_id, enabled, sort_order, word_count, chapter_index FROM pool_items`
 
 // PoolItems lists every user entry of the given kind (all accounts), oldest first.
 func (s *Store) PoolItems(kind string) ([]PoolItem, error) {
@@ -268,6 +271,102 @@ func (s *Store) AddChapterItem(accountID int64, bookValue, value, title string, 
 	return res.LastInsertId()
 }
 
+// NewChapter is one filtered TOC chapter handed to AddChapters.
+type NewChapter struct {
+	Value        string // 章节 ID（编码后的 chapterId）
+	Title        string // 完整标题（「书名 · 章节名」由调用方拼好）
+	WordCount    int
+	ChapterIndex int // 官方目录的章节下标（chapterIdx），心跳 payload 的 ci 用
+}
+
+// AddChapters writes many chapters of one book into the account's chapter
+// pool within a SINGLE transaction. 批量导入一本几千章的书时逐条 autocommit
+// 会把写入放大成几千个写事务（单连接 SQLite 上还会堵住心跳与日志写入）；
+// 这里用预编译语句 + 单事务，一次提交完成整本。每行的行为语义与
+// AddChapterItem 保持一致：已存在且旧数据缺 book_id 的行做修复并计为新增
+// （added），已存在且已有归属的行计为已在池（existed）。
+func (s *Store) AddChapters(accountID int64, bookValue string, chs []NewChapter) (added, existed int, err error) {
+	if strings.TrimSpace(bookValue) == "" {
+		return 0, 0, errors.New("所属书籍 ID 不能为空")
+	}
+	if accountID <= 0 {
+		accountID = s.fallbackAccountID()
+	}
+	if accountID <= 0 {
+		return 0, 0, errors.New("请先绑定微信读书账号，再导入章节")
+	}
+	bookValue = strings.TrimSpace(bookValue)
+	if len(chs) == 0 {
+		return 0, 0, nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, 0, err
+	}
+	defer tx.Rollback()
+	sel, err := tx.Prepare(`SELECT id, book_id FROM pool_items WHERE kind = 'chapter' AND value = ? AND account_id = ?`)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer sel.Close()
+	repair, err := tx.Prepare(`UPDATE pool_items SET book_id = ?,
+		title = CASE WHEN title = '' THEN ? ELSE title END,
+		word_count = CASE WHEN word_count <= 0 THEN ? ELSE word_count END,
+		chapter_index = CASE WHEN chapter_index = 0 THEN ? ELSE chapter_index END
+		WHERE id = ? AND book_id = ''`)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer repair.Close()
+	ins, err := tx.Prepare(`INSERT INTO pool_items (kind, value, title, book_id, account_id, enabled, word_count, chapter_index, created_at)
+		VALUES ('chapter', ?, ?, ?, ?, 1, ?, ?, ?)`)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer ins.Close()
+
+	for _, ch := range chs {
+		value := strings.TrimSpace(ch.Value)
+		if value == "" {
+			return 0, 0, errors.New("章节 ID 不能为空")
+		}
+		var exist int64
+		var existingBook string
+		err := sel.QueryRow(value, accountID).Scan(&exist, &existingBook)
+		if err == nil {
+			// Old manual imports lacked a book association. An explicit import
+			// from this book can repair it without guessing or deleting the row.
+			if existingBook == "" {
+				res, err := repair.Exec(bookValue, ch.Title, ch.WordCount, ch.ChapterIndex, exist)
+				if err != nil {
+					return 0, 0, err
+				}
+				n, err := res.RowsAffected()
+				if err != nil {
+					return 0, 0, err
+				}
+				if n > 0 {
+					added++
+					continue
+				}
+			}
+			existed++
+			continue
+		}
+		if err != sql.ErrNoRows {
+			return 0, 0, err
+		}
+		if _, err := ins.Exec(value, ch.Title, bookValue, accountID, ch.WordCount, ch.ChapterIndex, now()); err != nil {
+			return 0, 0, err
+		}
+		added++
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, 0, err
+	}
+	return added, existed, nil
+}
+
 // UpsertBookMeta adds a book row when missing (in the given account scope) and
 // refreshes its display metadata either way; metadata fill only targets empty
 // fields so user-edited titles survive. Returns the row ID and whether the row
@@ -455,8 +554,10 @@ func (s *Store) DeletePoolItem(id int64) error {
 }
 
 // ClearPoolFor empties the pool within the account scope. accountID<=0 只删
-// 共享条目；accountID>0 只删该账号的专属条目（不动共享）。书籍删除顺带级联
-// 其章节。引擎兜底不经此路，池清空后回落内置常量。
+// 共享条目；accountID>0 只删该账号的专属条目（不动共享）。清空书籍顺带级联
+// 其章节——与逐本删除的语义一致，否则会留下看不见却仍在引擎兜底里被引用的
+// 孤儿章节。整个清空在一条事务内完成：单连接 SQLite 下逐条 autocommit DELETE
+// 会把一次清空放大成 N 次写事务。
 func (s *Store) ClearPoolFor(kind string, accountID int64) error {
 	if kind != KindBook && kind != KindChapter {
 		return fmt.Errorf("未知池类型 %q", kind)
@@ -467,19 +568,21 @@ func (s *Store) ClearPoolFor(kind string, accountID int64) error {
 	if accountID <= 0 {
 		return nil // 尚无账号，池必为空
 	}
-	rows, err := s.PoolItems(kind)
+	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
-	for _, it := range rows {
-		if it.Kind != kind || it.AccountID != accountID {
-			continue
-		}
-		if err := s.DeletePoolItem(it.ID); err != nil && !strings.Contains(err.Error(), "不存在") {
+	defer tx.Rollback()
+	if kind == KindBook {
+		if _, err := tx.Exec(`DELETE FROM pool_items WHERE kind = ? AND account_id = ? AND book_id IN
+			(SELECT value FROM pool_items WHERE kind = ? AND account_id = ?)`, KindChapter, accountID, KindBook, accountID); err != nil {
 			return err
 		}
 	}
-	return nil
+	if _, err := tx.Exec(`DELETE FROM pool_items WHERE kind = ? AND account_id = ?`, kind, accountID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // MovePoolItem 把一个条目在它所在视角的同类列表里上移/下移 delta 位
@@ -518,12 +621,19 @@ func (s *Store) MovePoolItem(id int64, delta int) error {
 	}
 	swapped := append([]PoolItem(nil), items...)
 	swapped[idx], swapped[j] = swapped[j], swapped[idx]
+	// 全视角的 sort_order 重写在一条事务内完成：逐条 autocommit 会让一次
+	// 上移/下移动作放大成 N 个写事务，并阻塞单连接上的其他请求。
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
 	for i, it := range swapped {
-		if _, err := s.db.Exec(`UPDATE pool_items SET sort_order = ? WHERE id = ?`, i, it.ID); err != nil {
+		if _, err := tx.Exec(`UPDATE pool_items SET sort_order = ? WHERE id = ?`, i, it.ID); err != nil {
+			tx.Rollback()
 			return err
 		}
 	}
-	return nil
+	return tx.Commit()
 }
 
 // PoolTitleMapForAccount 返回某类条目的「value → 标题」映射（账号视角），
