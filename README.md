@@ -260,25 +260,23 @@ chmod +x /opt/ReadTrace/readtrace
 | 名称 | `ReadTrace` |
 | 应用 | 选 Go 1.27；面板只有 Go 1.26 也可以，但必须运行预编译二进制，不能 `go run` |
 | 运行目录 | `/opt/ReadTrace` |
-| 启动命令 | `/app/readtrace -addr 0.0.0.0:8720 -no-open -data /app/data` |
+| 启动命令 | `exec ./readtrace` |
 | 容器名称 | `ReadTrace` |
 | 端口 | 容器端口 `8720` |
 | 主机映射 | 宿主 `8720` → 容器 `8720`，宿主端口被占用时换成其他端口 |
 | 挂载 | 不需要。1Panel 已把宿主运行目录挂载到容器 `/app` |
-| 环境变量 | 可选 `TZ=Asia/Shanghai`；用域名访问时可加 `READTRACE_HOST_ALLOW=你的域名` |
+| 环境变量 | `READTRACE_ADDR=0.0.0.0:8720`（必填）；可选 `TZ=Asia/Shanghai`；用域名访问时可加 `READTRACE_HOST_ALLOW=你的域名` |
 
 1Panel 的 Go 运行环境本质上是 `golang` 容器，工作目录是 `/app`，宿主运行目录会挂载到 `/app`：
 
 - 宿主 `/opt/ReadTrace/readtrace` ↔ 容器 `/app/readtrace`
 - 宿主 `/opt/ReadTrace/data` ↔ 容器 `/app/data`
 
-所以启动命令要写容器内路径 `/app/readtrace`，不能写宿主路径 `/opt/ReadTrace/readtrace`；数据也写在运行目录下的 `data/`，天然就会持久化，不需要再单独挂载。只有把数据放到运行目录以外时才需要额外加挂载。
+因此只要把二进制命名为 `readtrace` 放在运行目录，启动命令就可以和你的其他项目一样写成 `exec ./readtrace`。`exec` 会让进程直接接管容器，停止/重启时信号能正确传递。
 
-三个启动参数不要省：
+监听地址通过环境变量 `READTRACE_ADDR=0.0.0.0:8720` 设置。**这个必须加**：程序默认只监听 `127.0.0.1`，容器内这样写会导致宿主端口映射后访问不到。
 
-- `-addr 0.0.0.0:8720`：容器内必须监听 `0.0.0.0`，否则端口映射后访问不到。
-- `-no-open`：服务器没有浏览器，禁止启动时自动打开。
-- `-data /app/data`：SQLite 与密钥都放在运行目录的 `data/` 下，随运行目录一起持久化。
+不需要 `-data`，也不需要额外挂载：程序默认把数据放在可执行文件同级的 `data/` 目录，也就是容器内的 `/app/data`，对应宿主 `/opt/ReadTrace/data`。`-no-open` 也可以省略：容器内没有 `xdg-open`，启动浏览器失败会被忽略，不影响服务。
 
 项目 `go.mod` 要求 Go 1.27+，所以如果面板走源码编译，必须选 1.27；选 1.26 会报 `go.mod requires go >= 1.27.0`。上传预编译二进制则不依赖 Go 版本。
 
