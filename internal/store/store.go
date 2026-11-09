@@ -50,6 +50,8 @@ CREATE TABLE IF NOT EXISTS accounts (
 	default_minutes  INTEGER NOT NULL DEFAULT 30,
 	daily_goal_minutes INTEGER NOT NULL DEFAULT 0,
 	tick_seconds     INTEGER NOT NULL DEFAULT 30,
+	-- read_speed：每分钟阅读字数（账号级设定），0 表示默认（默认速度 300）。
+	read_speed       INTEGER NOT NULL DEFAULT 300,
 	max_retries      INTEGER NOT NULL DEFAULT 0,
 	retry_delay      INTEGER NOT NULL DEFAULT 15,
 	book_id          TEXT NOT NULL DEFAULT '',
@@ -259,6 +261,10 @@ func migrate(db *sql.DB) error {
 		if _, err := tx.Exec(`UPDATE accounts SET seq = CAST(id - 1 AS INTEGER)`); err != nil {
 			return err
 		}
+	}
+	// 每分钟阅读字数：顺序书单的章节切换节奏按它折算。老库补列默认 300。
+	if _, err := addColumnIfMissing(tx, "accounts", "read_speed", `INTEGER NOT NULL DEFAULT 300`); err != nil {
+		return err
 	}
 	// 稳定模板模式已移除：旧账号统一归入顺序书单。
 	if _, err := tx.Exec(`UPDATE accounts SET mode = 'sequence' WHERE mode = 'stable' OR mode = ''`); err != nil {

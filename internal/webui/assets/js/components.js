@@ -485,6 +485,11 @@ export function editAccountDialog(acc, { onDone } = {}) {
         <input class="input" id="acc-daily-goal" type="number" min="0" max="1440" step="1" data-daily-goal value="${escapeHtml(acc.daily_goal_minutes ?? acc.default_minutes)}">
         <div class="hint">填 0 关闭。按站点时区累计本工具的今日阅读记录；保存后对新任务生效，最多补足今日余量。</div>
       </div>
+      <div class="field">
+        <label class="label" for="acc-read-speed">每分钟阅读字数 <span class="opt">字/分钟</span></label>
+        <input class="input" id="acc-read-speed" type="number" min="10" max="3000" step="1" data-read-speed value="${Number(acc.read_speed ?? 300)}">
+        <div class="hint">影响顺序书单的章节切换节奏：300 字/分钟 ≈ 3000 字章节约 10 分钟切下一章，并随心跳间隔自适应。填 0 恢复默认 300；取值 10~3000。修改后需重新开始该账号的阅读任务才生效。</div>
+      </div>
       <div class="grid-2">
         <div class="field">
           <label class="label" for="acc-tick">心跳间隔 <span class="opt">秒</span></label>
@@ -717,10 +722,21 @@ export function editAccountDialog(acc, { onDone } = {}) {
       focusFirstError(mask);
       return;
     }
+    // 0 = 恢复默认 300，其余 10~3000 的整数。
+    const speedInput = $('[data-read-speed]', mask);
+    const speedRaw = speedInput.value.trim();
+    const readSpeed = Number(speedRaw);
+    if (speedRaw === '' || !Number.isInteger(readSpeed) || (readSpeed !== 0 && (readSpeed < 10 || readSpeed > 3000))) {
+      setFieldError(speedInput, '每分钟阅读字数需为 0（默认）或 10~3000 的整数');
+      toast('每分钟阅读字数需为 0（默认）或 10~3000 的整数', 'warn');
+      focusFirstError(mask);
+      return;
+    }
     const patch = {
       name,
       default_minutes: defaultMinutes,
       daily_goal_minutes: dailyGoalMinutes,
+      readSpeed,
       tick_seconds: Number($('[data-tick]', mask).value) || 30,
       max_retries: Number($('[data-retries]', mask).value) || 0,
       retry_delay: Number($('[data-retry-delay]', mask).value) || 15,

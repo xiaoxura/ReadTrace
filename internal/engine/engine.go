@@ -44,6 +44,7 @@ type activeRun struct {
 	failed    int
 	status    string
 	tick      int
+	readSpeed int  // 每分钟阅读字数（Start 时快照，clamp 后；顺序书单切章预算用）
 	newExpiry bool // explicit auth failure changed this account to expired
 
 	// 书池快照按账号划分：账号专属优先，其次共享，最后回落内置常量。
@@ -470,9 +471,13 @@ func (e *Engine) Start(acc *store.Account, minutes int, trigger string) (*store.
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	// 阅读速度在运行内取值：Start 时读实例值即可（clamp 后快照进 activeRun）。
+	// 不做运行中热更新——改了账号的「每分钟阅读字数」后，重新开始该账号的
+	// 任务即可按新速度切章。
 	ar := &activeRun{
 		runID: run.ID, accountID: acc.ID, account: acc.Name, target: target,
 		started: run.StartedAt, status: "running", tick: clampTick(acc.TickSeconds),
+		readSpeed: clampReadSpeed(acc.ReadSpeed),
 		poolBooksOwned:       readableBooks,
 		poolChaptersByOwned:  byOwned,
 		poolChaptersByShared: byShared,
@@ -501,6 +506,11 @@ func (e *Engine) Start(acc *store.Account, minutes int, trigger string) (*store.
 	startMsg := fmt.Sprintf("开始阅读：目标 %s，间隔 %d 秒，模式 %s", humanMinutes(target), clampTick(acc.TickSeconds), modeName(acc.Mode))
 	if clampRetries(acc.MaxRetries) > 0 {
 		startMsg += fmt.Sprintf("，失败自动重试 %d 次（间隔 %d 秒）", clampRetries(acc.MaxRetries), clampDelay(acc.RetryDelay))
+	}
+	// 顺序书单的切章节奏由阅读速度决定（章节字数 ÷（速度 × 间隔 ÷ 60）），
+	// 开始日志把当前速度亮出来，用户能感知到节奏口径。
+	if acc.Mode == "sequence" {
+		startMsg += fmt.Sprintf("，阅读速度 %d 字/分钟", clampReadSpeed(acc.ReadSpeed))
 	}
 	e.logLine(ar, "info", startMsg)
 	go e.loop(ar, acc, weread.Cookies(cookies), template)
@@ -1125,13 +1135,26 @@ func seqNextBookIdx(ar *activeRun, idx int) int {
 	return idx % n
 }
 
-// chapterTickBudget 一个章节需要多少次 30 秒心跳才算“读完”：按字数折算，
-// 150 字 / 心跳 ≈ 真人 300 字/分钟。字数未知按 4 次（约 2 分钟）兜底。
-func chapterTickBudget(wordCount int) int {
+// chapterTickBudget 一个章节需要多少次心跳才算“读完”：显式换算，预算 =
+// ceil(章节字数 ÷ (阅读速度 × tickSeconds ÷ 60))，即把每分钟字数折算成每个
+// interval 心跳能“读”掉的字数，随账号的心跳间隔自适应（默认速度 300 字/
+// 分钟、30 秒心跳 = 150 字/心跳）。字数未知仍按 4 次「interval 心跳」兜底
+// ——默认速度下约 2 分钟。
+func chapterTickBudget(wordCount, readSpeed, tickSeconds int) int {
 	if wordCount <= 0 {
 		return 4
 	}
-	ticks := (wordCount + 149) / 150
+	// clampReadSpeed 保证 speed 为正；tickSeconds 兜底自 clampTick。
+	if tickSeconds <= 0 {
+		tickSeconds = 30
+	}
+	// ticks = ceil(wordCount * 60 / (readSpeed * tickSeconds))，整数运算避免
+	// 浮点误差；「×60 分钟」把字/分钟换算成每心跳字数（字/秒 × interval 秒）。
+	remainder := tickSeconds * readSpeed
+	if remainder <= 0 { // 极端配置下（理论上不可达）按默认口径兜底
+		remainder = 300 * 30
+	}
+	ticks := (wordCount*60 + remainder - 1) / remainder
 	if ticks < 1 {
 		return 1
 	}
@@ -1160,7 +1183,10 @@ func chapterDisplayName(ar *activeRun, book string, rawValue string) string {
 }
 
 // seqAdvance 在一次成功心跳后推进书单指针，并持久化（跨次运行衔接）。
-// 章节切换按字数预算：读满一章的字数才切下一章，符合真人阅读节奏；
+// 章节切换按字数预算：读满一章的字数才切下一章，符合真人阅读节奏。预算 =
+// ceil(字数 ÷（阅读速度 × 间隔 ÷ 60）)，阅读速度取 Start 时的账号快照
+// （ar.readSpeed），心跳间隔取当前运行的 interval（ar.tick，clamp 后）；
+// 中途改速度不会热更新，重启该账号任务即生效。
 // 读完整本书切下一本，书单尾部 wrap 回第一本。
 func (e *Engine) seqAdvance(ar *activeRun) {
 	pos := ar.seqPos
@@ -1179,7 +1205,7 @@ func (e *Engine) seqAdvance(ar *activeRun) {
 	if wordCount <= 0 {
 		wordCount = ar.chapterWordCounts[ar.seqMark.rawChapter] // 无归属/历史兜底
 	}
-	budget := chapterTickBudget(wordCount)
+	budget := chapterTickBudget(wordCount, ar.readSpeed, ar.tick)
 	if ar.seqMark.rawChapter == "" {
 		budget = 4 // buildPayload 未记录原始章节（兜底路径），保守处理
 	}
@@ -1202,6 +1228,12 @@ func (e *Engine) seqAdvance(ar *activeRun) {
 	e.saveSeqPos(ar.accountID, pos)
 
 	bookName := seqBookName(ar, ar.seqMark.bi)
+	// 切章日志带上本章字数与按当前速度预计的分钟数，让节奏可感知。
+	rhythm := ""
+	if wordCount > 0 {
+		speed := clampReadSpeed(ar.readSpeed)
+		rhythm = fmt.Sprintf("（本章 %d 字，按当前 %d 字/分钟约 %.1f 分钟）", wordCount, speed, float64(wordCount)/float64(speed))
+	}
 	if finishedBook {
 		e.logLine(ar, "info", fmt.Sprintf("顺序书单：《%s》已读完，切换到《%s》（第 %d 本）", bookName, seqBookName(ar, pos.Bi), pos.Bi+1))
 	} else {
@@ -1213,7 +1245,8 @@ func (e *Engine) seqAdvance(ar *activeRun) {
 		if next == "" {
 			nextName = "下一章"
 		}
-		e.logLine(ar, "info", fmt.Sprintf("顺序书单：《%s》读完「%s」，开始「%s」", bookName, chapterDisplayName(ar, seqBook, ar.seqMark.rawChapter), nextName))
+		e.logLine(ar, "info", fmt.Sprintf("顺序书单：《%s》读完「%s」%s，开始「%s」",
+			bookName, chapterDisplayName(ar, seqBook, ar.seqMark.rawChapter), rhythm, nextName))
 	}
 }
 
@@ -1456,6 +1489,19 @@ func humanMinutes(seconds int) string {
 		return fmt.Sprintf("%.0f 分钟", m)
 	}
 	return fmt.Sprintf("%.1f 分钟", m)
+}
+
+// clampReadSpeed keeps the words-per-minute reading speed in a sane range
+// (0/未填 = 默认 300，上限 3000)，与 store 层 clampReadSpeed 同口径；引擎
+// 各处的预算换算都应喂 clamp 后的值。
+func clampReadSpeed(v int) int {
+	if v <= 0 {
+		return 300
+	}
+	if v > 3000 {
+		return 3000
+	}
+	return v
 }
 
 func clampTick(v int) int {

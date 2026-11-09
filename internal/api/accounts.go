@@ -112,14 +112,24 @@ func parseImport(curl, cookie, payload string) (weread.Cookies, map[string]any, 
 
 func (s *Server) handleAccountImport(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Name    string `json:"name"`
-		Curl    string `json:"curl"`
-		Cookie  string `json:"cookie"`
-		Payload string `json:"payload"`
-		Force   bool   `json:"force"`
+		Name      string `json:"name"`
+		Curl      string `json:"curl"`
+		Cookie    string `json:"cookie"`
+		Payload   string `json:"payload"`
+		Force     bool   `json:"force"`
+		ReadSpeed *int   `json:"readSpeed"`
 	}
 	if !s.decode(w, r, &body) {
 		return
+	}
+	// 可选的初始阅读速度：缺省（0/未填）走 store 层默认 300。
+	createReadSpeed := 0
+	if body.ReadSpeed != nil {
+		if msg := invalidReadSpeed(*body.ReadSpeed); msg != "" {
+			s.writeErr(w, http.StatusBadRequest, msg)
+			return
+		}
+		createReadSpeed = *body.ReadSpeed
 	}
 	ck, payload, err := parseImport(body.Curl, body.Cookie, body.Payload)
 	if err != nil {
@@ -187,6 +197,7 @@ func (s *Server) handleAccountImport(w http.ResponseWriter, r *http.Request) {
 		Name: name, Vid: vid, Nickname: nickname, Avatar: avatar,
 		Status: status, LastError: validateErrString(validateErr), LastCheckAt: time.Now().Unix(),
 		DefaultMinutes: 30, DailyGoalMinutes: 30, TickSeconds: 30, Mode: "sequence",
+		ReadSpeed: createReadSpeed,
 		// 新账号默认：阅读失败自动重试 5 次，间隔 30 秒。
 		MaxRetries: 5, RetryDelay: 30,
 	}, map[string]string(ck), payload)
@@ -220,6 +231,7 @@ func (s *Server) handleAccountUpdate(w http.ResponseWriter, r *http.Request) {
 		DefaultMinutes   *int    `json:"default_minutes"`
 		DailyGoalMinutes *int    `json:"daily_goal_minutes"`
 		TickSeconds      *int    `json:"tick_seconds"`
+		ReadSpeed        *int    `json:"readSpeed"`
 		MaxRetries       *int    `json:"max_retries"`
 		RetryDelay       *int    `json:"retry_delay"`
 		BookID           *string `json:"book_id"`
@@ -260,6 +272,14 @@ func (s *Server) handleAccountUpdate(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		acc.TickSeconds = *body.TickSeconds
+	}
+	if body.ReadSpeed != nil {
+		if msg := invalidReadSpeed(*body.ReadSpeed); msg != "" {
+			s.writeErr(w, http.StatusBadRequest, msg)
+			return
+		}
+		// 0 表示恢复默认：store 层 clampReadSpeed 会把它折算成 300。
+		acc.ReadSpeed = *body.ReadSpeed
 	}
 	if body.MaxRetries != nil {
 		if *body.MaxRetries < 0 || *body.MaxRetries > 10 {
@@ -325,6 +345,18 @@ func (s *Server) handleAccountUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.writeJSON(w, http.StatusOK, accountList[0])
+}
+
+// invalidReadSpeed 校验「每分钟阅读字数」：0 表示恢复默认（未填不进这条
+// 路径 = 不改），其余必须是 10~3000 之间的整数，负数一律拒绝。
+func invalidReadSpeed(v int) string {
+	if v == 0 {
+		return ""
+	}
+	if v < 0 || v >= 1 && v < 10 || v > 3000 {
+		return "每分钟阅读字数需为 0（默认）或 10~3000 之间的整数"
+	}
+	return ""
 }
 
 func (s *Server) handleAccountDelete(w http.ResponseWriter, r *http.Request) {

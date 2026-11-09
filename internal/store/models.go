@@ -16,6 +16,7 @@ type Account struct {
 	TodaySeconds          int    `json:"today_seconds"`
 	DailyRemainingSeconds int    `json:"daily_remaining_seconds"`
 	TickSeconds           int    `json:"tick_seconds"`
+	ReadSpeed             int    `json:"read_speed"` // 每分钟阅读字数，0 表示默认；顺序书单章节切换节奏 = 章节字数 ÷（阅读速度 × 心跳间隔 ÷ 60）
 	MaxRetries            int    `json:"max_retries"` // 阅读失败自动重试次数，0 表示不重试
 	RetryDelay            int    `json:"retry_delay"` // 重试间隔，秒
 	BookID                string `json:"book_id"`
