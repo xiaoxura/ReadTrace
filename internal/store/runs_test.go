@@ -1,6 +1,7 @@
 package store
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -9,8 +10,7 @@ import (
 // 落在重启前的最后活动时刻（last_progress_at，缺列值时退回 started_at+
 // elapsed 近似），把已读秒数分配到实际活动的自然日，而不是把整段停机时间
 // 记进重启动当天的阅读时段。
-func TestInterruptRunningRunsStopsAtProgressTime(t *testing.T) {
-	loc, err := time.LoadLocation("Asia/Shanghai")
+func TestInterruptRunningRunsStopsAtProgressTime(t *testing.T) {	loc, err := time.LoadLocation("Asia/Shanghai")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,15 +48,37 @@ func TestInterruptRunningRunsStopsAtProgressTime(t *testing.T) {
 				}
 			}
 			// 模拟次日下午重启。
-			if err := st.InterruptRunningRuns(); err != nil {
+			interrupted, err := st.InterruptRunningRuns()
+			if err != nil {
 				t.Fatal(err)
+			}
+			if len(interrupted) != 1 {
+				t.Fatalf("interrupted = %+v, want exactly one row", interrupted)
+			}
+			if interrupted[0].RunID != run.ID || interrupted[0].AccountID != acc ||
+				interrupted[0].ElapsedSeconds != 60 || interrupted[0].AccountName != "A" {
+				t.Fatalf("interrupted run = %+v, want run %d / account %d", interrupted[0], run.ID, acc)
 			}
 			got, err := st.GetRun(run.ID)
 			if err != nil || got == nil {
 				t.Fatalf("get run: %v %v", got, err)
 			}
-			if got.Status != "failed" {
-				t.Fatalf("status = %q, want failed", got.Status)
+			// 被打断是外部中断（升级/重启）而非程序失败：status 用 stopped
+			// 与 failed 区分，error 文案说明原因并告知已自动续跑。
+			if got.Status != "stopped" {
+				t.Fatalf("status = %q, want stopped", got.Status)
+			}
+			if got.Error != errRestartInterrupted {
+				t.Fatalf("error = %q, want %q", got.Error, errRestartInterrupted)
+			}
+			logs, err := st.ListLogs(run.ID, 0, 10)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(logs) != 1 || logs[0].Level != "warn" ||
+				!strings.Contains(logs[0].Message, "程序重启中断") ||
+				!strings.Contains(logs[0].Message, "自动续跑") {
+				t.Fatalf("interruption log = %+v, want one warn about restart/resume", logs)
 			}
 			if got.FinishedAt != tc.wantFinished {
 				t.Fatalf("finished_at = %d (%s), want %d (%s)", got.FinishedAt,
@@ -68,6 +90,35 @@ func TestInterruptRunningRunsStopsAtProgressTime(t *testing.T) {
 				t.Fatalf("day split = %v, want %s=%d %s=%d", split, yesterdayKey, tc.wantYesterday, todayKey, tc.wantToday)
 			}
 		})
+	}
+}
+
+// 重启打断的返回值契约：无遗留 running 行时返回空 list、不磕绊；已结束的
+// 历史行（success/failed/stopped）不得被再次标记。
+func TestInterruptRunningRunsEmptyWhenNoLeak(t *testing.T) {
+	st := newTestStore(t)
+	acc := seedAccount(t, st, "A")
+	for _, status := range []string{"success", "failed", "stopped"} {
+		if err := st.CreateRun(&Run{AccountID: acc, PlanSeconds: 60, Status: status,
+			StartedAt: now() - 120, FinishedAt: now()}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	list, err := st.InterruptRunningRuns()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 0 {
+		t.Fatalf("interrupted = %+v, want empty for finished rows", list)
+	}
+	runs, err := st.ListRuns(acc, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range runs {
+		if r.Error == errRestartInterrupted {
+			t.Fatalf("finished run #%d was re-marked as interrupted", r.ID)
+		}
 	}
 }
 

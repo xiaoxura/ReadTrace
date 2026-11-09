@@ -659,6 +659,91 @@ func (e *Engine) logLine(ar *activeRun, level, msg string) {
 	})
 }
 
+// logToRun 向一个没有内存 activeRun 的运行写日志（续跑给「被打断的旧
+// 运行」补记中断原因时用）。落库与广播口径与 logLine 一致，只是新旧
+// 两侧的 runID/accountID 由调用方显式给出。
+func (e *Engine) logToRun(runID, accountID int64, level, msg string) {
+	ts := time.Now().Unix()
+	id, err := e.st.AddLog(runID, ts, level, msg)
+	if err != nil {
+		e.log.Warn("写入运行日志失败", "run", runID, "err", err)
+	}
+	e.hub.Publish(Event{
+		Type: "run.log", RunID: runID, AccountID: accountID, TS: ts,
+		Data: map[string]any{"id": id, "run_id": runID, "ts": ts, "level": level, "message": msg},
+	})
+}
+
+// ResumeInterrupted 在启动时对「程序重启」打断的阅读自动续跑（external
+// 中断如升级/手动重启）。每个账号按最新一条被中断记录去重、只续跑一次；
+// Start 失败不重试（Start 自身的会话内重试逻辑在 loop 里），避免失败账号
+// 无限循环。
+//
+// 复用 Start 的「每日只补不足」目标计算（target = min(默认时长, 今日剩余)），
+// 与定时任务语义完全一致，各错误分支的处置：
+//   - 今日已达标（ErrDailyGoalReached）→ 无需续跑，info 后跳过；
+//   - 账号已被并发启动（定时任务抢跑等，含 Start 的「正在阅读中」文案与
+//     WithIdleAccount 的 ErrAccountRunning）→ info 后跳过，不算错；
+//   - 引擎已停止（ErrEngineStopped）→ 立即结束整个续跑流程；
+//   - 其它错误（无凭据/无书单等）→ warn 后继续处理下一个账号，绝不重试。
+func (e *Engine) ResumeInterrupted(list []store.InterruptedRun) {
+	seen := map[int64]bool{}
+	for _, ir := range list {
+		// 停止门闩：进入退出流程立即整体返回，不再发起任何阅读。
+		if e.stopped() {
+			return
+		}
+		if seen[ir.AccountID] {
+			continue // 同一账号只按最新一条续跑一次
+		}
+		seen[ir.AccountID] = true
+		acc, err := e.st.GetAccount(ir.AccountID)
+		if err != nil {
+			e.log.Warn("读取账号失败，跳过续跑", "account", ir.AccountID, "run", ir.RunID, "err", err)
+			continue
+		}
+		if acc == nil {
+			e.log.Warn("账号已删除，跳过续跑", "account", ir.AccountID, "run", ir.RunID)
+			continue
+		}
+		if acc.Status != "active" {
+			// 失效账号续跑无意义：心跳立刻会因登录被拒绝。
+			e.log.Info(fmt.Sprintf("账号「%s」登录已失效，跳过续跑（请重新登录后再手动开始）", acc.Name),
+				"account", acc.ID, "status", acc.Status)
+			continue
+		}
+		run, err := e.Start(acc, 0, "resume")
+		switch {
+		case err == nil:
+			// 旧记录留「中断原因 + 由谁续跑」，新运行留「接续来源」，旧
+			// 运行与新运行之间互相可寻。旧运行没有内存态 activeRun，
+			// 走 logToRun 直接落库；新运行同用 run.ID（Start 已返回）。
+			e.logToRun(ir.RunID, ir.AccountID, "info",
+				fmt.Sprintf("中断原因：程序重启。已由本次续跑运行继续（运行 #%d）", run.ID))
+			e.logToRun(run.ID, ir.AccountID, "info",
+				fmt.Sprintf("接续运行 #%d（中断时已读 %s），继续完成今日剩余目标",
+					ir.RunID, humanMinutes(ir.ElapsedSeconds)))
+			e.log.Info("已自动续跑被打断的阅读",
+				"account", acc.Name, "old_run", ir.RunID, "new_run", run.ID,
+				"interrupted_elapsed", ir.ElapsedSeconds, "resume_target", run.PlanSeconds)
+		case errors.Is(err, ErrDailyGoalReached):
+			e.log.Info(fmt.Sprintf("「%s」今日目标已达成，跳过续跑", acc.Name),
+				"account", acc.ID, "old_run", ir.RunID)
+		case errors.Is(err, ErrAccountRunning) || strings.Contains(err.Error(), "正在阅读中"):
+			// 定时任务等可能和续跑并发启动同一账号；谁先占用谁继续读，
+			// 续跑侧让位即可，不算错误。
+			e.log.Info(fmt.Sprintf("「%s」已有运行中的任务（可能为定时任务同时触发），跳过续跑", acc.Name),
+				"account", acc.ID, "old_run", ir.RunID)
+		case errors.Is(err, ErrEngineStopped):
+			// 引擎已进入退出流程：立即结束，不再处理后续账号。
+			return
+		default:
+			e.log.Warn("续跑启动失败（续跑只执行一次、不重试，可手动开始该账号）",
+				"account", acc.ID, "name", acc.Name, "old_run", ir.RunID, "err", err)
+		}
+	}
+}
+
 // loop performs the reading ticks until the target or an error is reached.
 // A failed session is automatically retried while the account allows it
 // (max_retries > 0); success, manual stop and non-retryable failures return

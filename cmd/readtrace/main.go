@@ -32,7 +32,7 @@ import (
 	"readtrace/internal/weread"
 )
 
-var version = "0.2.0"
+var version = "0.2.1"
 
 func main() {
 	addr := flag.String("addr", envAny([]string{"READTRACE_ADDR", "WXREAD_ADDR"}, "127.0.0.1:8720"), "监听地址，例如 127.0.0.1:8720 或 0.0.0.0:8720")
@@ -88,8 +88,12 @@ func run(addr, dataDir string, openBrowser bool, retainDays int, hostAllow strin
 	}
 	defer st.Close()
 
-	if err := st.InterruptRunningRuns(); err != nil {
+	// 启动时把遗留 running 行改写为 stopped（缺陷 07 的 finished_at 语义
+	// 保留在内）；返回的 list 交给引擎重启后自动续跑（在引擎创建之后调用）。
+	interrupted, err := st.InterruptRunningRuns()
+	if err != nil {
 		logger.Warn("清理中断运行记录失败", "err", err)
+		interrupted = nil
 	}
 	_ = st.PurgeSessions()
 
@@ -124,6 +128,12 @@ func run(addr, dataDir string, openBrowser bool, retainDays int, hostAllow strin
 	hub := engine.NewHub()
 	nt := notify.New()
 	eng := engine.New(st, client, nt, hub, logger)
+	// 自动续跑放在引擎就绪之后、调度器启动之前：此刻定时任务还没开跑，
+	// 续跑不会与定时触发抢同一账号；即便调度器将来先抢跑（或同时触发），
+	// ResumeInterrupted 也按 info 级跳过，不打断既有流程。
+	if len(interrupted) > 0 {
+		eng.ResumeInterrupted(interrupted)
+	}
 	sch := sched.New(st, eng, logger)
 	if err := sch.Start(loc); err != nil {
 		return fmt.Errorf("启动定时任务失败: %w", err)

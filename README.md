@@ -83,16 +83,16 @@
 
 ```bash
 # Linux / macOS
-./build.sh 0.2.0
+./build.sh 0.2.1
 
 # Windows PowerShell
-.\build.ps1 -Version 0.2.0
+.\build.ps1 -Version 0.2.1
 ```
 
 也可以直接用发布页的二进制，或在项目根目录执行：
 
 ```bash
-go build -trimpath -ldflags "-s -w -X main.version=0.2.0" -o readtrace ./cmd/readtrace
+go build -trimpath -ldflags "-s -w -X main.version=0.2.1" -o readtrace ./cmd/readtrace
 ```
 
 ### 2. 启动
@@ -336,8 +336,8 @@ docs/deployment.md    部署指南（Linux / Windows / Docker / 1Panel / 反代 
 发布时推送标签：
 
 ```bash
-git tag v0.2.0
-git push origin v0.2.0
+git tag v0.2.1
+git push origin v0.2.1
 ```
 
 产物不套压缩包，也不在文件名里带版本号，直接是 `readtrace_linux_amd64`、`readtrace_macos_arm64` 这样的固定文件名（文件名里的 `macos` 即 Go 的 `darwin` 目标）。版本由 Release 标签和 `readtrace -version` 提供，服务器更新脚本始终使用同一个下载路径。Linux / macOS 下载后需要 `chmod +x`：
@@ -349,7 +349,7 @@ chmod +x readtrace_linux_amd64
 ./readtrace_linux_amd64
 ```
 
-也可以在 GitHub 的 **Releases → Draft a new release** 中新建 `v0.2.0` 标签并发布；如果该标签没有自动触发构建，到 **Actions → Release → Run workflow** 填入同一个标签即可补发产物。`main.version` 会取自标签（去掉开头的 `v`），所以设置页显示的版本与 Release 标签一致。
+也可以在 GitHub 的 **Releases → Draft a new release** 中新建 `v0.2.1` 标签并发布；如果该标签没有自动触发构建，到 **Actions → Release → Run workflow** 填入同一个标签即可补发产物。`main.version` 会取自标签（去掉开头的 `v`），所以设置页显示的版本与 Release 标签一致。
 
 ---
 

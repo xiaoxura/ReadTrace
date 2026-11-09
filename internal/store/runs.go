@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -175,9 +176,33 @@ func (s *Store) PurgeHistoryBefore(cutoff int64) (int64, error) {
 	return n, nil
 }
 
-// InterruptRunningRuns marks leftover running rows as interrupted (called on
-// startup because background goroutines do not survive a restart).
-//
+// errRestartInterrupted 一条遗留 running 行被打断时的 error 文案：措辞必须
+// 让用户一眼看出是「外部中断（升级/重启）且已自动续跑」，而不是程序错误
+// ——status 也因此用 'stopped' 与真正失败的 'failed' 区分开。
+const errRestartInterrupted = "程序重启中断（如升级/手动重启），剩余时间已自动续跑"
+
+// InterruptedRun 描述一条在启动时被「程序重启」打断的运行：引擎用它找到
+// 原记录并自动续跑（读剩余目标，账号按最新一条去重）。
+type InterruptedRun struct {
+	RunID          int64
+	AccountID      int64
+	AccountName    string
+	ElapsedSeconds int
+}
+
+// humanElapsed 把秒数折算成人读的「X 分钟」文案（约数，与引擎 humanMinutes
+// 口径一致：不足 10 分钟保留一位小数，更大的值取整）。
+func humanElapsed(seconds int) string {
+	if seconds < 0 {
+		seconds = 0
+	}
+	m := float64(seconds) / 60
+	if m >= 10 {
+		return fmt.Sprintf("%.0f 分钟", m)
+	}
+	return fmt.Sprintf("%.1f 分钟", m)
+}
+
 // finished_at 取值语义（缺陷 07）：优先用 last_progress_at——最后一次心跳
 // 落库时刻，是重启前最后已知的活动时刻，也是最接近真实活动时段边界的值；
 // 该列为 0（老数据或从未写进度）时退回 started_at+elapsed_seconds 近似
@@ -185,13 +210,74 @@ func (s *Store) PurgeHistoryBefore(cutoff int64) (int64, error) {
 // finished_at 好：后者把整段跨日停机时间塞进阅读跨度，SplitRunSeconds 会
 // 把停机前一天的已读秒数均摊到次日的停机时段上。SplitRunSeconds 的线性
 // 均摊逻辑不需要改，finished_at 修正后自然按活动时段归属。
-func (s *Store) InterruptRunningRuns() error {
-	_, err := s.db.Exec(`UPDATE runs SET status = 'failed', error = ?, finished_at = MAX(started_at, CASE
+//
+// 打断语义（缺陷 07 的延伸）：后台 goroutine 不跨进程存活，遗留的 running
+// 行是被「外部中断」（升级/手动重启）打断，不是程序错误——status 置
+// 'stopped'（与真正失败的 'failed' 区分）、error 写明已自动续跑，并逐条
+// AddLog 一条 warn 提醒阅读被切断了多久、剩余目标如何跟进。单事务里先
+// SELECT 后按 id 精确 UPDATE，保证「读到的就是要改的」，不会误伤并发
+// 新建的 running 行。
+func (s *Store) InterruptRunningRuns() ([]InterruptedRun, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.Query(`SELECT r.id, r.account_id, COALESCE(a.name, ''), r.elapsed_seconds
+		FROM runs r LEFT JOIN accounts a ON a.id = r.account_id
+		WHERE r.status = 'running' ORDER BY r.id DESC`)
+	if err != nil {
+		return nil, err
+	}
+	var list []InterruptedRun
+	for rows.Next() {
+		var ir InterruptedRun
+		if err := rows.Scan(&ir.RunID, &ir.AccountID, &ir.AccountName, &ir.ElapsedSeconds); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		list = append(list, ir)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+
+	if len(list) == 0 {
+		return nil, nil
+	}
+
+	q := `UPDATE runs SET status = 'stopped', error = ?, finished_at = MAX(started_at, CASE
 		WHEN last_progress_at > 0 THEN last_progress_at
 		ELSE started_at + elapsed_seconds
 		END)
-		WHERE status = 'running'`, "服务重启，本次运行已中断")
-	return err
+		WHERE id IN (` + strings.Repeat("?,", len(list)-1) + "?)"
+	args := make([]any, 0, len(list)+1)
+	args = append(args, errRestartInterrupted)
+	for _, ir := range list {
+		args = append(args, ir.RunID)
+	}
+	if _, err := tx.Exec(q, args...); err != nil {
+		return nil, err
+	}
+
+	// 打断原因写进每条被打断运行的 logs（所在事务一致落库）。单条日志
+	// 写失败不回滚中断标记本身——状态与 error 已经说明因果，剩余时间由
+	// 引擎侧 ResumeInterrupted 继续跟进，日志缺失不改变处置。
+	for _, ir := range list {
+		if _, err := tx.Exec(`INSERT INTO run_logs (run_id, ts, level, message) VALUES (?,?,?,?)`,
+			ir.RunID, now(), "warn",
+			fmt.Sprintf("程序重启中断：本次已读约 %s，剩余时间已安排自动续跑", humanElapsed(ir.ElapsedSeconds))); err != nil {
+			continue
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return list, nil
 }
 
 // AddLog appends one log line and returns its id.
