@@ -97,3 +97,28 @@ func TestFetchReaderStateRejectsLoginPage(t *testing.T) {
 		t.Fatal("want failure when __INITIAL_STATE__ missing")
 	}
 }
+
+// 上传书（CB_）的 b/reader 页 hash 都应是 _e() 编码后的长串，
+// 直接改用该书的真实抓包（阅读页 URL 与 payload 的 b 同值）校验。
+func TestEncodeWeReadIDUploadBookMatchesLiveCapture(t *testing.T) {
+	got := encodeWeReadID("CB_45SBDGBEC9jf74V75BAdW7jp")
+	if got != "17c424b3643425f343553424447424543396a66373456373542416457376a70879" {
+		t.Fatalf("encodeWeReadID(CB) = %s, want captured hash", got)
+	}
+}
+
+func TestNormalizePayloadIDShapes(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"43208843", "c9c321c07293508bc9c79df"},                                        // 纯数字 → _e 编码（koplugin 文档样例）
+		{"ce032b305a9bc1ce0b0dd2a", "ce032b305a9bc1ce0b0dd2a"},                         // 24 位 hex 书 ID → 原样
+		{"92c3210025c92cc22753209", "92c3210025c92cc22753209"},                         // 23 位 hex 章节 ID → 原样
+		{"CB_45SBDGBEC9jf74V75BAdW7jp", encodeWeReadID("CB_45SBDGBEC9jf74V75BAdW7jp")}, // 上传书 → 编码
+	}
+	for _, c := range cases {
+		if got := NormalizePayloadID(c.in); got != c.want {
+			t.Fatalf("NormalizePayloadID(%q) = %s, want %s", c.in, got, c.want)
+		}
+	}
+}

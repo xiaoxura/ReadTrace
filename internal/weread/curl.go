@@ -18,13 +18,7 @@ type CurlImport struct {
 
 var (
 	lineContinuation = regexp.MustCompile(`\\\r?\n`)
-	singleHeader     = regexp.MustCompile(`(?:^|\s)-H\s+'([^']*)'`)
-	doubleHeader     = regexp.MustCompile(`(?:^|\s)-H\s+"([^"]*)"`)
-	singleCookie     = regexp.MustCompile(`(?:^|\s)(?:-b|--cookie)\s+'([^']*)'`)
-	doubleCookie     = regexp.MustCompile(`(?:^|\s)(?:-b|--cookie)\s+"([^"]*)"`)
-	singleData       = regexp.MustCompile(`(?:^|\s)(?:--data-raw|--data-binary|--data|-d)\s+'([^']*)'`)
-	doubleData       = regexp.MustCompile(`(?:^|\s)(?:--data-raw|--data-binary|--data|-d)\s+"([^"]*)"`)
-	urlPattern       = regexp.MustCompile(`https?://[^\s'"]+`)
+	urlPattern       = regexp.MustCompile(`^https?://`)
 	headerPair       = regexp.MustCompile(`^([^:]+):\s*(.*)$`)
 )
 
@@ -38,6 +32,8 @@ func parseCurl(raw string, requireCookies bool) (*CurlImport, error) {
 	if raw == "" {
 		return nil, fmt.Errorf("内容为空")
 	}
+	// 行尾续行先折行成空格再分词（bash 语义：续行处在 token 之间时等价，
+	// Chrome 复制的多行命令都落在参数之间，不会切开引号串内部）。
 	raw = lineContinuation.ReplaceAllString(raw, " ")
 
 	imp := &CurlImport{Cookies: Cookies{}, Headers: map[string]string{}}
@@ -52,45 +48,157 @@ func parseCurl(raw string, requireCookies bool) (*CurlImport, error) {
 		return imp, nil
 	}
 
-	if m := urlPattern.FindString(raw); m != "" {
-		imp.URL = m
-	}
+	words := shellWords(raw)
 
-	for _, re := range []*regexp.Regexp{singleHeader, doubleHeader} {
-		for _, m := range re.FindAllStringSubmatch(raw, -1) {
-			h := strings.TrimSpace(m[1])
-			if mm := headerPair.FindStringSubmatch(h); mm != nil {
-				imp.Headers[strings.ToLower(strings.TrimSpace(mm[1]))] = strings.TrimSpace(mm[2])
+	// 按选项流逐个收值：-H 头、-b/--cookie 与请求体参数；URL 取第一个
+	// http(s) 开头且不是选项值的 token。
+	var cookieArg string
+	for i := 0; i < len(words); i++ {
+		switch words[i] {
+		case "-H", "--header":
+			if i+1 < len(words) {
+				i++
+				if mm := headerPair.FindStringSubmatch(words[i]); mm != nil {
+					imp.Headers[strings.ToLower(strings.TrimSpace(mm[1]))] = strings.TrimSpace(mm[2])
+				}
+			}
+		case "-b", "--cookie":
+			if i+1 < len(words) {
+				i++
+				// 支持重复出现的 cookie 参数，取最后一项（与 curl 语义相近）。
+				cookieArg = strings.TrimSpace(words[i])
+			}
+		case "--url":
+			if i+1 < len(words) && imp.URL == "" {
+				i++
+				imp.URL = words[i]
+			} else if i+1 < len(words) {
+				i++
+			}
+		case "--data-raw", "--data-binary", "--data", "-d":
+			if i+1 < len(words) {
+				i++
+				// curl 允许重复传体（会拼接），这里取最后一项即可覆盖
+				// Chrome 复制场景的单体请求。
+				applyDataBody(imp, words[i])
+			}
+		default:
+			if imp.URL == "" && urlPattern.MatchString(words[i]) {
+				imp.URL = words[i]
 			}
 		}
 	}
 
-	cookieHeader := imp.Headers["cookie"]
-	for _, re := range []*regexp.Regexp{singleCookie, doubleCookie} {
-		if m := re.FindStringSubmatch(raw); m != nil {
-			cookieHeader = m[1]
-		}
+	if imp.Cookies == nil {
+		imp.Cookies = Cookies{}
 	}
-	if cookieHeader != "" {
-		imp.Cookies = ParseCookieString(cookieHeader)
+	// 头里的 cookie 字串是 Cookie: 头的正常形态；-b/--cookie 显式参数出现
+	// 时优先（与 curl 语义一致）。
+	if h := imp.Headers["cookie"]; h != "" {
+		imp.Cookies = ParseCookieString(h)
 	}
-
-	for _, re := range []*regexp.Regexp{singleData, doubleData} {
-		if m := re.FindStringSubmatch(raw); m != nil {
-			body := strings.TrimSpace(m[1])
-			var payload map[string]any
-			if err := json.Unmarshal([]byte(body), &payload); err == nil && len(payload) > 0 {
-				delete(payload, "s")
-				delete(payload, "sg")
-				imp.Payload = payload
-			}
-		}
+	if cookieArg != "" {
+		imp.Cookies = ParseCookieString(cookieArg)
 	}
 
 	if requireCookies && len(imp.Cookies) == 0 {
 		return nil, fmt.Errorf("未从 curl 中找到 Cookie，请确认复制的是 /web/book/read 请求")
 	}
 	return imp, nil
+}
+
+// applyDataBody 把一次请求体参数解析成 payload 模板：合法 JSON 才采用，
+// 并维持导入语义——剥掉签名字段 s/sg。
+func applyDataBody(imp *CurlImport, body string) {
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(body)), &payload); err == nil && len(payload) > 0 {
+		delete(payload, "s")
+		delete(payload, "sg")
+		imp.Payload = payload
+	}
+}
+
+// shellWords 按 POSIX shell 的分词规则把整条命令拆成 token 列表，覆盖
+// "Copy as cURL" 会遇到的所有形态：
+//   - 单引号串：字面量，内部无转义；bash 常用 `'\”` 分段转义一个单引号，
+//     多个单引号段与裸段自然拼进同一个 token（如 Don'\”t → Don't）；
+//   - 双引号串：处理 \" \\ 等转义，变量/命令替换（$x、`..`）无法在本地
+//     求值，跳过其文本只保留字面量；
+//   - 无引号 token：空格分隔，反斜杠转义下一字节；
+//   - 行尾续行已在进入分词前折行。
+func shellWords(s string) []string {
+	var words []string
+	var cur strings.Builder
+	hasWord := false
+	for i := 0; i < len(s); {
+		c := s[i]
+		switch {
+		case c == ' ' || c == '\t' || c == '\n' || c == '\r':
+			if hasWord {
+				words = append(words, cur.String())
+				cur.Reset()
+				hasWord = false
+			}
+			i++
+		case c == '\'':
+			// 单引号段：找到闭合引号；未闭合的残串按字面量收尾。
+			hasWord = true
+			end := strings.IndexByte(s[i+1:], '\'')
+			if end < 0 {
+				cur.WriteString(s[i+1:])
+				i = len(s)
+				break
+			}
+			cur.WriteString(s[i+1 : i+1+end])
+			i += end + 2
+		case c == '"':
+			// 双引号段：逐字节处理转义，未闭合按字面量收尾。
+			hasWord = true
+			i++
+			for i < len(s) {
+				d := s[i]
+				if d == '\\' && i+1 < len(s) {
+					next := s[i+1]
+					if next == '"' || next == '\\' || next == '$' || next == '`' {
+						cur.WriteByte(next)
+						i += 2
+						continue
+					}
+					cur.WriteByte(d)
+					i++
+					continue
+				}
+				if d == '"' {
+					i++
+					break
+				}
+				if d == '$' || d == '`' {
+					// 无法本地求值，跳过变量/命令替换文本。
+					i++
+					continue
+				}
+				cur.WriteByte(d)
+				i++
+			}
+		case c == '\\':
+			// 裸段转义：保留下一字节，结尾悬空的反斜杠丢弃。
+			hasWord = true
+			if i+1 < len(s) {
+				cur.WriteByte(s[i+1])
+				i += 2
+			} else {
+				i++
+			}
+		default:
+			cur.WriteByte(c)
+			hasWord = true
+			i++
+		}
+	}
+	if hasWord {
+		words = append(words, cur.String())
+	}
+	return words
 }
 
 // ParseReadTemplate accepts a JSON request body or a captured cURL without

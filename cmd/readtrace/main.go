@@ -32,7 +32,7 @@ import (
 	"readtrace/internal/weread"
 )
 
-var version = "0.1.1"
+var version = "0.2.0"
 
 func main() {
 	addr := flag.String("addr", envAny([]string{"READTRACE_ADDR", "WXREAD_ADDR"}, "127.0.0.1:8720"), "监听地址，例如 127.0.0.1:8720 或 0.0.0.0:8720")
@@ -129,6 +129,7 @@ func run(addr, dataDir string, openBrowser bool, retainDays int, hostAllow strin
 		return fmt.Errorf("启动定时任务失败: %w", err)
 	}
 	// 后台账号状态检测：按设置中的间隔自动校验登录态，发现失效可推送提醒。
+	// defer 只兜底 run() 提前报错退出的路径；正常关机在下方显式 Wait。
 	chk := checker.New(st, eng, client, nt, logger)
 	chk.Start()
 	defer chk.Wait()
@@ -166,14 +167,22 @@ func run(addr, dataDir string, openBrowser bool, retainDays int, hostAllow strin
 	<-stop
 	logger.Info("收到退出信号，正在停止任务...")
 
-	// Stop producing first, then release SSE subscribers so the HTTP server
-	// has no long-lived connections left to wait on.
+	// 关机顺序（保证 StopAll 返回后不再有新运行、退出日志不早于实际等待）：
+	// 1. sch.Stop：定时任务先停，不再发起新的启动；
+	// 2. eng.StopAll：关闭引擎启动门闩并取消、等待全部运行收尾——此后
+	//    Start 一律被拒绝，active 里不会再出现新运行；
+	// 3. eng.Hub().CloseAll：先释放 SSE 订阅，HTTP 关闭时不再被长连接阻塞；
+	// 4. httpServer.Shutdown：等待在途 HTTP 请求收尾；
+	// 5. chk.Wait：停后台检测循环（会先取消正在检查中的请求与失效推送，
+	//    再等待 goroutine 全部退出）；
+	// 6. 「已安全退出」日志放在 chk.Wait 实际返回之后，不再先于等待打印。
 	sch.Stop()
 	eng.StopAll()
 	eng.Hub().CloseAll()
 	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 	defer cancel()
 	_ = httpServer.Shutdown(ctx)
+	chk.Wait()
 	logger.Info("已安全退出")
 	return nil
 }

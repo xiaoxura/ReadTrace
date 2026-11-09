@@ -3,7 +3,6 @@ package api
 
 import (
 	"context"
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -83,12 +83,14 @@ func mustSetting(st *store.Store, key string) string {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
-	// Public endpoints.
+	// Public endpoints. The three auth-write routes additionally get the
+	// cross-origin / application header guard (see authWriteGuard) since they
+	// skip the session check in s.auth.
 	mux.HandleFunc("GET /api/health", s.handleHealth)
 	mux.HandleFunc("GET /api/status", s.handleStatus)
-	mux.HandleFunc("POST /api/setup", s.handleSetup)
-	mux.HandleFunc("POST /api/login", s.handleLogin)
-	mux.HandleFunc("POST /api/logout", s.handleLogout)
+	mux.HandleFunc("POST /api/setup", s.authWriteGuard(s.handleSetup))
+	mux.HandleFunc("POST /api/login", s.authWriteGuard(s.handleLogin))
+	mux.HandleFunc("POST /api/logout", s.authWriteGuard(s.handleLogout))
 
 	// Authenticated API.
 	mux.HandleFunc("GET /api/me", s.auth(s.handleMe))
@@ -102,6 +104,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/accounts/{id}/refresh", s.auth(s.handleAccountRefresh))
 	mux.HandleFunc("POST /api/accounts/{id}/check", s.auth(s.handleAccountCheck))
 	mux.HandleFunc("POST /api/accounts/{id}/payload", s.auth(s.handleAccountPayload))
+	mux.HandleFunc("GET /api/accounts/{id}/payload", s.auth(s.handleAccountPayloadGet))
 	mux.HandleFunc("POST /api/accounts/{id}/payload/generate", s.auth(s.handleAccountGeneratePayload))
 	mux.HandleFunc("DELETE /api/accounts/{id}/payload", s.auth(s.handleAccountPayloadDelete))
 
@@ -125,7 +128,6 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/pool/items/{id}/move", s.auth(s.handlePoolMove))
 	mux.HandleFunc("DELETE /api/pool/items/{id}", s.auth(s.handlePoolDelete))
 	mux.HandleFunc("POST /api/pool/reset", s.auth(s.handlePoolReset))
-	mux.HandleFunc("PUT /api/pool/template", s.auth(s.handlePoolTemplate))
 
 	mux.HandleFunc("POST /api/runs", s.auth(s.handleRunStart))
 	mux.HandleFunc("GET /api/runs", s.auth(s.handleRunList))
@@ -206,6 +208,27 @@ func hostAllowed(host string, allowed []string) bool {
 	return false
 }
 
+// originAllowed checks a cross-origin marker against the request. The origin
+// must be an http(s) URL and either exactly match the request Host (the normal
+// same-origin fetch case) or hit the allowedHosts list (the same basis as the
+// Host check, with the port stripped). Anything else — including opaquely
+// sanitized origins like `null` — is rejected.
+func originAllowed(origin string, r *http.Request, allowedHosts []string) bool {
+	u, err := url.Parse(origin)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return false
+	}
+	oh := strings.ToLower(strings.TrimSpace(u.Host))
+	rh := strings.ToLower(strings.TrimSpace(r.Host))
+	if oh == "" {
+		return false
+	}
+	if oh == rh {
+		return true
+	}
+	return hostAllowed(oh, allowedHosts)
+}
+
 type statusWriter struct {
 	http.ResponseWriter
 	status int
@@ -257,11 +280,9 @@ func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 		if ses.ExpiresAt-time.Now().Unix() < int64(15*24*time.Hour.Seconds()) {
 			_ = s.st.ExtendSession(id, sessionTTL)
 		}
-		if r.Method != http.MethodGet && r.Method != http.MethodHead {
-			if subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Requested-With")), []byte("readtrace")) != 1 {
-				s.writeErr(w, http.StatusForbidden, "非法请求")
-				return
-			}
+		if r.Method != http.MethodGet && r.Method != http.MethodHead && !sameAppClient(r) {
+			s.writeErr(w, http.StatusForbidden, "非法请求")
+			return
 		}
 		ctx := context.WithValue(r.Context(), sessionCtxKey{}, ses)
 		next(w, r.WithContext(ctx))
@@ -303,6 +324,13 @@ func (s *Server) writeErr(w http.ResponseWriter, code int, msg string) {
 }
 
 func (s *Server) decode(w http.ResponseWriter, r *http.Request, v any) bool {
+	// 拒绝分析表单提交（urlencoded/text/plain 等）冒充 JSON 的请求；缺失
+	// Content-Type 时（curl 等脚本的习惯写法）仍按 JSON 处理——浏览器原生表单
+	// 提交必然显式携带类型头，因此缺失也接受不会放行表单攻击。
+	if ct := r.Header.Get("Content-Type"); ct != "" && mediaTypeBase(ct) != "application/json" {
+		s.writeErr(w, http.StatusUnsupportedMediaType, "请求体必须是 JSON 格式")
+		return false
+	}
 	r.Body = http.MaxBytesReader(w, r.Body, 8<<20)
 	dec := json.NewDecoder(r.Body)
 	if err := dec.Decode(v); err != nil {
@@ -313,7 +341,22 @@ func (s *Server) decode(w http.ResponseWriter, r *http.Request, v any) bool {
 		s.writeErr(w, http.StatusBadRequest, "请求格式错误："+err.Error())
 		return false
 	}
+	// 完整消费 JSON：拒绝一个 JSON 值之后的额外内容（如表单 text/plain
+	// 提交时浏览器追加的 `=\r\n` 尾巴）。
+	if dec.More() {
+		s.writeErr(w, http.StatusBadRequest, "请求体包含多余内容")
+		return false
+	}
 	return true
+}
+
+// mediaTypeBase 提取 Content-Type 的主类型（去掉参数部分），如
+// "application/json; charset=utf-8" → "application/json"。
+func mediaTypeBase(v string) string {
+	if i := strings.IndexByte(v, ';'); i >= 0 {
+		v = v[:i]
+	}
+	return strings.ToLower(strings.TrimSpace(v))
 }
 
 func pathID(r *http.Request) (int64, bool) {

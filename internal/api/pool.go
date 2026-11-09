@@ -17,23 +17,39 @@ import (
 	"readtrace/internal/weread"
 )
 
-// validateDefaultTemplate parses and normalizes a user-supplied default read
-// template. It accepts either the JSON object itself or a full curl / Copy as
-// cURL (bash) command, then stores the compact JSON payload. The payload must
-// carry string book ("b") and chapter ("c") IDs.
-func validateDefaultTemplate(raw string) (string, error) {
-	m, err := weread.ParseReadTemplate(raw)
-	if err != nil {
-		return "", fmt.Errorf("模板解析失败：%v", err)
-	}
-	out, err := json.Marshal(m)
-	if err != nil {
-		return "", err
-	}
-	return string(out), nil
-}
-
 // ---------- 书池与章节池管理 ----------
+
+// authedCall 执行一次 weread 调用；如果失败原因是登录失效（-2012/-2013/401
+// 等），先做 renewal 拿新 wr_skey（Renew 会更新 ck 本身，后续调用方继续用的
+// 就是新 Cookie）再重试一次，与阅读引擎的自愈语义保持一致。此前书架/导入
+// 这些 API 通道没有续期，Cookie 自然过期后第一次操作会直接报「登录超时」，
+// 用户被迫先去点一次「检测」。
+func (s *Server) authedCall(ctx context.Context, acc *store.Account, ck map[string]string, fn func() error) error {
+	err := fn()
+	if !weread.IsAuthFailure(err) {
+		return err
+	}
+	// 缺陷 03：expectedSkey 取请求开始时的值，写在 Renew 之前（Renew 成功
+	// 时会原地更新 ck）。Renew 可能要等很久，等待期间用户可能扫码/导入新
+	// 凭据；写回前用 CAS 比对库里仍是 expectedSkey 才落库。
+	expectedSkey := ck["wr_skey"]
+	key, renewErr := s.wc.Renew(ctx, ck)
+	if renewErr != nil {
+		return err // 续期失败：返回原始错误，不掩盖原因
+	}
+	if key == "" {
+		return err
+	}
+	written, saveErr := s.st.SaveCookiesIfCurrentSkey(acc.ID, expectedSkey, ck)
+	switch {
+	case saveErr != nil:
+		s.log.Warn("续期结果写回失败", "account", acc.ID, "err", saveErr)
+	case !written:
+		s.log.Info("续期等待期间凭据已变更（新登录/换绑），跳过本次写回，不覆盖新凭据",
+			"account", acc.ID)
+	}
+	return fn()
+}
 
 // BookAudit 是一本书的章节付费结构快照（账号视角）。
 type BookAudit struct {
@@ -131,11 +147,20 @@ func (s *Server) handlePoolShelf(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
 	defer cancel()
-	shelf, err := s.wc.FetchShelf(ctx, ck)
+	var shelfResult *weread.Shelf
+	err = s.authedCall(ctx, acc, ck, func() error {
+		shelf, fetchErr := s.wc.FetchShelf(ctx, ck)
+		if fetchErr != nil {
+			return fetchErr
+		}
+		shelfResult = shelf
+		return nil
+	})
 	if err != nil {
 		s.writeErr(w, http.StatusBadGateway, "获取书架失败："+err.Error())
 		return
 	}
+	shelf := shelfResult
 
 	// Keep a bounded page of archive details, and expose the cursor rather
 	// than silently dropping everything after the first fifty books.
@@ -279,6 +304,14 @@ func (s *Server) handlePoolAudit(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
+	// 预热第一本书的目录：若登录已失效，这里会先续期再继续，避免整批
+	// 书的审计全部失败后才暴露「登录超时」。
+	if len(body.Books) > 0 {
+		_ = s.authedCall(ctx, acc, ck, func() error {
+			_, probeErr := s.chapterInfos(ctx, acc.ID, ck, body.Books[0])
+			return probeErr
+		})
+	}
 	targets := make([]weread.Book, 0, len(body.Books))
 	for _, id := range body.Books {
 		targets = append(targets, weread.Book{ID: id})
@@ -343,13 +376,14 @@ func (s *Server) handlePoolShelfImport(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	var (
-		mu          sync.Mutex
-		chapterJobs = make(chan shelfImportBook, len(body.Books))
-		failures    = make(map[string]string, 0)
-		booksAdded  = make([]string, 0)
-		booksSkip   = make([]string, 0)
-		chapAdded   = 0
-		chapExisted = 0
+		mu           sync.Mutex
+		chapterJobs  = make(chan shelfImportBook, len(body.Books))
+		failures     = make(map[string]string, 0)
+		booksAdded   = make([]string, 0)
+		booksSkip    = make([]string, 0)
+		chapAdded    = 0
+		chapExisted  = 0
+		chapConflict = 0
 	)
 	// 书籍逐个入池（本地 SQLite 单连接，串行足够快）。完全不可读（未付费）
 	// 的书连书条目都不入池——章节与正文不可用，留着只会被轮换抽到。
@@ -375,6 +409,14 @@ func (s *Server) handlePoolShelfImport(w http.ResponseWriter, r *http.Request) {
 	close(chapterJobs)
 
 	if body.WithChapters {
+		// 预热第一本书的目录：登录已失效时先续期，避免整批书都在目录
+		// 请求上撞「登录超时」。
+		if len(body.Books) > 0 {
+			_ = s.authedCall(ctx, acc, ck, func() error {
+				_, probeErr := s.chapterInfos(ctx, scope, ck, body.Books[0].BookID)
+				return probeErr
+			})
+		}
 		// 低并发拉目录，失败再给一次单独重试的机会（瞬时风控/网络抖动
 		// 常见于批量请求的第一轮）。
 		workers := 2
@@ -391,14 +433,14 @@ func (s *Server) handlePoolShelfImport(w http.ResponseWriter, r *http.Request) {
 					if full {
 						limit = 0 // 0 = 不限量，导入全书可读章节
 					}
-					var added, existed int
+					var added, existed, conflicts int
 					var err error
 					// TOC fetches are the most rate-limited part of the import.
 					// Retry with backoff instead of giving up after one retry,
 					// otherwise large shelf imports end with later books at 0
 					// chapters while the books themselves are already in the pool.
 					for attempt := 0; attempt < 3; attempt++ {
-						added, existed, err = s.fetchChaptersIntoPool(ctx, ck, scope, b, limit, body.IgnorePaid)
+						added, existed, conflicts, err = s.fetchChaptersIntoPool(ctx, ck, scope, b, limit, body.IgnorePaid)
 						if err == nil {
 							break
 						}
@@ -415,13 +457,18 @@ func (s *Server) handlePoolShelfImport(w http.ResponseWriter, r *http.Request) {
 					}
 					if added == 0 && existed == 0 {
 						mu.Lock()
-						failures[b.BookID] = "没有可读章节可导入（免费章节为空且未购任何付费章节）"
+						if conflicts > 0 {
+							failures[b.BookID] = fmt.Sprintf("没有导入任何章节：%d 个章节 ID 已归属其他书籍（上传书的目录会共用章节 ID，表现为全书 0 章）", conflicts)
+						} else {
+							failures[b.BookID] = "没有可读章节可导入（免费章节为空且未购任何付费章节）"
+						}
 						mu.Unlock()
 						continue
 					}
 					mu.Lock()
 					chapAdded += added
 					chapExisted += existed
+					chapConflict += conflicts
 					mu.Unlock()
 				}
 			}()
@@ -429,11 +476,43 @@ func (s *Server) handlePoolShelfImport(w http.ResponseWriter, r *http.Request) {
 		wg.Wait()
 	}
 
+	tplGenerated, tplHint := s.maybeAutoGenerateTemplate(ctx, acc, booksAdded)
 	s.writeJSON(w, http.StatusOK, map[string]any{
 		"ok":          true,
 		"books_added": booksAdded, "books_skipped": booksSkip,
-		"chapters_added": chapAdded, "chapters_existed": chapExisted, "failures": failures,
+		"chapters_added": chapAdded, "chapters_existed": chapExisted,
+		"chapters_conflict": chapConflict, "failures": failures,
+		"template_generated": tplGenerated, "template_hint": tplHint,
 	})
+}
+
+// maybeAutoGenerateTemplate 导入书籍后，若该账号还没有请求模板，就自动走
+// 一遍免抓包生成逻辑（阅读页取 psvts + UA 推导 appId）。成功与否不强绑
+// 本次导入结果：失败只记录日志并在响应里带提示，用户可以手动重试或改用
+// 抓包模板。含章节未导入（with_chapters=false）的导入同样适用——模板需要
+// 的只是书池里有一本书。
+func (s *Server) maybeAutoGenerateTemplate(ctx context.Context, acc *store.Account, booksAdded []string) (bool, string) {
+	_, payload, err := s.st.AccountSecrets(acc.ID)
+	if err != nil {
+		return false, ""
+	}
+	if len(payload) > 0 {
+		return false, "" // 已有专属模板，不动
+	}
+	genCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+	defer cancel()
+	pl, _, _, genErr := s.generateAccountTemplate(genCtx, acc, "")
+	if genErr == nil {
+		if saveErr := s.st.SavePayload(acc.ID, pl); saveErr != nil {
+			genErr = saveErr
+		}
+	}
+	if genErr != nil {
+		s.log.Warn("导入后自动生成阅读模板失败", "account", acc.ID, "err", genErr)
+		return false, genErr.Error()
+	}
+	s.log.Info("导入书籍后自动生成了阅读模板", "account", acc.ID)
+	return true, ""
 }
 
 type shelfImportBook struct {
@@ -447,12 +526,14 @@ type shelfImportBook struct {
 // into the chapter pool（账号视角，标题形如「书名 · 章节名」）。付费未购章节
 // (官方目录 price=-1 或 price>0 且 paid=0) 默认不写入——它们读不开；目录无法
 // 区分「已购/会员可读」，所以 ignorePaid=true 时由调用方显式声明不过滤。
-// 返回（新增数，已在池数）；重复导入时"已在池"不为零，不算失败。章节入库
-// 用单事务批量写：每章一条 autocommit 会把整本导入变成几千个写事务。
-func (s *Server) fetchChaptersIntoPool(ctx context.Context, ck map[string]string, accountID int64, b shelfImportBook, per int, ignorePaid bool) (int, int, error) {
+// 返回（新增数，已在池数，ID 冲突数）；重复导入时"已在池"不为零，不算失
+// 败。章节入库用单事务批量写：每章一条 autocommit 会把整本导入变成几千个
+// 写事务。冲突（章节 ID 已归属其他书）单独计数，上传书（CB_）目录复用时
+// 会大量出现，绝不能与「已在池」混记，否则用户看到导入成功却书籍 0 章。
+func (s *Server) fetchChaptersIntoPool(ctx context.Context, ck map[string]string, accountID int64, b shelfImportBook, per int, ignorePaid bool) (int, int, int, error) {
 	chs, err := s.chapterInfos(ctx, accountID, ck, b.BookID)
 	if err != nil {
-		return 0, 0, fmt.Errorf("拉取目录失败：%w", err)
+		return 0, 0, 0, fmt.Errorf("拉取目录失败：%w", err)
 	}
 	targets := make([]store.NewChapter, 0, len(chs))
 	for _, ch := range chs {
@@ -536,12 +617,6 @@ func (s *Server) handlePoolGet(w http.ResponseWriter, r *http.Request) {
 	delete(chapterCounts, "") // 无归属章节不参与书籍卡片展示
 	out["chapter_counts"] = chapterCounts
 	out["book_total"] = len(books)
-	tpl, err := s.st.GetDefaultTemplate()
-	if err != nil {
-		s.writeErr(w, http.StatusInternalServerError, "读取默认模板失败")
-		return
-	}
-	out["default_template"] = tpl
 	// 账号视角附带「顺序书单」进度：书单下标 bi / 章节下标 ci。书单顺序与
 	// books 返回顺序一致（专属在前、共享在后，各自按 sort_order），前端
 	// 据此为每本书标注已读/在读进度。共享视角不展示（进度是账号的）。
@@ -599,7 +674,17 @@ func (s *Server) handlePoolBookChapters(w http.ResponseWriter, r *http.Request) 
 			if ck, err := s.accountCookies(acc); err == nil {
 				ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 				defer cancel()
-				if chs, err := s.chapterInfos(ctx, view, ck, bookValue); err == nil {
+				var liveChs []weread.Chapter
+				callErr := s.authedCall(ctx, acc, ck, func() error {
+					chs2, infoErr := s.chapterInfos(ctx, acc.ID, ck, bookValue)
+					if infoErr != nil {
+						return infoErr
+					}
+					liveChs = chs2
+					return nil
+				})
+				if callErr == nil {
+					chs := liveChs
 					total := len(chs)
 					priced := 0
 					unpaid := make(map[string]bool, 16)
@@ -617,7 +702,7 @@ func (s *Server) handlePoolBookChapters(w http.ResponseWriter, r *http.Request) 
 					// 目录里已消失的条目不在 map 中（按未知处理）。
 					out["unpaid"] = unpaid
 				} else {
-					out["live_error"] = err.Error()
+					out["live_error"] = callErr.Error()
 				}
 			}
 		}
@@ -646,7 +731,15 @@ func (s *Server) handlePoolBookPrune(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
-	chs, err := s.chapterInfos(ctx, acc.ID, ck, bookValue)
+	var chs []weread.Chapter
+	err = s.authedCall(ctx, acc, ck, func() error {
+		chs2, infoErr := s.chapterInfos(ctx, acc.ID, ck, bookValue)
+		if infoErr != nil {
+			return infoErr
+		}
+		chs = chs2
+		return nil
+	})
 	if err != nil {
 		s.writeErr(w, http.StatusBadGateway, "拉取官方目录失败："+err.Error())
 		return
@@ -702,6 +795,10 @@ func (s *Server) handlePoolAdd(w http.ResponseWriter, r *http.Request) {
 	id, err := s.addLinkedPoolItem(body.Kind, body.Value, truncateRunes(strings.TrimSpace(body.Title), 60), body.BookID, scope)
 	if errors.Is(err, store.ErrPoolItemExists) {
 		s.writeErr(w, http.StatusConflict, kindLabel(body.Kind)+"中已存在该 ID")
+		return
+	}
+	if errors.Is(err, store.ErrChapterConflict) {
+		s.writeErr(w, http.StatusConflict, "该章节 ID 已归属其他书籍（上传书目录可能共用章节 ID）")
 		return
 	}
 	if err != nil {
@@ -921,34 +1018,10 @@ func (s *Server) handlePoolReset(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-// ---------- 账号指纹模板（全局请求基底） ----------
+// ---------- 账号指纹模板 ----------
 
-func (s *Server) handlePoolTemplate(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		Template *string `json:"template"` // null/空字符串 = 清除（使用内置模板）
-	}
-	if !s.decode(w, r, &body) {
-		return
-	}
-	if body.Template == nil || strings.TrimSpace(*body.Template) == "" {
-		if err := s.st.SetDefaultTemplate(""); err != nil {
-			s.writeErr(w, http.StatusInternalServerError, "清除默认模板失败")
-			return
-		}
-		s.writeJSON(w, http.StatusOK, map[string]any{"ok": true, "cleared": true, "template": ""})
-		return
-	}
-	normalized, err := validateDefaultTemplate(*body.Template)
-	if err != nil {
-		s.writeErr(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	if err := s.st.SetDefaultTemplate(normalized); err != nil {
-		s.writeErr(w, http.StatusInternalServerError, "保存默认模板失败")
-		return
-	}
-	s.writeJSON(w, http.StatusOK, map[string]any{"ok": true, "cleared": false, "template": normalized})
-}
+// 全局默认模板属旧契约：接口与存储读取已随全局模板 UI 一并删除
+// （缺陷 13），模板唯一来源是各账号保存的专属模板。
 
 func kindLabel(kind string) string {
 	if kind == store.KindChapter {

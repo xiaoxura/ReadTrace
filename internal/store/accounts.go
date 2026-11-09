@@ -91,7 +91,17 @@ func (s *Store) CreateAccount(a Account, cookies map[string]string, payload map[
 		pl = nil
 	}
 	ts := now()
-	res, err := s.db.Exec(`INSERT INTO accounts
+	// 建号与共享池归属迁移放进同一事务（缺陷 24）：旧无账号库升级时会跳过
+	// 共享池迁移（migrateSharedPoolOwnership 需要至少一个账号），遗留的
+	// account_id=0 行在创建首账号时在这里接管生效，无需等下次重启再迁移。
+	// 顺带复用迁移主路径的合并+改归属逻辑（adoptSharedPoolOwnership），不
+	// 另写一份；迁移失败则整个建号回滚，不留半套账号加半套池。
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`INSERT INTO accounts
 		(seq, name, vid, nickname, avatar, cookie_enc, payload_enc, status, last_error, last_check_at,
 		 default_minutes, daily_goal_minutes, tick_seconds, max_retries, retry_delay, book_id, book_title, chapter_id, chapter_title,
 		 mode, push_channel_id, created_at, updated_at)
@@ -102,7 +112,19 @@ func (s *Store) CreateAccount(a Account, cookies map[string]string, payload map[
 	if err != nil {
 		return 0, err
 	}
-	return res.LastInsertId()
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
+	// 首账号创建时 MIN(id) 即为新账号；如果早已有账号而 0 号共享行仍在
+	// （理论上不会，迁移在 Open 时已完成），同样安全地归属到第一个账号。
+	if err := migrateSharedPoolOwnership(tx); err != nil {
+		return 0, fmt.Errorf("归属共享书池遗留条目失败: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return id, nil
 }
 
 // UpdateAccount updates editable settings.
@@ -151,6 +173,54 @@ func (s *Store) SaveCookies(id int64, cookies map[string]string) error {
 	}
 	_, err = s.db.Exec(`UPDATE accounts SET cookie_enc = ?, updated_at = ? WHERE id = ?`, ck, now(), id)
 	return err
+}
+
+// SaveCookiesIfCurrentSkey 凭据 CAS（缺陷 03）：仅当账号当前存储的 wr_skey
+// 与 expectedSkey 一致时才把新凭据写入，否则不写。用于「结果到达时间不确定
+// 的续期/自动登录」的写回路径，防止旧请求的响应覆盖等待期间发生的新登录或
+// 换绑。事务内读出当前 cookie_enc → 解密取 wr_skey → 比对 → UPDATE。
+//
+// 边界处理：
+//   - 返回 written=false（nil）表示「已变更/无法证明一致，未写入」。
+//   - cookie_enc 解密失败（密钥轮换、损坏数据等）：读不出旧 skey 就无法
+//     证明仍旧一致，视为「已变更」处理，宁可不写也不覆盖不明状态的凭据，
+//     返回 false 与 nil，调用方只跳过写回，不算错误。
+//   - 预期值与库中值都为空字符串（账号本来就没有 skey）视为一致，允许
+//     一次全新写入（首次导入/自动登录的场景）。
+func (s *Store) SaveCookiesIfCurrentSkey(id int64, expectedSkey string, cookies map[string]string) (bool, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	var ckEnc []byte
+	err = tx.QueryRow(`SELECT cookie_enc FROM accounts WHERE id = ?`, id).Scan(&ckEnc)
+	if err == sql.ErrNoRows {
+		return false, fmt.Errorf("账号不存在")
+	}
+	if err != nil {
+		return false, err
+	}
+	if len(ckEnc) > 0 {
+		current := map[string]string{}
+		if err := s.openJSON(ckEnc, &current); err != nil {
+			return false, nil
+		}
+		if current["wr_skey"] != expectedSkey {
+			return false, nil
+		}
+	}
+	ck, err := s.sealJSON(cookies)
+	if err != nil {
+		return false, err
+	}
+	if _, err := tx.Exec(`UPDATE accounts SET cookie_enc = ?, updated_at = ? WHERE id = ?`, ck, now(), id); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // SavePayload replaces the captured read template.

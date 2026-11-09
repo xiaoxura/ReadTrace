@@ -35,6 +35,19 @@ func testEngineStore(t *testing.T) *store.Store {
 	return st
 }
 
+// addReadablePoolChapter 给账号的书池补「一本书 + 一个可用章节」。缺陷 05
+// 之后，custom 模式指定书籍且章节为空的运行要求书池里有该书的可用章节，
+// 起 Start 的测试 fixture 统一走这里。
+func addReadablePoolChapter(t *testing.T, st *store.Store, accountID int64, book, chapter string) {
+	t.Helper()
+	if _, err := st.AddPoolItem(store.KindBook, book, book, accountID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.AddChapterItem(accountID, book, chapter, book+" · 第一章", 300); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestLoopPreservesCumulativeProgress(t *testing.T) {
 	for _, mode := range []string{"complete", "stop", "retry", "renew"} {
 		t.Run(mode, func(t *testing.T) {
@@ -61,7 +74,9 @@ func TestLoopPreservesCumulativeProgress(t *testing.T) {
 						headers.Set("Set-Cookie", "wr_skey=new")
 					} else {
 						reads++
-						if mode == "renew" && reads == 2 { body = `{"succ":0,"errCode":-2012}` }
+						if mode == "renew" && reads == 2 {
+							body = `{"succ":0,"errCode":-2012}`
+						}
 						if mode == "retry" && reads > 1 && reads <= 6 {
 							body = `{"succ":0,"errCode":57}`
 						}
@@ -88,8 +103,23 @@ func TestLoopPreservesCumulativeProgress(t *testing.T) {
 					if got.Status != "stopped" || got.ElapsedSeconds >= 90 {
 						t.Fatalf("stopped result: %+v", got)
 					}
-				} else if got.Status != "success" || got.ElapsedSeconds != 90 || got.SuccessTicks != 3 {
+					// 缺陷 04：停止发生在 35s 墙钟处，记录值只能 ≤ 已覆盖
+					// 的真实墙钟（误差 1 秒以内），不再是预记的 300/90。
+					if got.ElapsedSeconds > 36 {
+						t.Fatalf("stop recorded more than covered wall clock: %+v", got)
+					}
+				} else if got.Status != "success" || got.ElapsedSeconds != 90 {
 					t.Fatalf("cumulative result: %+v", got)
+				}
+				if mode != "stop" {
+					// 缺陷 04 语义变化：首个成功心跳按运行开始时间起算
+					// 覆盖≈0，目标 90s 要按墙钟长跑；单步覆盖在 0.9~1.0
+					// 个 interval 之间（抖动值封顶 interval），因此成功
+					// 心跳次数在 4~5 之间由随机抖动决定（旧语义预记完整
+					// 间隔，定死 3 次）。
+					if got.SuccessTicks < 4 || got.SuccessTicks > 5 {
+						t.Fatalf("success ticks = %d (want 4~5 under wall-clock accounting)", got.SuccessTicks)
+					}
 				}
 				if mode == "retry" && got.FailedTicks != 5 {
 					t.Fatalf("failed ticks = %d", got.FailedTicks)

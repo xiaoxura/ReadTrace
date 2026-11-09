@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -68,5 +69,92 @@ func TestGenerateAccountPayloadWithoutCapture(t *testing.T) {
 	s.handleAccountGeneratePayload(rec2, req2)
 	if rec2.Code != http.StatusBadRequest {
 		t.Fatalf("generate with empty pool status=%d, want 400", rec2.Code)
+	}
+}
+
+// 导入书籍时，账号没有请求模板就自动走一遍免抓包生成。
+func TestImportAutoGeneratesTemplate(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/web/book/chapterInfos", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":{"bookId":"43208843","updated":[
+			{"chapterUid":2,"chapterIdx":2,"title":"第一章 出发","wordCount":3000}]}}`))
+	})
+	mux.HandleFunc("/web/reader/", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`<script>window.__INITIAL_STATE__={"reader":{"psvts":"psv-auto","pclts":"pc-auto"}};</script>`))
+	})
+	s := newCheckTestServer(t, mux)
+	id := startTestAccount(t, s)
+
+	rec := httptest.NewRecorder()
+	body := fmt.Sprintf(`{"account_id":%d,"with_chapters":true,"chapters_per_book":0,"books":[{"book_id":"43208843","title":"测试书","author":"作者","cover":""}]}`, id)
+	s.handlePoolShelfImport(rec, httptest.NewRequest(http.MethodPost, "/api/pool/shelf/import", strings.NewReader(body)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("import status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		TemplateGenerated bool   `json:"template_generated"`
+		TemplateHint      string `json:"template_hint"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if !out.TemplateGenerated {
+		t.Fatalf("template not auto-generated: %s", rec.Body.String())
+	}
+	_, payload, err := s.st.AccountSecrets(id)
+	if err != nil || payload["ps"] != "psv-auto" || payload["pc"] != "pc-auto" {
+		t.Fatalf("auto template payload=%v err=%v", payload, err)
+	}
+
+	// 已有模板的账号不再重复生成。
+	rec2 := httptest.NewRecorder()
+	s.handlePoolShelfImport(rec2, httptest.NewRequest(http.MethodPost, "/api/pool/shelf/import",
+		strings.NewReader(fmt.Sprintf(`{"account_id":%d,"with_chapters":false,"books":[{"book_id":"other","title":"第二本"}]}`, id))))
+	var out2 struct {
+		TemplateGenerated bool `json:"template_generated"`
+	}
+	_ = json.Unmarshal(rec2.Body.Bytes(), &out2)
+	if out2.TemplateGenerated {
+		t.Fatal("template should not be regenerated when it already exists")
+	}
+}
+
+// 「查看当前模板」：GET 返回保存的 payload（不含 Cookie）。
+func TestGetAccountPayloadReturnsSavedTemplate(t *testing.T) {
+	s := newCheckTestServer(t, http.NewServeMux())
+	id := startTestAccount(t, s)
+	if err := s.st.SavePayload(id, map[string]any{"appId": "wb1", "b": "x", "c": "y"}); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/accounts/x/payload", nil)
+	req.SetPathValue("id", strconv.FormatInt(id, 10))
+	rec := httptest.NewRecorder()
+	s.handleAccountPayloadGet(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var out struct {
+		HasPayload bool           `json:"has_payload"`
+		Payload    map[string]any `json:"payload"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if !out.HasPayload || out.Payload["appId"] != "wb1" {
+		t.Fatalf("payload=%+v", out)
+	}
+
+	// 空账号：has_payload=false 且不带 payload。
+	empty := startTestAccount(t, s)
+	req2 := httptest.NewRequest(http.MethodGet, "/api/accounts/x/payload", nil)
+	req2.SetPathValue("id", strconv.FormatInt(empty, 10))
+	rec2 := httptest.NewRecorder()
+	s.handleAccountPayloadGet(rec2, req2)
+	var out2 map[string]any
+	if err := json.Unmarshal(rec2.Body.Bytes(), &out2); err != nil {
+		t.Fatal(err)
+	}
+	if _, has := out2["payload"]; has || out2["has_payload"] != false {
+		t.Fatalf("empty account payload=%v", out2)
 	}
 }

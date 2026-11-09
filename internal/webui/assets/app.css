@@ -365,8 +365,24 @@ h1, h2, h3, h4, p { margin: 0; }
 .textarea { min-height: 120px; resize: vertical; font-family: var(--mono); font-size: 12px; line-height: 1.6; }
 .hint { font-size: 11.5px; color: var(--muted); line-height: 1.55; }
 .hint code { font-family: var(--mono); font-size: 11px; background: var(--surface-3); padding: 1px 5px; border-radius: 5px; color: var(--text-2); }
+/* 缺陷 06：字段级错误就地反馈 —— 输入框红框 + 字段容器末尾一行 red 文案。
+   由 util.js 的 setFieldError（写入）与 clearFieldErrors（清空）读写，
+   拒绝提交时用 focusFirstError 滚动定位到首错；toast 同时保留为辅助说明。 */
+.field.invalid .input, .field.invalid .select, .field.invalid .textarea {
+  border-color: var(--red);
+  box-shadow: 0 0 0 3px var(--red-soft);
+}
+.field .field-error { font-size: 11.5px; color: var(--red); line-height: 1.5; overflow-wrap: anywhere; }
 .row { display: flex; gap: 12px; align-items: center; }
 .row > * { min-width: 0; }
+/* 缺陷 02：模板操作组。原 .row 的 min-width:0 允许按钮被压缩到文字宽度
+   以下，配合按钮的 white-space:nowrap，文字溢出到相邻按钮上 → 点「生成
+   模板」的状态文字（“免抓包）”）实际命中了「保存模板」。允许换行的组 +
+   按钮 flex:none：按钮永不低于自身文字宽度；状态文案占满整行落到按钮
+   下方，不再与任何按钮重叠。 */
+.tpl-actions { display: flex; flex-wrap: wrap; gap: 9px 10px; align-items: center; margin-top: 8px; }
+.tpl-actions .btn { flex: none; }
+.tpl-actions .hint { flex: 1 1 100%; min-width: 0; margin-top: 2px; }
 .row .grow { flex: 1; }
 .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 
@@ -644,9 +660,19 @@ h1, h2, h3, h4, p { margin: 0; }
 }
 
 /* 底部翻页工具条 */
-.table-pager { display: flex; align-items: center; gap: 9px; margin-top: 12px; }
-.table-pager-gap { flex: 1; }
+/* 缺陷 01：分页条常被放进 overflow:hidden 的卡片，强制单行放不下时按钮
+   会被裁出视口且触摸不可达（书池 / 书架 / 阅读记录三处复现）。整条允许
+   换行重排：合计/条数提示留在首行，上一页 / 下一页与页码组折到后续行时
+   仍完整可见、可点；表格自身的局部横向滚动（.table-wrap）保持不变。 */
+.table-pager { display: flex; align-items: center; gap: 9px; row-gap: 7px; margin-top: 12px; flex-wrap: wrap; }
+.table-pager-gap { flex: 1; min-width: 2px; }
 .table-pager .hint { white-space: nowrap; }
+.table-pager .btn { flex: none; } /* 翻页按钮永不压缩到文字宽度以下 */
+@media (max-width: 480px) {
+  /* 收紧间距与内边距，保证「上一页 / 下一页」和页码组在 ~250px 可用宽内排得下 */
+  .table-pager { gap: 6px; }
+  .table-pager .btn-sm { padding: 6px 9px; }
+}
 
 /* 推送渠道 / 定时任务表格：表头与内容统一居中 */
 .push-table th, .push-table td,
@@ -657,6 +683,10 @@ h1, h2, h3, h4, p { margin: 0; }
 .shelf-table th, .shelf-table td { text-align: center; vertical-align: middle; }
 .runs-table .progress-cell { justify-content: center; }
 .runs-table .table td { white-space: normal; }
+
+/* 书架审查行：整行可点选（未付费禁用行保持默认光标） */
+.shelf-table tbody tr[data-shelf]:not([data-blocked="1"]) { cursor: pointer; }
+.shelf-table tbody tr[data-shelf]:hover { background: var(--surface-2); }
 
 /* 模态框表格的滚动兜底 */
 .modal-body-scroll { max-height: 52vh; overflow-y: auto; }
@@ -900,6 +930,10 @@ h1, h2, h3, h4, p { margin: 0; }
 .modal-foot {
   display: flex;
   justify-content: flex-end;
+  /* 缺陷 07：动作组允许换行（右对齐逐行推进）。危险按钮（删除）在 markup
+     中排在首位、保持最左不计一行时；取消 / 保存等肯定动作折到第二行仍
+     靠右，主/次色按钮的视觉权重自然延续。320px 下弹窗内不再左溢出裁切。 */
+  flex-wrap: wrap;
   gap: 9px;
   margin: 22px -24px -24px;
   padding: 14px 24px 18px;
@@ -909,10 +943,16 @@ h1, h2, h3, h4, p { margin: 0; }
   bottom: -24px;
   z-index: 3;
 }
+.modal-foot .btn { flex: none; }
 
 /* ---------- toasts ---------- */
 
 .toasts { position: fixed; right: 20px; bottom: 20px; z-index: 300; display: flex; flex-direction: column; gap: 9px; max-width: 360px; }
+/* 缺陷 06：存在模态弹窗时 Toast 统一挪到顶部 —— modal-foot 是 sticky 固定
+   在弹窗底部的动作区，底部 Toast（z-index 更高）会盖住保存 / 删除按钮的
+   命中区（报告实测重叠约 29px）。桌面与手机端使用同一 :has() 规则，避免
+   出现另一套断点。手机端的 left/right 16px 位移在下方媒体查询里仍然成立。 */
+body:has(.modal-mask) .toasts { top: 16px; bottom: auto; }
 .toast {
   display: flex;
   gap: 10px;
@@ -1003,7 +1043,12 @@ h1, h2, h3, h4, p { margin: 0; }
   font-size: 12px;
   display: none;
 }
-.auth-error.show { display: flex; gap: 8px; align-items: center; animation: shake .3s; }
+.auth-error.show { display: flex; gap: 8px; align-items: flex-start; animation: shake .3s; }
+/* 缺陷 04：内联 SVG 没有固有 CSS 尺寸时会按替换元素默认尺寸渲染（实测
+   被放大到约 201px，把错误文案挤成 39px 窄列）。约束为与正文匹配的 16px
+   并禁止 flex 放大 / 收缩；文案 span 占据剩余宽度自然换行，表单高度稳定。 */
+.auth-error svg { width: 16px; height: 16px; flex: none; margin-top: 2px; }
+.auth-error span { flex: 1; min-width: 0; }
 
 /* ---------- menus ---------- */
 

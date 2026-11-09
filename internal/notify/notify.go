@@ -7,10 +7,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -80,7 +82,7 @@ func (s *Sender) Send(ctx context.Context, ch store.PushChannel, title, content 
 func doRequest(client *http.Client, req *http.Request) ([]byte, int, error) {
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, redactTransportError(err)
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 512<<10))
@@ -287,7 +289,7 @@ func (s *Sender) feishu(ctx context.Context, cfg map[string]string, title, conte
 		"msg_type": "text", "content": map[string]any{"text": "【" + title + "】\n" + content},
 	})
 	if err != nil {
-		return err
+		return redactSecret(err, webhookSecret(webhook))
 	}
 	return checkFeishu(body)
 }
@@ -307,7 +309,7 @@ func (s *Sender) weCom(ctx context.Context, cfg map[string]string, title, conten
 	}
 	body, err := s.postJSON(ctx, webhook, payload)
 	if err != nil {
-		return err
+		return redactSecret(err, webhookSecret(webhook))
 	}
 	return checkCode(body, "WeCom", "errcode", 0, "errmsg")
 }
@@ -430,6 +432,27 @@ func validHostLabel(s string) bool {
 	return true
 }
 
+// webhookSecret 提取随 webhook URL 传递的凭据段，供 redactSecret 兜底：
+// 飞书（/open-apis/bot/v2/hook/<key>）与企业微信（/cgi-bin/webhook/<key>）
+// 的 key 都在路径末段。钉钉的 access_token 在查询串、路径只是 robot/send，
+// 末段不含凭据，交给传输层 redactTransportError 的查询清洗覆盖即可。
+func webhookSecret(endpoint string) string {
+	s := strings.TrimSpace(endpoint)
+	if i := strings.IndexByte(s, '?'); i >= 0 {
+		s = s[:i]
+	}
+	// 去掉 scheme://，剩余无路径段（如裸主机名）说明凭据不在路径上。
+	if i := strings.Index(s, "//"); i >= 0 {
+		s = s[i+2:]
+	}
+	if i := strings.LastIndexByte(s, '/'); i >= 0 {
+		s = s[i+1:]
+	} else {
+		s = ""
+	}
+	return s
+}
+
 func redactSecret(err error, secret string) error {
 	if err == nil {
 		return nil
@@ -441,6 +464,60 @@ func redactSecret(err error, secret string) error {
 		}
 	}
 	return fmt.Errorf("%s", message)
+}
+
+// redactTransportError 统一清洗传输层失败：client.Do 的网络错误是 *url.Error，
+// 携带完整请求 URL，而 webhook 密钥就藏在 URL 里（钉钉 access_token、Gotify
+// token 在查询串）。这里保留「POST "URL": 原因」的结构让错误对用户可读，但把
+// 请求 URL 重建成 scheme://host/path?参数=[REDACTED]：查询串的值全部换占位符，
+// userinfo 一并去掉。路径里藏 key 的渠道（飞书/企业微信/telegram、ServerChan
+// 等）再由各渠道把自己的凭据传给 redactSecret 兜底，两层叠加后 13 个渠道的
+// 传输失败都不会把密钥带进推送测试响应与引擎/检测器日志。
+func redactTransportError(err error) error {
+	var urlErr *url.Error
+	if !errors.As(err, &urlErr) || urlErr.URL == "" {
+		return err
+	}
+	// 真 client.Do 会对传输层抛出的 *url.Error 再包一层（代理/重试链路可能
+	// 嵌套更多层），取最里层的 Op/URL/Err 做脱敏，避免内层 URL 原样漏出。
+	for {
+		var nested *url.Error
+		if !errors.As(urlErr.Err, &nested) || nested.URL == "" {
+			break
+		}
+		urlErr = nested
+	}
+	op, reason := urlErr.Op, urlErr.Err
+	u, perr := url.Parse(urlErr.URL)
+	if perr != nil || u == nil {
+		return fmt.Errorf("%s \"[REDACTED]\": %v", op, reason)
+	}
+	redacted := "[REDACTED]"
+	if u.Scheme != "" {
+		var b strings.Builder
+		b.WriteString(u.Scheme)
+		b.WriteString("://")
+		if u.User != nil {
+			b.WriteString("[REDACTED]@")
+		}
+		b.WriteString(u.Host)
+		b.WriteString(u.EscapedPath())
+		if names := u.Query(); len(names) > 0 {
+			keys := make([]string, 0, len(names))
+			for k := range names {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			values := make([]string, 0, len(keys))
+			for _, k := range keys {
+				values = append(values, url.QueryEscape(k)+"=[REDACTED]")
+			}
+			b.WriteString("?")
+			b.WriteString(strings.Join(values, "&"))
+		}
+		redacted = b.String()
+	}
+	return fmt.Errorf("%s %q: %v", op, redacted, reason)
 }
 
 func responseObject(body []byte, channel string) (map[string]json.RawMessage, error) {

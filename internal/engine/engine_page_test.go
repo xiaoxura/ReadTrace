@@ -22,6 +22,8 @@ func TestCustomPageProgressCommitsOnlyAfterSuccess(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		// 缺陷 05：custom 指定书籍且章节为空需要书池可用章节。
+		addReadablePoolChapter(t, st, id, "book", "chapter")
 		acc, err := st.GetAccount(id)
 		if err != nil {
 			t.Fatal(err)
@@ -56,11 +58,21 @@ func TestCustomPageProgressCommitsOnlyAfterSuccess(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got.Status != "success" || len(pages) != 3 {
+		// 缺陷 04：目标 60s、首个成功心跳计账≈0，之后每步覆盖 0.9~1.0 个
+		// interval，因此需要 2~3 次成功才达标（旧语义预记完整间隔，2 次即
+		// 定死达标）；加失败的第一页共 3~4 页请求。
+		if got.Status != "success" || len(pages) < 3 || len(pages) > 4 {
 			t.Fatalf("run=%+v pages=%+v", got, pages)
 		}
-		if pages[0] != pages[1] || pages[2].pr != pages[1].pr+1 || pages[2].co <= pages[1].co {
-			t.Fatalf("failed page was committed or success did not advance: %+v", pages)
+		// 失败的第一页与首次成功复用同一 page candidate；之后的每个成功
+		// 页都相对前一页推进 co/pr。
+		if pages[0] != pages[1] {
+			t.Fatalf("failed page was not reused: %+v", pages)
+		}
+		for i := 2; i < len(pages); i++ {
+			if pages[i].pr != pages[i-1].pr+1 || pages[i].co <= pages[i-1].co {
+				t.Fatalf("success page %d did not advance: %+v", i, pages)
+			}
 		}
 	})
 }
@@ -73,6 +85,8 @@ func TestTransientRenewalAfterRead401DoesNotExpireAccount(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		// 缺陷 05：custom 指定书籍且章节为空需要书池可用章节。
+		addReadablePoolChapter(t, st, id, "book", "chapter")
 		acc, err := st.GetAccount(id)
 		if err != nil {
 			t.Fatal(err)

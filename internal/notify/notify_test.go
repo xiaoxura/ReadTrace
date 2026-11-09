@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -16,6 +17,9 @@ import (
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+// secretLiteral 是 19 的传输失败抹敏用例统一假想凭据（不得出现在错误串里）。
+const secretLiteral = "LOCAL_FAKE_SECRET"
 
 func testSender(body string, status int, inspect func(*http.Request)) *Sender {
 	return &Sender{HTTP: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
@@ -208,5 +212,98 @@ func TestServerChan3EndpointAndUID(t *testing.T) {
 	s.HTTP.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) { return nil, errors.New(req.URL.String()) })
 	if err := s.Send(context.Background(), ch, "title", "body"); err == nil || strings.Contains(err.Error(), "secret") {
 		t.Fatalf("sendkey leaked: %v", err)
+	}
+}
+
+// TestTransportFailureRedactsWebhookSecret 转正归档探针
+// TestReviewProbeWebhookSecretInError（缺陷 19）：本地假 RoundTripper 按
+// client.Do 的真实失败形态（*url.Error 携带完整请求 URL）注入传输失败，
+// 对 13 个渠道断言错误串不含任何凭据值；密钥在路径/查询串里的渠道还要保留
+// 「POST "https://host/路径": 原因」的可读结构。
+func TestTransportFailureRedactsWebhookSecret(t *testing.T) {
+	type tc struct {
+		kind     string
+		config   map[string]string
+		readable bool // assert "Post \"https://...\"": 前缀可读
+	}
+	tests := []tc{
+		// 凭据在 JSON body 或配置字段里的渠道，URL 本身无密钥。
+		{"pushplus", map[string]string{"token": secretLiteral}, false},
+		{"wxpusher", map[string]string{"spt": secretLiteral}, false},
+		{"bark", map[string]string{"device_key": secretLiteral, "server": "https://day.example"}, false},
+		{"pushdeer", map[string]string{"pushkey": secretLiteral}, false},
+		{"ntfy", map[string]string{"topic": "topic", "token": secretLiteral, "server": "https://ntfy.example"}, false},
+		// 凭据在 URL 路径里的渠道。
+		{"telegram", map[string]string{"bot_token": secretLiteral, "chat_id": "123"}, false},
+		{"serverchan", map[string]string{"sendkey": secretLiteral}, false},
+		{"feishu", map[string]string{"webhook_url": "https://feishu.example/open-apis/bot/v2/hook/" + secretLiteral}, true},
+		{"wework", map[string]string{"webhook_url": "https://qyapi.weixin.qq.com/cgi-bin/webhook/" + secretLiteral}, true},
+		// 凭据在 URL 查询串里的渠道。
+		{"gotify", map[string]string{"server": "https://gotify.example", "token": secretLiteral}, true},
+		{"dingtalk", map[string]string{"webhook_url": "https://oapi.dingtalk.com/robot/send?access_token=" + secretLiteral}, true},
+		{"serverchan3", map[string]string{"uid": "user-1", "sendkey": secretLiteral}, false},
+		{"apprise", map[string]string{"server": "https://apprise.example", "token": secretLiteral}, false},
+	}
+	for _, test := range tests {
+		s := New()
+		s.HTTP.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return nil, &url.Error{Op: "Post", URL: req.URL.String(), Err: errors.New("local transport failure")}
+		})
+		err := s.Send(context.Background(), store.PushChannel{Type: test.kind, Enabled: true, Config: test.config}, "title", "body")
+		if err == nil {
+			t.Fatalf("%s: 应返回传输失败错误", test.kind)
+		}
+		if msg := err.Error(); strings.Contains(msg, secretLiteral) {
+			t.Fatalf("%s: 错误泄漏密钥: %s", test.kind, msg)
+		} else if test.readable && !strings.Contains(msg, `Post "https://`) {
+			t.Fatalf("%s: 错误应保留可读结构: %s", test.kind, msg)
+		}
+	}
+}
+
+// TestTransportFailureKeepsReadableShape 固化三类 webhook 渠道脱敏后的输出
+// 形态：主机与路径保留、密钥变占位符、原因文本保留（用户能看出是传输失败）。
+func TestTransportFailureKeepsReadableShape(t *testing.T) {
+	tests := []struct {
+		kind, webhook, want, notWant string
+	}{
+		{"wework", "https://qyapi.weixin.qq.com/cgi-bin/webhook/" + secretLiteral,
+			`Post "https://qyapi.weixin.qq.com/cgi-bin/webhook/[REDACTED]": local transport failure`,
+			"LOCAL_FAKE_SECRET"},
+		{"feishu", "https://feishu.example/open-apis/bot/v2/hook/" + secretLiteral,
+			`Post "https://feishu.example/open-apis/bot/v2/hook/[REDACTED]": local transport failure`,
+			"LOCAL_FAKE_SECRET"},
+		{"dingtalk", "https://oapi.dingtalk.com/robot/send?access_token=" + secretLiteral,
+			`Post "https://oapi.dingtalk.com/robot/send?access_token=[REDACTED]": local transport failure`,
+			"LOCAL_FAKE_SECRET"},
+	}
+	for _, test := range tests {
+		s := New()
+		s.HTTP.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return nil, &url.Error{Op: "Post", URL: req.URL.String(), Err: errors.New("local transport failure")}
+		})
+		err := s.Send(context.Background(), store.PushChannel{
+			Type: test.kind, Enabled: true, Config: map[string]string{"webhook_url": test.webhook},
+		}, "title", "body")
+		if err == nil {
+			t.Fatalf("%s: 应返回错误", test.kind)
+		}
+		if msg := err.Error(); msg != test.want {
+			t.Fatalf("%s: got %q want %q", test.kind, msg, test.want)
+		}
+	}
+}
+
+// TestWebhookSecretCoversFeishuWeWorkPathKey 校验 webhookSecret 的取值与
+// 边界：钉钉路径无凭据不误报，空串不参与替换。
+func TestWebhookSecretCoversFeishuWeWorkPathKey(t *testing.T) {
+	if got := webhookSecret("https://qyapi.weixin.qq.com/cgi-bin/webhook/KEY123"); got != "KEY123" {
+		t.Fatalf("webhookSecret = %q", got)
+	}
+	if got := webhookSecret("https://oapi.dingtalk.com/robot/send?access_token=KEY123"); got != "send" {
+		t.Fatalf("dingtalk path key = %q", got)
+	}
+	if got := webhookSecret("https://feishu.example"); got != "" {
+		t.Fatalf("bare host = %q", got)
 	}
 }

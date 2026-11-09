@@ -88,6 +88,60 @@ export function statusBadge(status, running = false) {
   }
 }
 
+/* ---------- 定时时长与字段级校验（缺陷 06 / 08 共享逻辑） ---------- */
+
+// 读原始输入解析分钟数：仅 1~1440 的整数有效。空串、0、0.5、"3e2"、
+// 越界（1441+）、非数字一律返回 null —— 绝不静默回退默认 30（缺陷 08）。
+// 新建 / 编辑定时任务共用这一个函数；默认值应体现在输入框的 value / placeholder。
+export function parseDurationMinutes(raw) {
+  const text = String(raw ?? '').trim();
+  if (!/^\d+$/.test(text)) return null;
+  return Number.isSafeInteger(Number(text)) && Number(text) >= 1 && Number(text) <= 1440
+    ? Number(text)
+    : null;
+}
+
+// 在字段容器（closest('.field')）就地标注错误：容器加 .invalid（红框）+
+// 末尾追加一行 inline 文案；控件重新输入时自动解除该字段错误态。
+// 返回字段容器；控件不在 .field 内时返回 null。
+export function setFieldError(control, message) {
+  const field = control?.closest?.('.field');
+  if (!field) return null;
+  field.classList.add('invalid');
+  let hint = $('.field-error', field);
+  if (!hint) {
+    hint = document.createElement('div');
+    hint.className = 'field-error';
+    field.appendChild(hint);
+  }
+  hint.textContent = message;
+  control.addEventListener('input', () => {
+    field.classList.remove('invalid');
+    hint.remove();
+  }, { once: true });
+  return field;
+}
+
+// 清空 scope 内全部字段错误态（提交前统一重置，避免残留旧提示）。
+export function clearFieldErrors(scope = document) {
+  $$('.field.invalid', scope).forEach((field) => {
+    field.classList.remove('invalid');
+    $('.field-error', field)?.remove();
+  });
+}
+
+// 拒绝提交时定位首个错误字段（缺陷 06）：滚动到视域中心并把焦点交给其
+// 中控件；返回是否成功定位。
+export function focusFirstError(scope = document) {
+  const field = $('.field.invalid', scope);
+  const control = field && $('.input, .select, .textarea', field);
+  if (!control) return false;
+  control.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  control.focus({ preventScroll: true });
+  return true;
+}
+
+/* ---------- cron 解读 ---------- */
 export function humanCron(expr) {
   const raw = String(expr || '').trim();
   const f = raw.split(/\s+/);
@@ -153,6 +207,10 @@ export function unlockScroll() {
   if (dialogDepth === 0) document.body.style.overflow = '';
 }
 
+// 弹窗栈：只有栈顶弹窗响应 Escape，防止一次按键同时关掉确认框与
+// 底层编辑弹窗（未保存内容也随之丢）。走 openModal 的都在同一栈里。
+const modalStack = [];
+
 export function openModal({ title, subtitle = '', body = '', footer = '', wide, narrow, onClose, onMount }) {
   const mask = document.createElement('div');
   mask.className = 'modal-mask';
@@ -177,16 +235,32 @@ export function openModal({ title, subtitle = '', body = '', footer = '', wide, 
     mask,
   ).filter((el) => el.offsetParent !== null);
 
+  const entry = { mask, focusables };
+  modalStack.push(entry);
+
   const close = () => {
     if (!mask.isConnected) return;
+    // 先出栈再隐藏，保证 onClose 期间再开新弹窗时栈序正确。
+    const idx = modalStack.indexOf(entry);
+    if (idx >= 0) modalStack.splice(idx, 1);
     mask.remove();
     unlockScroll();
     document.removeEventListener('keydown', onKey);
-    previouslyFocused?.focus?.();
+    // 焦点恢复（缺陷 05）：优先交还给「打开本弹窗时」的 document.activeElement
+    //（confirmDialog 场景即下层弹窗里的触发控件，例如底部「删除」按钮），
+    // preventScroll 保住父弹窗滚动位置不再跳回顶；触发控件已断开连接才
+    // 回退到下层弹窗首个可聚焦元素，最后才是打开前的元素。
+    const below = modalStack[modalStack.length - 1];
+    const opener = previouslyFocused?.isConnected ? previouslyFocused : null;
+    if (opener) opener.focus({ preventScroll: true });
+    else if (below && below.mask.isConnected) below.focusables()[0]?.focus?.();
+    else previouslyFocused?.focus?.();
     onClose?.();
   };
   const onKey = (e) => {
     if (e.key === 'Escape') {
+      // 只在自己位于栈顶时关自己；下层弹窗不响应这次按键。
+      if (modalStack[modalStack.length - 1] !== entry) return;
       close();
       return;
     }

@@ -10,7 +10,6 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	"readtrace/internal/checker"
-	"readtrace/internal/store"
 )
 
 func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
@@ -24,16 +23,15 @@ func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s.writeJSON(w, http.StatusOK, map[string]any{
-		"site_name":        s.siteName(),
-		"timezone":         s.timezone().String(),
-		"password_set":     hash != "",
-		"version":          s.version,
-		"go_version":       runtime.Version(),
-		"uptime_seconds":   int(time.Since(s.started).Seconds()),
-		"started_at":       s.started.Unix(),
-		"check_interval":   interval,
-		"settings":         all,
-		"default_template": mustSetting(s.st, store.KeyDefaultReadPayload),
+		"site_name":      s.siteName(),
+		"timezone":       s.timezone().String(),
+		"password_set":   hash != "",
+		"version":        s.version,
+		"go_version":     runtime.Version(),
+		"uptime_seconds": int(time.Since(s.started).Seconds()),
+		"started_at":     s.started.Unix(),
+		"check_interval": interval,
+		"settings":       all,
 	})
 }
 

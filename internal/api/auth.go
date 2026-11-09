@@ -1,6 +1,7 @@
 package api
 
 import (
+	"crypto/subtle"
 	"net/http"
 	"strings"
 	"sync"
@@ -18,7 +19,45 @@ const (
 
 	sessionCookieName = "readtrace_session"
 	sessionTTL        = 30 * 24 * time.Hour
+
+	appHeader = "X-Requested-With"
+	appValue  = "readtrace"
 )
+
+// sameAppClient 判断请求是否携带本应用标记：前端 api.js 的 fetch 统一带上
+// X-Requested-With，浏览器原生 HTML form 无法设置该自定义头，据此阻断表单提交。
+func sameAppClient(r *http.Request) bool {
+	return subtle.ConstantTimeCompare([]byte(r.Header.Get(appHeader)), []byte(appValue)) == 1
+}
+
+// authWriteGuard wraps the three public auth-write routes (setup / login /
+// logout). They skip the session check in s.auth, so the guard applies the
+// same application-header rule plus a cross-origin check on top:
+//   - X-Requested-With must be present (the frontend fetch always sends it);
+//   - a present Origin must be same-origin or on the allowedHosts list;
+//   - the request must declare a JSON body (forms cannot forge one).
+//
+// 没有 Origin 的非浏览器调用（如 curl）不依赖此校验，因不构成表单 CSRF，
+// 允许通过。浏览器对非 GET/HEAD 的 fetch（包括同源）总是附带 Origin。
+func (s *Server) authWriteGuard(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !sameAppClient(r) {
+			s.writeErr(w, http.StatusForbidden, "非法请求")
+			return
+		}
+		if origin := strings.TrimSpace(r.Header.Get("Origin")); origin != "" &&
+			!originAllowed(origin, r, s.allowedHosts) {
+			s.writeErr(w, http.StatusForbidden, "拒绝跨站请求")
+			return
+		}
+		// 原生表单无法把自己的 Content-Type 改成 JSON，这里要求显式 JSON 声明。
+		if mediaTypeBase(r.Header.Get("Content-Type")) != "application/json" {
+			s.writeErr(w, http.StatusUnsupportedMediaType, "请求体必须是 JSON 格式")
+			return
+		}
+		next(w, r)
+	}
+}
 
 func sessionID(r *http.Request) string {
 	c, err := r.Cookie(sessionCookieName)

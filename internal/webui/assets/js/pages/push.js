@@ -52,6 +52,8 @@ export async function renderPush(ctx) {
   try {
     await refreshChannels();
   } catch (e) {
+    // 先守卫后渲染：路由已切换时旧请求的失败响应不写共享 root。
+    if (!ctx.isActive()) return;
     renderError(root, e, { onRetry: () => ctx.reload() });
     return;
   }

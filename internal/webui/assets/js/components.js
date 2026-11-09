@@ -5,6 +5,7 @@ import { runStatusBadge } from './helpers.js';
 import {
   $, $$, escapeHtml, openModal, confirmDialog, toast, fmtMinutes, fmtClock, fmtTime, humanCron,
   copyText, debounce, setLoading, initials, lockScroll, unlockScroll,
+  parseDurationMinutes, setFieldError, clearFieldErrors, focusFirstError,
 } from './util.js';
 
 export function avatarHTML(acc, size = 46) {
@@ -77,11 +78,9 @@ export function startRunDialog({ accountId = 0, onDone } = {}) {
   const minutesInput = $('#run-minutes', mask);
   const preview = $('[data-daily-preview]', mask);
   const btn = $('[data-start]', mask);
-  const validMinutes = () => {
-    const raw = minutesInput.value.trim();
-    const value = Number(raw);
-    return raw !== '' && Number.isInteger(value) && value >= 1 && value <= 1440 ? value : null;
-  };
+  // 与定时任务（缺陷 08）共用同一解析函数：空串/0/越界/非整数都视为无
+  // 效，交给 toast 提示，不做静默回退。
+  const validMinutes = () => parseDurationMinutes(minutesInput.value);
   const updateChips = () => {
     $$('.chip', mask).forEach((chip) => chip.classList.toggle('active', Number(chip.dataset.min) === validMinutes()));
   };
@@ -177,11 +176,33 @@ export function startRunDialog({ accountId = 0, onDone } = {}) {
 
 export function qrLoginDialog({ onDone } = {}) {
   let flowId = null;
-  let timer = null;
-  let ticker = null;
   let startedAt = 0;
   let stage = 'pending';
   let done = false;
+  let polling = false;
+  // 流程代次：弹窗打开为 0，每次 start()（含「刷新二维码」）自增；
+  // 所有迟到响应（qrStart 返回、qrPoll 应用、qrOtp 后的 check）都要求
+  // 代次仍为当前才允许改 DOM 或启计时器。
+  let gen = 0;
+  // 计时器中心登记：intervalId -> 所属代次；所有退出路径（关闭、旋返、
+  // 被新流程替换）统一清理，迟到响应因代次守卫也无法再新建 interval。
+  const timers = new Map();
+  const stopTimers = (whichGen) => {
+    for (const [id, idGen] of Array.from(timers)) {
+      if (idGen === whichGen) {
+        clearInterval(id);
+        timers.delete(id);
+      }
+    }
+  };
+  const stopAllTimers = () => {
+    for (const id of timers.keys()) clearInterval(id);
+    timers.clear();
+  };
+  const registerTimer = (whichGen, id) => {
+    timers.set(id, whichGen);
+    return id;
+  };
 
   const { mask, close } = openModal({
     title: '扫码登录微信读书',
@@ -207,7 +228,7 @@ export function qrLoginDialog({ onDone } = {}) {
     footer: `<button class="btn btn-ghost" data-refresh>${icon('refresh')}刷新二维码</button>
       <button class="btn" data-close>关闭</button>`,
     onClose: () => {
-      stop(); // 同时清理轮询 timer 与倒计时 ticker，避免关闭后空转泄漏
+      stopAllTimers(); // 关闭即清空全部代次的计时器，不依赖响应路径回收
       done = true;
     },
   });
@@ -225,15 +246,12 @@ export function qrLoginDialog({ onDone } = {}) {
     statusEl.style.color = error ? 'var(--red)' : '';
   };
 
-  const stop = () => {
-    clearInterval(timer);
-    clearInterval(ticker);
-    timer = null;
-    ticker = null;
-  };
+  // 迟到响应统一守卫：关闭（done）、弹窗已移除（isConnected）、代次已推进
+  // （新 start/refresh）任一成立，旧流程响应一律丢弃。
+  const flowAlive = (myGen) => !done && mask.isConnected && gen === myGen;
 
-  function updateCountdown() {
-    if (done) return;
+  function updateCountdown(myGen) {
+    if (!flowAlive(myGen)) return;
     if (stage === 'need_otp') {
       countdownEl.textContent = '已扫码，请按手机提示操作';
       countdownEl.className = 'qr-countdown';
@@ -250,8 +268,11 @@ export function qrLoginDialog({ onDone } = {}) {
   }
 
   async function start() {
-    stop();
+    const myGen = ++gen; // 每次打开/刷新都是新代次
+    stopAllTimers(); // 先清掉上一代残留的 interval
     done = false;
+    polling = false; // 新代次不再受旧代次在途轮询锁影响
+    flowId = null;
     stage = 'pending';
     otpInput.value = '';
     otpBox.style.opacity = '1';
@@ -262,26 +283,28 @@ export function qrLoginDialog({ onDone } = {}) {
     setStatus('正在获取二维码…');
     try {
       const res = await api.qrStart();
+      if (!flowAlive(myGen)) return; // 已关闭/被新流程替换：丢弃响应，不建任何计时器
       flowId = res.id;
       img.src = res.qr;
       startedAt = Date.now() / 1000;
-      updateCountdown();
+      updateCountdown(myGen);
       setStatus('等待微信扫码…');
-      ticker = setInterval(updateCountdown, 1000);
-      timer = setInterval(check, 1200);
+      // 计时器挂在当前代次名下统一登记；恢复路径全部经 stopTimers/stopAllTimers 清理
+      registerTimer(myGen, setInterval(() => updateCountdown(myGen), 1000));
+      registerTimer(myGen, setInterval(() => check(myGen), 1200));
     } catch (e) {
+      if (!flowAlive(myGen)) return;
       setStatus(e.message, true);
       countdownEl.textContent = '';
     }
   }
 
-  let polling = false;
-
-  async function check() {
-    if (!flowId || done || polling) return; // 响应未返回前不重叠发起下一次轮询，避免乱序回写状态
+  async function check(myGen) {
+    if (!flowId || !flowAlive(myGen) || polling) return; // 响应未返回前不重叠发起下一次轮询，避免乱序回写状态
     polling = true;
     try {
       const res = await api.qrPoll(flowId);
+      if (!flowAlive(myGen)) return; // 迟到/被替换响应：不改 DOM、不启新计时器
       switch (res.status) {
         case 'pending':
           setStatus('等待微信扫码…');
@@ -289,7 +312,7 @@ export function qrLoginDialog({ onDone } = {}) {
         case 'need_otp':
           stage = 'need_otp';
           otpBox.style.opacity = '1';
-          updateCountdown();
+          updateCountdown(myGen);
           setStatus('已扫码，请输入手机上的 4 位验证码');
           otpInput.focus();
           break;
@@ -297,7 +320,7 @@ export function qrLoginDialog({ onDone } = {}) {
           setStatus('已扫码，正在绑定账号…');
           break;
         case 'confirmed': {
-          stop();
+          stopTimers(myGen);
           done = true;
           frame.classList.add('expired');
           overlayText.textContent = '登录成功';
@@ -312,7 +335,8 @@ export function qrLoginDialog({ onDone } = {}) {
           break;
         }
         case 'expired':
-          stop();
+          stopTimers(myGen);
+          done = true;
           frame.classList.add('expired');
           overlayText.textContent = '二维码已失效';
           countdownEl.textContent = '二维码已失效';
@@ -320,7 +344,8 @@ export function qrLoginDialog({ onDone } = {}) {
           setStatus('二维码已失效，请刷新重试', true);
           break;
         case 'failed':
-          stop();
+          stopTimers(myGen);
+          done = true;
           setStatus(res.error || '登录失败，请重试', true);
           break;
         default:
@@ -336,6 +361,7 @@ export function qrLoginDialog({ onDone } = {}) {
   $('[data-refresh]', mask).addEventListener('click', start);
   $('[data-close]', mask).addEventListener('click', close);
   $('[data-otp-submit]', mask).addEventListener('click', async () => {
+    const myGen = gen; // 提交时锁定代次，等待响应期间被刷新/关闭即丢弃
     const code = $('[data-otp-input]', mask).value.trim();
     if (!/^\d{4}$/.test(code)) {
       toast('请输入 4 位数字验证码', 'warn');
@@ -345,13 +371,14 @@ export function qrLoginDialog({ onDone } = {}) {
     setLoading(btn, true);
     try {
       await api.qrOtp(flowId, code);
+      if (!flowAlive(myGen)) return; // 迟到响应：不改状态、不触发 check
       toast('验证成功，正在登录…', 'ok');
       stage = 'binding';
       otpInput.value = '';
       setStatus('验证成功，正在绑定账号…');
-      check();
+      check(myGen);
     } catch (e) {
-      toast(e.message, 'error');
+      if (flowAlive(myGen)) toast(e.message, 'error');
     } finally {
       setLoading(btn, false);
     }
@@ -514,18 +541,24 @@ export function editAccountDialog(acc, { onDone } = {}) {
       rotate: '模板只提供设备指纹与会话标识；书/章节每次心跳从书池随机抽取。',
       sequence: '模板只提供设备指纹与会话标识；书/章节按书池顺序逐个推进。',
     };
+    // 先快照：切换模式或书池异步响应触发重绘时，用户已粘贴但未保存
+    // 的模板草稿要原样回填（generatePayload 路径会先显式清空，行为不变）。
+    const prevBox = $('[data-payload]', modeExtra);
+    const draft = prevBox ? prevBox.value : '';
+    const wasFocused = prevBox !== null && prevBox === document.activeElement;
     // 请求模板 = 账号的设备指纹底盘，所有模式都会使用（b/c 按模式覆盖）。
     const tplSection = `
       <div class="field">
         <label class="label">请求模板 ${acc.has_payload ? '<span class="opt">已保存</span>' : '<span class="opt">可选 · 所有模式共用</span>'}</label>
         <textarea class="textarea" id="acc-payload" data-payload placeholder="粘贴 read 请求的 curl 或 JSON 请求体" aria-label="请求模板"></textarea>
         <div class="hint">获取方法：浏览器打开 weread.qq.com 阅读任意一本书 → F12 → Network → 找到名为 <code>read</code> 的请求（每 30 秒一条）→ 右键 → 「Copy as cURL (bash)」→ 粘贴到这里。签名 s/sg 自动重算，不用手写。</div>
-        <div class="hint">不想抓包？点下面的「生成模板」即可：会自动从这本书的阅读页拉取指纹并保存，签名 s/sg 自动重算。</div>
-        <div class="row" style="margin-top:8px">
+        <div class="hint">不想抓包？点上面的「生成模板」即可：自动从书池书籍的阅读页拉取指纹并保存；导入书籍时若没有模板也会自动生成。签名 s/sg 自动重算。</div>
+        <div class="tpl-actions">
           <button class="btn btn-sm" data-generate-payload title="免抓包：从书池第一本书的阅读页自动生成">${icon('download')}生成模板（免抓包）</button>
           <button class="btn btn-sm" data-save-payload>${icon('check')}保存粘贴的模板</button>
-          ${acc.has_payload ? `<button class="btn btn-sm btn-ghost" data-clear-payload>清除（回到全局指纹模板）</button>` : ''}
-          <span class="hint" data-payload-state>${acc.has_payload ? '当前使用该账号的专属指纹模板' : '当前使用全局指纹模板（设置页）'}</span>
+          ${acc.has_payload ? `<button class="btn btn-sm btn-ghost" data-view-payload>查看当前模板</button>` : ''}
+          ${acc.has_payload ? `<button class="btn btn-sm btn-ghost" data-clear-payload>清除模板</button>` : ''}
+          <span class="hint" data-payload-state>${acc.has_payload ? '当前使用该账号的请求模板' : '未创建请求模板；导入书籍时自动生成，或点上方按钮'}</span>
         </div>
       </div>`;
     modeExtra.innerHTML = `
@@ -535,6 +568,17 @@ export function editAccountDialog(acc, { onDone } = {}) {
         : '顺序书单：按书池列表的顺序逐本阅读（读完循环）。'}</div></div>` : ''}
       ${tplSection}
     `;
+    if (draft) {
+      const box = $('[data-payload]', modeExtra);
+      if (box) {
+        box.value = draft;
+        // 简单保焦点：只有重绘前焦点本来就在模板框里才抢回焦点，光标置末尾。
+        if (wasFocused) {
+          box.focus();
+          box.setSelectionRange(box.value.length, box.value.length);
+        }
+      }
+    }
     bindTplWiring();
   };
   const customSelectHTML = () => {
@@ -595,10 +639,30 @@ export function editAccountDialog(acc, { onDone } = {}) {
         setLoading(btn, false);
       }
     });
+    $('[data-view-payload]', modeExtra)?.addEventListener('click', async (e) => {
+      const btn = e.currentTarget;
+      const snapBox = $('[data-payload]', modeExtra);
+      // 请求前快照：响应若迟到，仅当输入框仍在且用户未再改动（值仍等于快照）才回填；
+      // 避免「查看当前模板」覆盖请求期间新粘贴的草稿。
+      const snapshot = snapBox ? snapBox.value : '';
+      setLoading(btn, true);
+      try {
+        const res = await api.getPayload(acc.id);
+        const box = $('[data-payload]', modeExtra);
+        if (box && box.value === snapshot) {
+          box.value = JSON.stringify(res.payload || {}, null, 2);
+          toast('已把当前模板填入上方输入框（可直接保存覆盖或复制）', 'ok');
+        }
+      } catch (err) {
+        toast(err.message, 'error');
+      } finally {
+        setLoading(btn, false);
+      }
+    });
     $('[data-clear-payload]', modeExtra)?.addEventListener('click', async () => {
       const ok = await confirmDialog({
-        title: '清除自定义模板',
-        message: '将删除该账号保存的抓包模板，之后所有模式回落到「设置 · 账号指纹模板」作为请求基底；若全局指纹模板也未配置，将无法发起阅读。',
+        title: '清除请求模板',
+        message: `将删除账号「${acc.name || acc.nickname || ''}」保存的请求模板。之后发起阅读会提示重新生成：可在下一次导入书籍时自动生成，或点「生成模板」，或改用粘贴的抓包模板。`,
         confirmText: '清除',
       });
       if (!ok) return;
@@ -606,7 +670,7 @@ export function editAccountDialog(acc, { onDone } = {}) {
         await api.clearPayload(acc.id);
         acc.has_payload = false;
         renderModeExtra();
-        toast('已清除专属模板，回到全局指纹模板', 'ok');
+        toast('已清除请求模板', 'ok');
       } catch (err) {
         toast(err.message, 'error');
       }
@@ -624,21 +688,33 @@ export function editAccountDialog(acc, { onDone } = {}) {
 
   $('[data-save]', mask).addEventListener('click', async (e) => {
     const btn = e.currentTarget;
-    const name = $('[data-name]', mask).value.trim();
+    // 缺陷 06：字段级校验失败时拒绝提交、就地标注红框/inline 文案并滚动
+    // 定位到首个错误字段；原有的 toast 提示与文案保持不变（作辅助说明）。
+    clearFieldErrors(mask);
+    const nameInput = $('[data-name]', mask);
+    const name = nameInput.value.trim();
     if (!name) {
+      setFieldError(nameInput, '账号名称不能为空');
       toast('账号名称不能为空', 'warn');
+      focusFirstError(mask);
       return;
     }
-    const defaultRaw = $('[data-minutes]', mask).value.trim();
+    const defaultInput = $('[data-minutes]', mask);
+    const defaultRaw = defaultInput.value.trim();
     const defaultMinutes = Number(defaultRaw);
     if (defaultRaw === '' || !Number.isInteger(defaultMinutes) || defaultMinutes < 1 || defaultMinutes > 1440) {
+      setFieldError(defaultInput, '默认时长需为 1~1440 的整数分钟');
       toast('默认时长需为 1~1440 的整数分钟', 'warn');
+      focusFirstError(mask);
       return;
     }
-    const goalRaw = $('[data-daily-goal]', mask).value.trim();
+    const goalInput = $('[data-daily-goal]', mask);
+    const goalRaw = goalInput.value.trim();
     const dailyGoalMinutes = Number(goalRaw);
     if (goalRaw === '' || !Number.isInteger(dailyGoalMinutes) || dailyGoalMinutes < 0 || dailyGoalMinutes > 1440) {
+      setFieldError(goalInput, '每日目标需为 0~1440 的整数分钟');
       toast('每日目标需为 0~1440 的整数分钟', 'warn');
+      focusFirstError(mask);
       return;
     }
     const patch = {
@@ -719,7 +795,8 @@ export function addScheduleDialog({ onDone, schedule = null } = {}) {
       <div class="grid-2">
         <div class="field">
           <label class="label" for="sch-minutes">阅读时长 <span class="opt">分钟</span></label>
-          <input class="input" id="sch-minutes" type="number" min="1" max="1440" data-min value="${escapeHtml(schedule?.minutes || 30)}">
+          <input class="input" id="sch-minutes" type="number" min="1" max="1440" data-min value="${escapeHtml(schedule?.minutes || 30)}" placeholder="30">
+          <div class="hint">1~1440 的整数分钟；清空后将不会默认 30，保存前需要填写有效值。</div>
         </div>
         <div class="field">
           <label class="label">启用</label>
@@ -769,16 +846,31 @@ export function addScheduleDialog({ onDone, schedule = null } = {}) {
   $('[data-cancel]', mask).addEventListener('click', close);
   const saveBtn = $('[data-save]', mask);
   saveBtn.addEventListener('click', async () => {
-    const payload = {
-      account_id: Number($('#sch-account', mask).value),
-      cron: cronInput.value.trim(),
-      minutes: Number($('[data-min]', mask).value) || 30,
-      enabled: $('[data-enabled]', mask).checked,
-    };
-    if (!payload.cron) {
+    clearFieldErrors(mask);
+    const cron = cronInput.value.trim();
+    if (!cron) {
+      // cron 缺失同样走字段级错误定位（缺陷 06/08 同一机制）。
+      setFieldError(cronInput, '请填写 cron 表达式');
       toast('请填写 cron 表达式', 'warn');
+      focusFirstError(mask);
       return;
     }
+    const minutesInput = $('[data-min]', mask);
+    // 缺陷 08：读原始输入校验（新建 / 编辑共用一个入口函数），空串、0、
+    // 小数、>1440 都拒绝提交并定位时长字段 —— 不再静默改写为 30。
+    const minutes = parseDurationMinutes(minutesInput.value);
+    if (minutes === null) {
+      setFieldError(minutesInput, '阅读时长需为 1~1440 的整数分钟');
+      toast('阅读时长需为 1~1440 的整数分钟（留空、0 与小数均无效）', 'warn');
+      focusFirstError(mask);
+      return;
+    }
+    const payload = {
+      account_id: Number($('#sch-account', mask).value),
+      cron,
+      minutes,
+      enabled: $('[data-enabled]', mask).checked,
+    };
     setLoading(saveBtn, true);
     try {
       if (editing) await api.updateSchedule(schedule.id, payload);

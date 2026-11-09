@@ -126,6 +126,8 @@ async function renderRoute() {
     await PAGES[key](ctx);
     if (token !== routeToken) return;
   } catch (e) {
+    // 与成功分支一致先查路由代次：旧页面请求的迟到失败不覆盖已导航的新页面。
+    if (token !== routeToken) return;
     root.innerHTML = `<article class="card"><div class="empty">
       <div class="empty-ico">${icon('alert')}</div>
       <h3>页面加载失败</h3><p>${escapeHtml(e.message)}</p>

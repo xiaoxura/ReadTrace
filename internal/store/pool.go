@@ -24,9 +24,11 @@ const (
 	KindChapter = "chapter"
 )
 
-// KeyDefaultReadPayload 保存全局默认 read 模板（完整请求 payload 的 JSON）。
-// 账号无专属模板时作为回落基底；账号可用「生成模板」一键免抓包生成专属
-// 模板（appId/ps/pc 等指纹字段按官方公式自动推导，无需内置常量模板）。
+// KeyDefaultReadPayload 是历史遗留的全局默认 read 模板设置键（缺陷 13）：
+// 模板契约已收敛为「每个账号保存自己的专属模板」，引擎不再回落该全局
+// 设置，读写路径（Get/SetDefaultTemplate 与 PUT /api/pool/template）均已
+// 删除。旧库 settings 表里已有的 read_default_payload 行按约定保留不读不
+// 写（不迁移也不删除），既避免旧数据以额外来源复活，也给回滚留出路径。
 const KeyDefaultReadPayload = "read_default_payload"
 
 // SharedAccountID 保留为 0 的历史值：共享池已移除，所有条目都归属某个账号，
@@ -192,6 +194,11 @@ func (s *Store) PoolChaptersPage(bookValue string, accountID int64, limit, offse
 // kind/value/account tuple).
 var ErrPoolItemExists = errors.New("该 ID 已在池中")
 
+// ErrChapterConflict 历史遗留：章节唯一键放宽到 (kind, value, book_id,
+// account) 之后，跨书同章节 ID 属于合法数据（上传书 CB_ 的 chapterUid 是
+// 每书小编号），这类行不会再被误判；保留错误常量以兼容既有调用方。
+var ErrChapterConflict = errors.New("章节 ID 已归属其他书籍")
+
 // AddPoolItem inserts a new pool entry and returns its row ID. accountID<=0 → shared.
 func (s *Store) AddPoolItem(kind, value, title string, accountID int64) (int64, error) {
 	switch {
@@ -237,26 +244,40 @@ func (s *Store) AddChapterItem(accountID int64, bookValue, value, title string, 
 		return 0, errors.New("请先绑定微信读书账号，再导入章节")
 	}
 	value, title, bookValue = strings.TrimSpace(value), strings.TrimSpace(title), strings.TrimSpace(bookValue)
+	// 查重分两步，语义不同、顺序固定：
+	//  1. 先按目标书键 (kind, value, book_id, account) 查既有行——命中说明
+	//     本书已有这条章节，属于重复导入，直接拒绝。
+	//  2. 目标书键没有时，再查同 (kind, value, account) 但 book_id='' 的
+	//     无归属遗留行（老的手动导入章节没有 book 关联）。存在则就地挂到
+	//     本书：UPDATE 补 book_id，只回填空的 title/word_count，enabled 与
+	//     sort_order 原样保留（缺陷 12：旧实现查重键含 book_id 导致该分支
+	//     不可达，老行成了孤儿，再 INSERT 一行默认启用的副本，丢了用户的
+	//     禁用状态）。注意不能与第 1 步合并成一个查询：book_id='' 的行不
+	//     能算「本书已有」，否则显式导入会被误判重复而永远挂不上。
 	var exist int64
-	var existingBook string
-	err := s.db.QueryRow(`SELECT id, book_id FROM pool_items WHERE kind = ? AND value = ? AND account_id = ?`,
-		KindChapter, value, accountID).Scan(&exist, &existingBook)
+	err := s.db.QueryRow(`SELECT id FROM pool_items WHERE kind = ? AND value = ? AND book_id = ? AND account_id = ?`,
+		KindChapter, value, bookValue, accountID).Scan(&exist)
 	if err == nil {
-		// Old manual imports lacked a book association. An explicit import
-		// from this book can repair it without guessing or deleting the row.
-		if existingBook == "" {
-			res, err := s.db.Exec(`UPDATE pool_items SET book_id = ?,
-				title = CASE WHEN title = '' THEN ? ELSE title END,
-				word_count = CASE WHEN word_count <= 0 THEN ? ELSE word_count END
-				WHERE id = ? AND book_id = ''`, bookValue, title, wordCount, exist)
-			if err != nil {
-				return 0, err
-			}
-			if n, err := res.RowsAffected(); err != nil {
-				return 0, err
-			} else if n > 0 {
-				return exist, nil
-			}
+		return 0, ErrPoolItemExists
+	}
+	if err != sql.ErrNoRows {
+		return 0, err
+	}
+	var legacyID int64
+	err = s.db.QueryRow(`SELECT id FROM pool_items WHERE kind = ? AND value = ? AND book_id = '' AND account_id = ?`,
+		KindChapter, value, accountID).Scan(&legacyID)
+	if err == nil {
+		res, err := s.db.Exec(`UPDATE pool_items SET book_id = ?,
+			title = CASE WHEN title = '' THEN ? ELSE title END,
+			word_count = CASE WHEN word_count <= 0 THEN ? ELSE word_count END
+			WHERE id = ? AND book_id = ''`, bookValue, title, wordCount, legacyID)
+		if err != nil {
+			return 0, err
+		}
+		if n, err := res.RowsAffected(); err != nil {
+			return 0, err
+		} else if n > 0 {
+			return legacyID, nil
 		}
 		return 0, ErrPoolItemExists
 	}
@@ -282,89 +303,110 @@ type NewChapter struct {
 // AddChapters writes many chapters of one book into the account's chapter
 // pool within a SINGLE transaction. 批量导入一本几千章的书时逐条 autocommit
 // 会把写入放大成几千个写事务（单连接 SQLite 上还会堵住心跳与日志写入）；
-// 这里用预编译语句 + 单事务，一次提交完成整本。每行的行为语义与
-// AddChapterItem 保持一致：已存在且旧数据缺 book_id 的行做修复并计为新增
-// （added），已存在且已有归属的行计为已在池（existed）。
-func (s *Store) AddChapters(accountID int64, bookValue string, chs []NewChapter) (added, existed int, err error) {
+// 这里用预编译语句 + 单事务，一次提交完成整本。返回值：
+//   - added：新插入（含旧数据修复）的行数；
+//   - existed：已存在且本就归属本书的行数（真正的重复导入）；
+//   - conflicts：章节 ID 已存在但归属其他书的行数——这不是「已在池」，
+//     上传书（CB_）目录复用时会大量出现，调用方必须单独呈现，否则用户
+//     会误以为导入成功而书籍 0 章。
+func (s *Store) AddChapters(accountID int64, bookValue string, chs []NewChapter) (added, existed, conflicts int, err error) {
 	if strings.TrimSpace(bookValue) == "" {
-		return 0, 0, errors.New("所属书籍 ID 不能为空")
+		return 0, 0, 0, errors.New("所属书籍 ID 不能为空")
 	}
 	if accountID <= 0 {
 		accountID = s.fallbackAccountID()
 	}
 	if accountID <= 0 {
-		return 0, 0, errors.New("请先绑定微信读书账号，再导入章节")
+		return 0, 0, 0, errors.New("请先绑定微信读书账号，再导入章节")
 	}
 	bookValue = strings.TrimSpace(bookValue)
 	if len(chs) == 0 {
-		return 0, 0, nil
+		return 0, 0, 0, nil
 	}
 	tx, err := s.db.Begin()
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
 	defer tx.Rollback()
-	sel, err := tx.Prepare(`SELECT id, book_id FROM pool_items WHERE kind = 'chapter' AND value = ? AND account_id = ?`)
+	sel, err := tx.Prepare(`SELECT id, book_id FROM pool_items WHERE kind = 'chapter' AND value = ? AND book_id = ? AND account_id = ?`)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
 	defer sel.Close()
+	// 无归属遗留行的查重语句：与逐条入口同构——先查目标书键（sel），再查
+	// book_id='' 的老行（selLegacy）。老行是在本书键没有时的下一步，不能
+	// 归入「本书已有」（缺陷 12：否则显式导入被误判重复、老行永远挂不上，
+	// 还会新插一行默认启用的副本丢掉禁用状态）。
+	selLegacy, err := tx.Prepare(`SELECT id FROM pool_items WHERE kind = 'chapter' AND value = ? AND book_id = '' AND account_id = ?`)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	defer selLegacy.Close()
 	repair, err := tx.Prepare(`UPDATE pool_items SET book_id = ?,
 		title = CASE WHEN title = '' THEN ? ELSE title END,
 		word_count = CASE WHEN word_count <= 0 THEN ? ELSE word_count END,
 		chapter_index = CASE WHEN chapter_index = 0 THEN ? ELSE chapter_index END
 		WHERE id = ? AND book_id = ''`)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
 	defer repair.Close()
 	ins, err := tx.Prepare(`INSERT INTO pool_items (kind, value, title, book_id, account_id, enabled, word_count, chapter_index, created_at)
 		VALUES ('chapter', ?, ?, ?, ?, 1, ?, ?, ?)`)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
 	defer ins.Close()
 
 	for _, ch := range chs {
 		value := strings.TrimSpace(ch.Value)
 		if value == "" {
-			return 0, 0, errors.New("章节 ID 不能为空")
+			return 0, 0, 0, errors.New("章节 ID 不能为空")
 		}
 		var exist int64
 		var existingBook string
-		err := sel.QueryRow(value, accountID).Scan(&exist, &existingBook)
+		err := sel.QueryRow(value, bookValue, accountID).Scan(&exist, &existingBook)
 		if err == nil {
-			// Old manual imports lacked a book association. An explicit import
-			// from this book can repair it without guessing or deleting the row.
-			if existingBook == "" {
-				res, err := repair.Exec(bookValue, ch.Title, ch.WordCount, ch.ChapterIndex, exist)
-				if err != nil {
-					return 0, 0, err
-				}
-				n, err := res.RowsAffected()
-				if err != nil {
-					return 0, 0, err
-				}
-				if n > 0 {
-					added++
-					continue
-				}
-			}
+			// 前一步确认本书已登记该章节（existingBook 必为 bookValue）：
+			// 真正的重复导入。
 			existed++
 			continue
 		}
 		if err != sql.ErrNoRows {
-			return 0, 0, err
+			return 0, 0, 0, err
+		}
+		// 本书键没有 → 找无归属遗留行就地挂上，保留 enabled/title/sort 等
+		// 元数据与参与状态。
+		var legacyID int64
+		legacyErr := selLegacy.QueryRow(value, accountID).Scan(&legacyID)
+		if legacyErr == sql.ErrNoRows {
+			legacyErr = nil
+		} else if legacyErr != nil {
+			return 0, 0, 0, legacyErr
+		}
+		if legacyErr == nil {
+			res, rerr := repair.Exec(bookValue, ch.Title, ch.WordCount, ch.ChapterIndex, legacyID)
+			if rerr != nil {
+				return 0, 0, 0, rerr
+			}
+			n, rerr := res.RowsAffected()
+			if rerr != nil {
+				return 0, 0, 0, rerr
+			}
+			if n > 0 {
+				added++
+				continue
+			}
 		}
 		if _, err := ins.Exec(value, ch.Title, bookValue, accountID, ch.WordCount, ch.ChapterIndex, now()); err != nil {
-			return 0, 0, err
+			return 0, 0, 0, err
 		}
 		added++
 	}
 	if err := tx.Commit(); err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
-	return added, existed, nil
+	return added, existed, conflicts, nil
 }
 
 // UpsertBookMeta adds a book row when missing (in the given account scope) and
@@ -466,11 +508,18 @@ func (s *Store) PoolChapterMapForAccount(accountID int64) (ownedByBook, sharedBy
 }
 
 // UpdatePoolItem edits value/title/enabled of one entry. Passing nil keeps
-// the current value of that field.
+// the current value of that field. 书（kind=book）改 value 时在同一事务内把
+// 其章节行的 book_id 一起UPDATE 到新值（缺陷 10：旧行为只改书行，章节保留
+// 旧 book_id，书变成 0 章、之后删书也找不到旧章节，留下孤儿数据）。
 func (s *Store) UpdatePoolItem(id int64, value, title *string, enabled *bool) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
 	var cur PoolItem
 	var curEnabled int
-	err := s.db.QueryRow(`SELECT id, kind, value, title, account_id, enabled FROM pool_items WHERE id = ?`, id).
+	err = tx.QueryRow(`SELECT id, kind, value, title, account_id, enabled FROM pool_items WHERE id = ?`, id).
 		Scan(&cur.ID, &cur.Kind, &cur.Value, &cur.Title, &cur.AccountID, &curEnabled)
 	if err == sql.ErrNoRows {
 		return errors.New("条目不存在")
@@ -494,16 +543,21 @@ func (s *Store) UpdatePoolItem(id int64, value, title *string, enabled *bool) er
 	}
 	// Guard the unique key: the new value must not collide with another row in
 	// the same (kind, account) scope.
+	var newValue string
+	var rebindChapters bool
 	if v, has := updates["value"]; has && toPoolString(v) != cur.Value {
+		newValue = toPoolString(v)
 		var other int64
-		err := s.db.QueryRow(`SELECT id FROM pool_items WHERE kind = ? AND value = ? AND account_id = ? AND id <> ?`,
-			cur.Kind, v, cur.AccountID, id).Scan(&other)
+		err := tx.QueryRow(`SELECT id FROM pool_items WHERE kind = ? AND value = ? AND account_id = ? AND id <> ?`,
+			cur.Kind, newValue, cur.AccountID, id).Scan(&other)
 		if err == nil {
 			return ErrPoolItemExists
 		}
 		if err != sql.ErrNoRows {
 			return err
 		}
+		// 书改 ID 才需要同步章节外键；章节改 value 不存在归属问题。
+		rebindChapters = cur.Kind == KindBook
 	}
 	if len(updates) == 0 {
 		return nil
@@ -515,8 +569,20 @@ func (s *Store) UpdatePoolItem(id int64, value, title *string, enabled *bool) er
 		args = append(args, v)
 	}
 	args = append(args, id)
-	_, err = s.db.Exec(`UPDATE pool_items SET `+strings.Join(cols, ", ")+` WHERE id = ?`, args...)
-	return err
+	if _, err := tx.Exec(`UPDATE pool_items SET `+strings.Join(cols, ", ")+` WHERE id = ?`, args...); err != nil {
+		return err
+	}
+	if rebindChapters {
+		// 章节跟随换书：同账号 (book_id=旧值) 的章节全部指向新书 value。
+		// 与书行的更新同一事务——任一步失败整体回滚，不会出现「书改了、
+		// 章节还挂在旧书」的中间态。
+		if _, err := tx.Exec(`UPDATE pool_items SET book_id = ?
+			WHERE kind = ? AND book_id = ? AND account_id = ?`,
+			newValue, KindChapter, cur.Value, cur.AccountID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func toPoolString(v any) string {
@@ -526,10 +592,18 @@ func toPoolString(v any) string {
 
 // DeletePoolItem removes one entry. Deleting a BOOK also cascades its linked
 // chapters in the same account scope; deleting a chapter is standalone.
+// 读目标、删章节、删书三步放进单条事务（缺陷 11：旧实现三步各自 autocommit，
+// 删书失败时章节已被永久删除而书还在；并发导入也可能在两步之间加入孤儿章
+// 节），失败整体回滚，参考 ClearPoolFor 的既有事务模式。
 func (s *Store) DeletePoolItem(id int64) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
 	var kind, value string
 	var accountID int64
-	err := s.db.QueryRow(`SELECT kind, value, account_id FROM pool_items WHERE id = ?`, id).
+	err = tx.QueryRow(`SELECT kind, value, account_id FROM pool_items WHERE id = ?`, id).
 		Scan(&kind, &value, &accountID)
 	if err == sql.ErrNoRows {
 		return errors.New("条目不存在")
@@ -538,19 +612,19 @@ func (s *Store) DeletePoolItem(id int64) error {
 		return err
 	}
 	if kind == KindBook {
-		if _, err := s.db.Exec(`DELETE FROM pool_items WHERE kind = ? AND book_id = ? AND account_id = ?`,
+		if _, err := tx.Exec(`DELETE FROM pool_items WHERE kind = ? AND book_id = ? AND account_id = ?`,
 			KindChapter, value, accountID); err != nil {
 			return err
 		}
 	}
-	res, err := s.db.Exec(`DELETE FROM pool_items WHERE id = ?`, id)
+	res, err := tx.Exec(`DELETE FROM pool_items WHERE id = ?`, id)
 	if err != nil {
 		return err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return errors.New("条目不存在")
 	}
-	return nil
+	return tx.Commit()
 }
 
 // ClearPoolFor empties the pool within the account scope. accountID<=0 只删
@@ -671,14 +745,4 @@ func (s *Store) PoolWordCountMapForAccount(kind string, accountID int64) (map[st
 		}
 	}
 	return out, nil
-}
-
-// GetDefaultTemplate returns the stored default read template, or "" when unset.
-func (s *Store) GetDefaultTemplate() (string, error) {
-	return s.GetSetting(KeyDefaultReadPayload)
-}
-
-// SetDefaultTemplate stores (or clears with "") the default read template JSON.
-func (s *Store) SetDefaultTemplate(raw string) error {
-	return s.SetSetting(KeyDefaultReadPayload, strings.TrimSpace(raw))
 }

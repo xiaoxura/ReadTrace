@@ -23,6 +23,9 @@ func goalEngine(t *testing.T, goal int) (*store.Store, *Engine, *store.Account) 
 	if err != nil {
 		t.Fatal(err)
 	}
+	// 缺陷 05：custom 指定书籍且章节为空的 Start 校验要求书池里有该书的
+	// 可用章节，这里补一本书和一个章节。
+	addReadablePoolChapter(t, st, id, "book", "chapter")
 	acc, err := st.GetAccount(id)
 	if err != nil {
 		t.Fatal(err)

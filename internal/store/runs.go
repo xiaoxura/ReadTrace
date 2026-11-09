@@ -40,10 +40,12 @@ func (s *Store) CreateRun(r *Run) error {
 	return nil
 }
 
-// UpdateRunProgress persists a tick's progress.
+// UpdateRunProgress persists a tick's progress. 同步写 last_progress_at（缺
+// 陷 07）：记录最后心跳落库时刻，进程重启打断遗留运行时用它近似真正的活动
+// 结束时刻，避免把整段停机时间算进阅读时段。
 func (s *Store) UpdateRunProgress(id int64, elapsed, success, failed int) error {
-	_, err := s.db.Exec(`UPDATE runs SET elapsed_seconds = ?, success_ticks = ?, failed_ticks = ? WHERE id = ?`,
-		elapsed, success, failed, id)
+	_, err := s.db.Exec(`UPDATE runs SET elapsed_seconds = ?, success_ticks = ?, failed_ticks = ?,
+		last_progress_at = ? WHERE id = ?`, elapsed, success, failed, now(), id)
 	return err
 }
 
@@ -65,10 +67,17 @@ func (s *Store) GetRun(id int64) (*Run, error) {
 	return r, err
 }
 
-// ListRuns returns the newest runs, optionally filtered by account.
-func (s *Store) ListRuns(accountID int64, limit int) ([]Run, error) {
+// ListRuns returns the newest runs, optionally filtered by account. The
+// optional offset 参数（缺陷 18：此前 storage 只有 LIMIT，前端请求第 301 条
+// 以前的记录不可达）指定跳过最新的前 offset 条做服务端分页；不传则为 0，
+// 既有的调用点行为不变。
+func (s *Store) ListRuns(accountID int64, limit int, offset ...int) ([]Run, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 100
+	}
+	off := 0
+	if len(offset) > 0 && offset[0] > 0 {
+		off = offset[0]
 	}
 	q := `SELECT ` + runCols + ` FROM runs r LEFT JOIN accounts a ON a.id = r.account_id`
 	args := []any{}
@@ -76,8 +85,8 @@ func (s *Store) ListRuns(accountID int64, limit int) ([]Run, error) {
 		q += ` WHERE r.account_id = ?`
 		args = append(args, accountID)
 	}
-	q += ` ORDER BY r.id DESC LIMIT ?`
-	args = append(args, limit)
+	q += ` ORDER BY r.id DESC LIMIT ? OFFSET ?`
+	args = append(args, limit, off)
 
 	rows, err := s.db.Query(q, args...)
 	if err != nil {
@@ -168,9 +177,20 @@ func (s *Store) PurgeHistoryBefore(cutoff int64) (int64, error) {
 
 // InterruptRunningRuns marks leftover running rows as interrupted (called on
 // startup because background goroutines do not survive a restart).
+//
+// finished_at 取值语义（缺陷 07）：优先用 last_progress_at——最后一次心跳
+// 落库时刻，是重启前最后已知的活动时刻，也是最接近真实活动时段边界的值；
+// 该列为 0（老数据或从未写进度）时退回 started_at+elapsed_seconds 近似
+// （成功心跳覆盖的秒数与时钟跨度大体一致）。两者都比把「重启时刻」写进
+// finished_at 好：后者把整段跨日停机时间塞进阅读跨度，SplitRunSeconds 会
+// 把停机前一天的已读秒数均摊到次日的停机时段上。SplitRunSeconds 的线性
+// 均摊逻辑不需要改，finished_at 修正后自然按活动时段归属。
 func (s *Store) InterruptRunningRuns() error {
-	_, err := s.db.Exec(`UPDATE runs SET status = 'failed', error = ?, finished_at = ?
-		WHERE status = 'running'`, "服务重启，本次运行已中断", now())
+	_, err := s.db.Exec(`UPDATE runs SET status = 'failed', error = ?, finished_at = MAX(started_at, CASE
+		WHEN last_progress_at > 0 THEN last_progress_at
+		ELSE started_at + elapsed_seconds
+		END)
+		WHERE status = 'running'`, "服务重启，本次运行已中断")
 	return err
 }
 

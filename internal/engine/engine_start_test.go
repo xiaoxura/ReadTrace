@@ -26,7 +26,20 @@ func TestStartValidationDoesNotCreateRunningRun(t *testing.T) {
 	if _, err := e.Start(acc, 1, "manual"); err == nil {
 		t.Fatal("missing template accepted")
 	}
+	// 缺陷 13 契约收敛：read_default_payload 全局模板已是无效存量数据，
+	// 引擎不得回落——账号模板缺失时必须报「需要模板」错误。
 	if err := st.SetSetting(store.KeyDefaultReadPayload, `{"b":"book","c":"chapter"}`); err != nil {
+		t.Fatal(err)
+	}
+	noTplErr := func() error {
+		_, err := e.Start(acc, 1, "manual")
+		return err
+	}()
+	if noTplErr == nil || !strings.Contains(noTplErr.Error(), "模板") {
+		t.Fatalf("global fallback resurrected: error = %v", noTplErr)
+	}
+	// 账号模板补齐后，校验才进入下一层（custom 模式缺指定书籍）。
+	if err := st.SavePayload(id, map[string]any{"b": "book", "c": "chapter"}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := e.Start(acc, 1, "manual"); err == nil {

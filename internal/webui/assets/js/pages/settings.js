@@ -19,8 +19,6 @@ const TZ_OPTIONS = [
   ['UTC', 'UTC'],
 ];
 
-const DEFAULT_TPL_PLACEHOLDER = `{"b": "ce032b305a9bc1ce0b0dd2a", "c": "7f632b502707f6ffaa6bf2e", "ci": 27, "co": 389, "sm": "...", ...}`;
-
 let infoCache = null;
 
 export async function renderSettings(ctx) {
@@ -31,6 +29,8 @@ export async function renderSettings(ctx) {
   try {
     info = await api.settings();
   } catch (e) {
+    // 先守卫后渲染：路由已切换时旧请求的失败响应不写共享 root。
+    if (!ctx.isActive()) return;
     renderError(root, e, { onRetry: () => ctx.reload() });
     return;
   }
@@ -54,60 +54,12 @@ function draw(ctx, root, info = infoCache) {
       ${appearanceHTML()}
       ${siteHTML(info)}
       ${securityHTML(info)}
-      ${defaultTemplateHTML(info)}
     </div>
   `;
 
   wireAppearance(ctx, host);
   wireSite(ctx, host, info);
   wireSecurity(ctx, host, info);
-  wireDefaultTemplate(ctx, host, info);
-}
-
-/* ---------- 账号指纹模板（全局基底） ---------- */
-
-function defaultTemplateHTML(info) {
-  return `
-    <article class="card settings-card">
-      <div class="card-head"><div><div class="card-title">${icon('key')}账号指纹模板</div><div class="card-sub">全局请求基底 · 账号无专属模板时使用</div></div></div>
-      <div class="field">
-        <textarea class="input mono" id="pool-template" rows="7" placeholder="${DEFAULT_TPL_PLACEHOLDER}">${escapeHtml(info.default_template || '')}</textarea>
-        <div class="hint">
-          JSON 对象，至少包含书籍 "b" 与章节 "c"；代表一份真实阅读请求的<b>设备/会话指纹</b>（appId、读的书、章节进度、标识等），<b>任何账号只要没保存自身抓包模板，都以这份指纹作为请求基底</b>；签名 s/sg 每次自动重算。<br>
-          获取方法：浏览器打开 weread.qq.com 阅读任意一本书 → F12 → Network → 找到名为 <code>read</code> 的请求（每 30 秒一条）→ 右键 → 「Copy as cURL (bash)」→ 直接粘贴到上方（curl 或纯 JSON 均可）。
-        </div>
-      </div>
-      <div style="display:flex;gap:8px">
-        <button class="btn btn-primary" id="save-pool-template">${icon('check')}保存指纹模板</button>
-        <button class="btn" id="clear-pool-template">${icon('refresh')}清空指纹模板</button>
-      </div>
-    </article>
-  `;
-}
-
-function wireDefaultTemplate(ctx, host, info = infoCache) {
-  $('#save-pool-template', host)?.addEventListener('click', async (e) => {
-    const btn = e.currentTarget;
-    const raw = $('#pool-template', host).value.trim();
-    setLoading(btn, true);
-    try {
-      const res = await api.poolTemplate(raw);
-      infoCache = { ...infoCache, default_template: res?.template || raw };
-      toast(raw ? '账号指纹模板已保存，未配置自身模板的账号将以它为基底' : '账号指纹模板已清空', 'ok');
-    } catch (e2) {
-      toast(e2.message, 'error');
-    } finally {
-      setLoading(btn, false);
-    }
-  });
-  $('#clear-pool-template', host)?.addEventListener('click', async () => {
-    try {
-      await api.poolTemplate(null);
-      infoCache = { ...infoCache, default_template: '' };
-      $('#pool-template', host).value = '';
-      toast('已清空账号指纹模板', 'ok');
-    } catch (e) { toast(e.message, 'error'); }
-  });
 }
 
 /* ---------- 外观 ---------- */

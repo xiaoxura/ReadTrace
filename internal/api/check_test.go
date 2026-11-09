@@ -117,8 +117,11 @@ func TestCheckLoginRunningNoProbe(t *testing.T) {
 	s := newCheckTestServer(t, mux)
 	id := startTestAccount(t, s)
 	// 新版移除了内置模板兜底：所有模式都需要一份阅读模板作为请求基底。
-	if err := s.st.SetSetting(store.KeyDefaultReadPayload, `{"b":"ce032b305a9bc1ce0b0dd2a","c":"7f632b502707f6ffaa6bf2e"}`); err != nil {
-		t.Fatalf("set default template: %v", err)
+	// （缺陷 13 后模板唯一来源是账号自身；这里直接给测试账号 SavePayload，
+	// 不再通过已废弃的 read_default_payload 全局设置提供。）
+	if err := s.st.SavePayload(id, map[string]any{
+		"b": "ce032b305a9bc1ce0b0dd2a", "c": "7f632b502707f6ffaa6bf2e"}); err != nil {
+		t.Fatalf("set account template: %v", err)
 	}
 	// 顺序书单（默认模式）需要书池里有带章节的书。
 	if _, err := s.st.AddPoolItem(store.KindBook, "book1", "测试书", id); err != nil {

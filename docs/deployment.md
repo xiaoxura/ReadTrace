@@ -69,14 +69,14 @@ chmod +x readtrace_linux_amd64
 需要 Go 1.27+：
 
 ```bash
-CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=0.1.1" -o readtrace ./cmd/readtrace
+CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=0.2.0" -o readtrace ./cmd/readtrace
 ```
 
 Linux 交叉编译：
 
 ```bash
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-  go build -trimpath -ldflags "-s -w -X main.version=0.1.1" -o readtrace ./cmd/readtrace
+  go build -trimpath -ldflags "-s -w -X main.version=0.2.0" -o readtrace ./cmd/readtrace
 ```
 
 仓库的 GitHub Actions 发布流程也会为六个平台构建单文件可执行程序，见 [`.github/workflows/release.yml`](../.github/workflows/release.yml)。

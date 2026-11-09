@@ -52,7 +52,10 @@ func (s *Server) handleRunStop(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleRunList(w http.ResponseWriter, r *http.Request) {
 	accountID, _ := strconv.ParseInt(r.URL.Query().Get("account_id"), 10, 64)
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	runs, err := s.st.ListRuns(accountID, limit)
+	// 服务端分页（缺陷 18）：offset 跳过最新的前 N 条，让第 301 条以前的
+	// 记录可达；负值按 0 处理。
+	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
+	runs, err := s.st.ListRuns(accountID, limit, offset)
 	if err != nil {
 		s.writeErr(w, http.StatusInternalServerError, "读取运行记录失败")
 		return

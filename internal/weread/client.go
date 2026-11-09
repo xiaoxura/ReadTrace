@@ -254,13 +254,26 @@ func (c *Client) Renew(ctx context.Context, ck Cookies) (string, error) {
 }
 
 // FixSyncKey asks the chapterInfos endpoint to re-bind the sync state.
+// 与 Read/Validate 同语义：HTTP 200 不代表业务成功，要解析 errCode/errMsg；
+// 登录失效类业务码（-2012/-2013/401）包 ErrUnauthorized，方便引擎用
+// errors.Is / IsAuthFailure 统一分类并触发续期。函数签名与调用方
+// （engine.go 的 runOnce）保持不变，只改内部行为。
 func (c *Client) FixSyncKey(ctx context.Context, ck Cookies, bookID string) error {
 	if bookID == "" {
 		bookID = "3300060341"
 	}
 	body := map[string]any{"bookIds": []string{bookID}}
-	_, err := c.doJSON(ctx, http.MethodPost, "/web/book/chapterInfos", ck, body, nil)
-	return err
+	var raw map[string]any
+	if _, err := c.doJSON(ctx, http.MethodPost, "/web/book/chapterInfos", ck, body, &raw); err != nil {
+		return err
+	}
+	if code := toInt(raw["errCode"]); code != 0 {
+		if isAuthCode(code) {
+			return fmt.Errorf("%w（chapterInfos errCode=%d）%s", ErrUnauthorized, code, apiErrText(raw, code))
+		}
+		return fmt.Errorf("chapterInfos（errCode=%d）%s", code, apiErrText(raw, code))
+	}
+	return nil
 }
 
 // Validate checks whether the session is still alive. True login failures wrap
@@ -302,6 +315,26 @@ func apiErrText(raw map[string]any, code int) string {
 	default:
 		return "接口返回异常"
 	}
+}
+
+// ErrAuthFailure reports whether the error means "this login cannot proceed
+// right now" in a way a renewal can potentially fix（HTTP 401、errCode
+// -2012/-2013 登录超时、-2003 可续期会话）。非鉴权错误（风控/限频/限频参数）
+// 返回 false，调用方不应为它们白白续期。
+func IsAuthFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrUnauthorized) {
+		return true
+	}
+	msg := err.Error()
+	for _, marker := range []string{"errCode=-2012", "errCode=-2013", "errCode=-2003", "登录超时", "登录已超时"} {
+		if strings.Contains(msg, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // UserInfo fetches the nickname and avatar bound to a user id.

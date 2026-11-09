@@ -51,6 +51,7 @@ export const api = {
   refreshAccount: (id) => request(`/api/accounts/${id}/refresh`, { method: 'POST', body: {} }),
   checkAccount: (id) => request(`/api/accounts/${id}/check`, { method: 'POST', body: {} }),
   savePayload: (id, payload) => request(`/api/accounts/${id}/payload`, { method: 'POST', body: payload }),
+  getPayload: (id) => request(`/api/accounts/${id}/payload`),
   generatePayload: (id) =>
     request(`/api/accounts/${id}/payload/generate`, { method: 'POST', body: {} }),
   clearPayload: (id) => request(`/api/accounts/${id}/payload`, { method: 'DELETE' }),
@@ -77,15 +78,15 @@ export const api = {
   poolMove: (id, direction) => request(`/api/pool/items/${id}/move`, { method: 'POST', body: { direction } }),
   poolDelete: (id) => request(`/api/pool/items/${id}`, { method: 'DELETE' }),
   poolReset: (kind, accountId = 0) => request('/api/pool/reset', { method: 'POST', body: { kind, account_id: accountId } }),
-  poolTemplate: (template) => request('/api/pool/template', { method: 'PUT', body: { template } }),
   poolShelf: (accountId = 0, archiveOffset = 0, archiveRevision = '') =>
     request(`/api/pool/shelf?account_id=${accountId}&archive_offset=${archiveOffset}${archiveRevision ? `&archive_revision=${encodeURIComponent(archiveRevision)}` : ''}`),
   poolShelfImport: (payload) => request('/api/pool/shelf/import', { method: 'POST', body: payload }),
 
   startRun: (accountId, minutes) => request('/api/runs', { method: 'POST', body: { account_id: accountId, minutes } }),
   stopRun: (id) => request(`/api/runs/${id}/stop`, { method: 'POST', body: {} }),
-  runs: (accountId = 0, limit = 100) =>
-    request(`/api/runs?limit=${limit}${accountId ? `&account_id=${accountId}` : ''}`),
+  // 服务端分页（缺陷 18）：offset 跳过最新的前 N 条，与后端 ListRuns(accountID, limit, offset...) 对齐。
+  runs: (accountId = 0, limit = 100, offset = 0) =>
+    request(`/api/runs?limit=${limit}&offset=${encodeURIComponent(offset)}${accountId ? `&account_id=${accountId}` : ''}`),
   run: (id) => request(`/api/runs/${id}`),
   runLogs: (id, { afterId = 0, tail = false, limit = 500, signal } = {}) => {
     const q = new URLSearchParams({ after_id: String(afterId), limit: String(limit) });

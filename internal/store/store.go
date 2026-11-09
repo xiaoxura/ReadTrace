@@ -73,6 +73,9 @@ CREATE TABLE IF NOT EXISTS runs (
 	status           TEXT NOT NULL DEFAULT 'running',
 	error            TEXT NOT NULL DEFAULT '',
 	started_at       INTEGER NOT NULL,
+	-- last_progress_at：最后一次心跳进度落库时刻。跨日停机时用它结算被
+	-- 打断的运行（finished_at），避免把整段停机时间算进阅读时段。
+	last_progress_at INTEGER NOT NULL DEFAULT 0,
 	finished_at      INTEGER NOT NULL DEFAULT 0
 );
 
@@ -133,7 +136,9 @@ CREATE TABLE IF NOT EXISTS pool_items (
 	word_count  INTEGER NOT NULL DEFAULT 0,
 	chapter_index  INTEGER NOT NULL DEFAULT 0,
 	created_at  INTEGER NOT NULL,
-	UNIQUE(kind, value, account_id)
+	-- 章节唯一键含 book_id：上传书（CB_）的 chapterUid 是每书从 1 开始的
+	-- 小序号（官方心跳用 b+c 双键区分书），跨书同值是合法数据。
+	UNIQUE(kind, value, book_id, account_id)
 );
 
 -- 微信机器人渠道已移除：旧库中的遗留表在此清理。
@@ -148,10 +153,6 @@ CREATE INDEX IF NOT EXISTS idx_run_statistics_account_started ON run_statistics(
 CREATE INDEX IF NOT EXISTS idx_run_logs_run ON run_logs(run_id, id);
 CREATE INDEX IF NOT EXISTS idx_schedules_account ON schedules(account_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
--- 书池查询的主力索引：PoolItemsForAccount / PoolChaptersPage（COUNT+LIMIT）
--- / PoolChapterCountsForAccount / AddChapters 去重都按 (account_id, kind) 起
--- 步，章节还带 book_id 过滤。UNIQUE(kind, value, account_id) 救不了它们。
-CREATE INDEX IF NOT EXISTS idx_pool_account_kind_book ON pool_items(account_id, kind, book_id);
 `
 
 // Open creates/opens the database and applies the schema.
@@ -294,12 +295,25 @@ func migrate(db *sql.DB) error {
 	if _, err := addColumnIfMissing(tx, "pool_items", "account_id", `INTEGER NOT NULL DEFAULT 0`); err != nil {
 		return err
 	}
+	// 心跳 payload 的 ci（章节下标）：导入目录时随 word_count 一起保存。
+	// 必须在唯一键重建之前补列，重建 INSERT 才能带上它。
+	if _, err := addColumnIfMissing(tx, "pool_items", "chapter_index", `INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return err
+	}
+	// 跨日停机结算（缺陷 07）：补 runs.last_progress_at，供重启打断旧运行时
+	// 按最后活动时刻写入 finished_at。老库用 ensure 列模式补齐。
+	if _, err := addColumnIfMissing(tx, "runs", "last_progress_at", `INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return err
+	}
 	if err := rebuildPoolUniqueKey(tx); err != nil {
 		return err
 	}
-	// 心跳 payload 的 ci（章节下标）：导入目录时随 word_count 一起保存。
-	// 历史章节保持 0，引擎就回落到模板里的 ci；重建后补齐。
-	if _, err := addColumnIfMissing(tx, "pool_items", "chapter_index", `INTEGER NOT NULL DEFAULT 0`); err != nil {
+	// 书池查询的主力索引：PoolItemsForAccount / PoolChaptersPage（COUNT+LIMIT）
+	// / PoolChapterCountsForAccount / AddChapters 去重都按 (account_id, kind) 起
+	// 步，章节还带 book_id 过滤。必须建在表重建之后——上面的 DROP TABLE 会把
+	// 建在它之前（schema 常量里）的同名索引一并删掉，导致升级后的本次进程
+	// 缺索引（缺陷 20）。IF NOT EXISTS 幂等：未重建的库已有时零开销。
+	if _, err := tx.Exec(`CREATE INDEX IF NOT EXISTS idx_pool_account_kind_book ON pool_items(account_id, kind, book_id)`); err != nil {
 		return err
 	}
 	// 共享池已移除：account_id=0 的历史条目归属到第一个已绑定账号。
@@ -309,9 +323,9 @@ func migrate(db *sql.DB) error {
 	return tx.Commit()
 }
 
-// migrateSharedPoolOwnership merges a shared item into the first account's
-// existing copy before changing ownership. The account copy keeps its ID,
-// enabled state and ordering; shared metadata only fills empty fields.
+// migrateSharedPoolOwnership 把 account_id=0 的共享池遗留条目归属到第一个已
+// 绑定账号。无账号的老库在这里跳过，首账号创建时由 CreateAccount 再次调用
+// adoptSharedPoolOwnership 补做（缺陷 24），见 adoptSharedPoolOwnership 的注释。
 func migrateSharedPoolOwnership(tx *sql.Tx) error {
 	var firstAccount sql.NullInt64
 	if err := tx.QueryRow(`SELECT MIN(id) FROM accounts`).Scan(&firstAccount); err != nil {
@@ -320,53 +334,77 @@ func migrateSharedPoolOwnership(tx *sql.Tx) error {
 	if !firstAccount.Valid {
 		return nil
 	}
-	type poolMerge struct {
-		ownedID, sharedID            int64
-		title, author, cover, bookID string
-		wordCount                    int64
+	return adoptSharedPoolOwnership(tx, firstAccount.Int64)
+}
+
+// adoptSharedPoolOwnership 逐行处置 target 账号名下的共享池遗留行
+// （pool_items.account_id=0），合并与改归属都在本事务内完成：
+//
+//  1. 与 target 已有专属行 (kind, value, book_id) 三键全等 → 视为同一章节/
+//     条目的重复：专属行保留 ID/enabled/sort 等参与状态，空元数据由共享
+//     行补齐，随后删除共享行。注意 book_id 必须全等：老共享行与某账号专属
+//     行 value 相同但 book_id 不同（两本书复用同一章节 ID，唯一键含 book_id
+//     的合法数据）不是重复，绝不能在此合并删除（缺陷 02 曾导致另一本书的
+//     章节被误删）。
+//  2. 没有同键专属行 → 只改归属（UPDATE account_id）。
+//
+// 逐行「先查后改」而不是一条 `UPDATE ... WHERE account_id=0` 全量翻转：
+// 全量翻转在唯一键 UNIQUE(kind, value, book_id, account_id) 下可能撞键，让
+// 迁移启动失败；逐行路径保证任何一步都不会撞键，绝不因撞键让迁移失败。
+func adoptSharedPoolOwnership(tx *sql.Tx, target int64) error {
+	if target <= 0 {
+		return nil
 	}
-	rows, err := tx.Query(`SELECT owned.id, shared.id,
-		COALESCE(NULLIF(owned.title, ''), shared.title),
-		COALESCE(NULLIF(owned.author, ''), shared.author),
-		COALESCE(NULLIF(owned.cover, ''), shared.cover),
-		COALESCE(NULLIF(owned.book_id, ''), shared.book_id),
-		CASE WHEN owned.word_count = 0 THEN shared.word_count ELSE owned.word_count END
-		FROM pool_items owned JOIN pool_items shared
-		ON owned.kind = shared.kind AND owned.value = shared.value
-		WHERE owned.account_id = ? AND shared.account_id = 0`, firstAccount.Int64)
-	if err != nil {
-		return err
-	}
-	merges := []poolMerge{}
-	for rows.Next() {
-		var item poolMerge
-		if err := rows.Scan(&item.ownedID, &item.sharedID, &item.title, &item.author,
-			&item.cover, &item.bookID, &item.wordCount); err != nil {
-			_ = rows.Close()
+	for {
+		// 每次取最早的一条共享行处置完再取下一条；共享行被合并删除或改
+		// 归属后便退出候选，循环必然收敛。
+		var id int64
+		var kind, value, bookID, title, author, cover string
+		var wordCount int64
+		err := tx.QueryRow(`SELECT id, kind, value, book_id, title, author, cover, word_count
+			FROM pool_items WHERE account_id = 0 ORDER BY id LIMIT 1`).
+			Scan(&id, &kind, &value, &bookID, &title, &author, &cover, &wordCount)
+		if err == sql.ErrNoRows {
+			return nil
+		}
+		if err != nil {
 			return err
 		}
-		merges = append(merges, item)
-	}
-	err = rows.Err()
-	if closeErr := rows.Close(); err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		return err
-	}
-	for _, item := range merges {
-		if _, err := tx.Exec(`UPDATE pool_items SET title = ?, author = ?, cover = ?, book_id = ?, word_count = ?
-			WHERE id = ?`, item.title, item.author, item.cover, item.bookID, item.wordCount, item.ownedID); err != nil {
-			return fmt.Errorf("合并共享书池条目 %d 失败: %w", item.sharedID, err)
+		var ownedID int64
+		err = tx.QueryRow(`SELECT id FROM pool_items
+			WHERE kind = ? AND value = ? AND book_id = ? AND account_id = ?`,
+			kind, value, bookID, target).Scan(&ownedID)
+		switch {
+		case err == sql.ErrNoRows:
+			// 没有同键专属行：整体改归属安置这条共享行。
+			res, uerr := tx.Exec(`UPDATE pool_items SET account_id = ? WHERE id = ? AND account_id = 0`,
+				target, id)
+			if uerr != nil {
+				return fmt.Errorf("迁移共享书池条目 %d 归属失败: %w", id, uerr)
+			}
+			if n, nerr := res.RowsAffected(); nerr == nil && n == 0 {
+				// 选中的行刚被消失属于异常状态，报告而不是空转。
+				return fmt.Errorf("迁移共享书池条目 %d 归属失败: 条目消失", id)
+			}
+		case err != nil:
+			return err
+		default:
+			// 有同键专属行：合并元数据（只填空字段）后删除共享行，专属行
+			// 的参与状态与排序保持不动。
+			if _, uerr := tx.Exec(`UPDATE pool_items SET
+				title = CASE WHEN title = '' THEN ? ELSE title END,
+				author = CASE WHEN author = '' THEN ? ELSE author END,
+				cover = CASE WHEN cover = '' THEN ? ELSE cover END,
+				book_id = CASE WHEN book_id = '' THEN ? ELSE book_id END,
+				word_count = CASE WHEN word_count <= 0 THEN ? ELSE word_count END
+				WHERE id = ?`, title, author, cover, bookID, wordCount, ownedID); uerr != nil {
+				return fmt.Errorf("合并共享书池条目 %d 失败: %w", id, uerr)
+			}
+			if _, derr := tx.Exec(`DELETE FROM pool_items WHERE id = ? AND account_id = 0`, id); derr != nil {
+				return fmt.Errorf("删除已合并共享书池条目 %d 失败: %w", id, derr)
+			}
 		}
-		if _, err := tx.Exec(`DELETE FROM pool_items WHERE id = ? AND account_id = 0`, item.sharedID); err != nil {
-			return fmt.Errorf("删除已合并共享书池条目 %d 失败: %w", item.sharedID, err)
-		}
 	}
-	if _, err := tx.Exec(`UPDATE pool_items SET account_id = ? WHERE account_id = 0`, firstAccount.Int64); err != nil {
-		return fmt.Errorf("迁移共享书池归属失败: %w", err)
-	}
-	return nil
 }
 
 func addColumnIfMissing(tx *sql.Tx, table, column, definition string) (bool, error) {
@@ -460,7 +498,7 @@ func rebuildPoolUniqueKey(tx *sql.Tx) error {
 		if err != nil {
 			return err
 		}
-		if !index.partial && len(columns) == 3 && columns[0] == "kind" && columns[1] == "value" && columns[2] == "account_id" {
+		if !index.partial && len(columns) == 4 && columns[0] == "kind" && columns[1] == "value" && columns[2] == "book_id" && columns[3] == "account_id" {
 			hasExpected = true
 		} else {
 			hasOther = true
@@ -484,11 +522,11 @@ func rebuildPoolUniqueKey(tx *sql.Tx) error {
 			word_count  INTEGER NOT NULL DEFAULT 0,
 			chapter_index INTEGER NOT NULL DEFAULT 0,
 			created_at  INTEGER NOT NULL,
-			UNIQUE(kind, value, account_id)
+			UNIQUE(kind, value, book_id, account_id)
 		)`,
 		`INSERT INTO pool_items_new
-			(id, kind, value, title, author, cover, book_id, account_id, enabled, sort_order, word_count, created_at)
-		 SELECT id, kind, value, title, author, cover, book_id, account_id, enabled, sort_order, word_count, created_at
+			(id, kind, value, title, author, cover, book_id, account_id, enabled, sort_order, word_count, chapter_index, created_at)
+		 SELECT id, kind, value, title, author, cover, book_id, account_id, enabled, sort_order, word_count, chapter_index, created_at
 		 FROM pool_items`,
 		`DROP TABLE pool_items`,
 		`ALTER TABLE pool_items_new RENAME TO pool_items`,

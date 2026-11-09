@@ -45,8 +45,15 @@ type Checker struct {
 	nt  *notify.Sender
 	log *slog.Logger
 
-	stop chan struct{}
-	done sync.WaitGroup
+	stop     chan struct{}
+	stopOnce sync.Once // 保证 close(stop) 只执行一次：并发 Wait 不 panic
+	done     sync.WaitGroup
+	ctx      context.Context    // checker 生命周期：Wait 时随 stop 关闭一并取消
+	cancel   context.CancelFunc // 取消生命周期 ctx，中断扫描与推送中的请求
+
+	// notifyDone 跟踪每个「账号失效」推送 goroutine，Wait 等待它们
+	// 退出，保证关机路径不遗留后台 goroutine。
+	notifyDone sync.WaitGroup
 
 	mu      sync.Mutex
 	lastRun time.Time
@@ -55,7 +62,11 @@ type Checker struct {
 
 // New creates a Checker (call Start to activate the background loop).
 func New(st *store.Store, eng *engine.Engine, wc *weread.Client, nt *notify.Sender, log *slog.Logger) *Checker {
-	return &Checker{st: st, eng: eng, wc: wc, nt: nt, log: log, stop: make(chan struct{})}
+	ctx, cancel := context.WithCancel(context.Background())
+	return &Checker{
+		st: st, eng: eng, wc: wc, nt: nt, log: log,
+		stop: make(chan struct{}), ctx: ctx, cancel: cancel,
+	}
 }
 
 // Start launches the background loop. It never returns an error; per-account
@@ -77,13 +88,18 @@ func (c *Checker) Start() {
 	}()
 }
 
-// Wait stops the loop at shutdown.
+// Wait stops the loop at shutdown. 退出顺序：
+//  1. close(stop)：让扫描循环停下；
+//  2. cancel()：取消生命周期 ctx，中断「正在检查中的账号请求」与
+//     尚未完成的失效推送（单独的 WithTimeout 都派生自该 ctx）；
+//  3. 依次等待推送 goroutine 与扫描 goroutine 退出。
+//
+// Wait 幂等：重复调用只在第一次生效（close 由 stopOnce 保证只执行一次，
+// 并发调用安全）。
 func (c *Checker) Wait() {
-	select {
-	case <-c.stop:
-	default:
-		close(c.stop)
-	}
+	c.stopOnce.Do(func() { close(c.stop) })
+	c.cancel()
+	c.notifyDone.Wait()
 	c.done.Wait()
 }
 
@@ -129,7 +145,9 @@ func (c *Checker) tick() {
 		c.running = false
 		c.mu.Unlock()
 	}()
-	c.RunOnce(context.Background())
+	// 扫描全程使用生命周期 ctx：一旦 Wait 关停，正在检查的请求与
+	// 后续账号的扫描都会被取消（每账号 30 秒上限派生自该 ctx）。
+	c.RunOnce(c.ctx)
 }
 
 // RunOnce validates every account once. Running accounts are skipped (their
@@ -193,7 +211,7 @@ func (c *Checker) RunOnce(ctx context.Context) {
 		case "expired":
 			expired++
 			if notifyAcc != nil {
-				go c.notifyExpired(notifyAcc, outcomeErr)
+				c.pushExpiredAsync(ctx, *notifyAcc, outcomeErr)
 			}
 		default: // "error": transient trouble — log only, never touch the row.
 			// -2003 这类参数错误/网络抖动是临时的，手动检查就能恢复；
@@ -207,8 +225,20 @@ func (c *Checker) RunOnce(ctx context.Context) {
 	c.log.Info("账号状态自动检查完成", "checked", checked, "active", checked-expired, "expired", expired)
 }
 
+// pushExpiredAsync spawns the expired-account push on a goroutine that is
+// tracked by notifyDone and bound to the lifecycle ctx：Wait 先取消 ctx、
+// 再等 goroutine 退出，关机路径不再遗留它们。
+func (c *Checker) pushExpiredAsync(ctx context.Context, acc store.Account, cause error) {
+	c.notifyDone.Add(1)
+	go func() {
+		defer c.notifyDone.Done()
+		c.notifyExpired(ctx, acc, cause)
+	}()
+}
+
 // notifyExpired pushes the "账号失效" template to the account's channel.
-func (c *Checker) notifyExpired(acc *store.Account, cause error) {
+// 25 秒推送上限派生自生命周期 ctx（两个时限取更早者生效），父 ctx 取消即中断。
+func (c *Checker) notifyExpired(ctx context.Context, acc store.Account, cause error) {
 	ch, err := c.st.GetPushChannel(acc.PushChannelID)
 	if err != nil || ch == nil || !ch.Enabled {
 		return
@@ -222,7 +252,7 @@ func (c *Checker) notifyExpired(acc *store.Account, cause error) {
 		"微信读书 · 账号失效",
 		fmt.Sprintf("账号：%s\n状态：登录已失效，请重新扫码登录\n检查时间：%s", acc.Name, vars["time"]),
 		vars)
-	ctx, cancel := context.WithTimeout(context.Background(), pushTimeout)
+	ctx, cancel := context.WithTimeout(ctx, pushTimeout)
 	defer cancel()
 	if err := c.nt.Send(ctx, *ch, title, content); err != nil {
 		c.log.Warn("账号失效推送失败", "channel", ch.Name, "account", acc.Name, "err", err)

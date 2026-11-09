@@ -31,6 +31,8 @@ func TestStartReadsCredentialSavedUnderAccountLock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// 缺陷 05：custom 指定书籍且章节为空需要书池可用章节。
+	addReadablePoolChapter(t, st, id, "book", "chapter")
 	acc, err := st.GetAccount(id)
 	if err != nil || acc == nil {
 		t.Fatalf("GetAccount: %v", err)

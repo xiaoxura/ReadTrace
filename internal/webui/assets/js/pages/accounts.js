@@ -24,6 +24,8 @@ export async function renderAccounts(ctx) {
     if (!ctx.isActive()) return;
     if (!state.channels.length) await refreshChannels().catch(() => {});
   } catch (e) {
+    // 先守卫后渲染：路由已切换时旧请求的失败响应不写共享 root。
+    if (!ctx.isActive()) return;
     renderError(root, e, { onRetry: () => ctx.reload() });
     return;
   }
@@ -307,7 +309,7 @@ function accountCard(a, active) {
         ${dailyStatus}
         <span class="badge neutral">${escapeHtml(a.tick_seconds)}s 心跳</span>
         <span class="badge neutral">${escapeHtml(MODE_LABEL[a.mode] || a.mode)}</span>
-        ${a.has_payload ? '<span class="badge ok">自定义模板</span>' : ''}
+        ${a.has_payload ? '<span class="badge ok">请求模板已创建</span>' : '<span class="badge neutral">请求模板未创建</span>'}
         ${a.book_title ? `<span class="badge neutral">${icon('book')}${escapeHtml(a.book_title)}</span>` : ''}
       </div>
     </td>

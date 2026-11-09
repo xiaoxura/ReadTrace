@@ -3,10 +3,13 @@ package api
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"readtrace/internal/checker"
 	"readtrace/internal/engine"
@@ -273,7 +276,14 @@ func (s *Server) handleAccountUpdate(w http.ResponseWriter, r *http.Request) {
 		acc.RetryDelay = *body.RetryDelay
 	}
 	if body.BookID != nil {
-		acc.BookID = strings.TrimSpace(*body.BookID)
+		// 自定义 book_id 的入口在形态与长度上都和手动书池同一标准
+		// （书池按 64 rune 上限拒绝超长串）：空值合法，表示回落书池。
+		id := strings.TrimSpace(*body.BookID)
+		if msg := invalidCustomBookID(id); msg != "" {
+			s.writeErr(w, http.StatusBadRequest, msg)
+			return
+		}
+		acc.BookID = id
 	}
 	if body.BookTitle != nil {
 		acc.BookTitle = strings.TrimSpace(*body.BookTitle)
@@ -531,6 +541,30 @@ func (s *Server) handleAccountPayload(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, map[string]any{"ok": true, "has_payload": true})
 }
 
+// handleAccountPayloadGet 返回该账号当前保存的请求模板（免抓包生成或粘贴
+// 所得的 JSON）。供账号设置里的「查看当前模板」使用；Cookie 不随行返回。
+func (s *Server) handleAccountPayloadGet(w http.ResponseWriter, r *http.Request) {
+	id, ok := pathID(r)
+	if !ok {
+		s.writeErr(w, http.StatusBadRequest, "无效的账号 ID")
+		return
+	}
+	acc, ok := s.accountOrErr(w, id)
+	if !ok {
+		return
+	}
+	_, payload, err := s.st.AccountSecrets(acc.ID)
+	if err != nil {
+		s.writeErr(w, http.StatusInternalServerError, "读取模板失败")
+		return
+	}
+	out := map[string]any{"has_payload": len(payload) > 0}
+	if len(payload) > 0 {
+		out["payload"] = payload
+	}
+	s.writeJSON(w, http.StatusOK, out)
+}
+
 func (s *Server) handleAccountPayloadDelete(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathID(r)
 	if !ok {
@@ -548,12 +582,9 @@ func (s *Server) handleAccountPayloadDelete(w http.ResponseWriter, r *http.Reque
 	s.writeJSON(w, http.StatusOK, map[string]any{"ok": true, "has_payload": false})
 }
 
-// handleAccountGeneratePayload 一键生成该账号的专属 read 模板，全程不抓包：
-// 1) 从书池挑一本可读书（或 body.book_id 指定）；2) 拉官方目录取首个可读
-// 章节的 chapterUid/章节下标；3) GET 阅读页从 window.__INITIAL_STATE__ 解析
-// psvts/pclts；4) appId 按官方公式由 User-Agent 推导；ps/pc 同理自算或兜底
-// _e(ct)。签名 s/sg 由引擎每次心跳现算，模板里不需要保存。
-// 生成结果直接覆盖该账号的专属模板（可在设置里清除回到全局模板）。
+// handleAccountGeneratePayload 一键生成该账号的专属 read 模板（免抓包）。
+// 组装细节见 generateAccountTemplate；签名 s/sg 由引擎每次心跳现算，模板里
+// 不需要保存。生成结果直接覆盖该账号的专属模板（清除后可回到全局回落）。
 func (s *Server) handleAccountGeneratePayload(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathID(r)
 	if !ok {
@@ -570,15 +601,42 @@ func (s *Server) handleAccountGeneratePayload(w http.ResponseWriter, r *http.Req
 	if !s.decode(w, r, &body) {
 		return
 	}
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+	pl, bookID, chapter, err := s.generateAccountTemplate(ctx, acc, strings.TrimSpace(body.BookID))
+	if err != nil {
+		s.writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := s.st.SavePayload(acc.ID, pl); err != nil {
+		s.writeErr(w, http.StatusInternalServerError, "保存模板失败")
+		return
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "has_payload": true,
+		"book_id": bookID, "chapter_id": chapter.ID, "ci": chapter.Index,
+		"book_title": truncateRunes(chapter.Title, 60),
+	})
+}
 
-	bookID := strings.TrimSpace(body.BookID)
+// generateAccountTemplate 不抓包生成一份 read 请求基底：
+// 1) bookID 为空时回落书池第一本书；2) 拉官方目录取首个实章（chapterUid/
+// 章节下标）；3) GET 阅读页从 window.__INITIAL_STATE__ 解析 psvts/pclts；
+// 4) appId 按官方公式由 User-Agent 推导；pclts 缺失时用 _e(ct) 兜底。
+// 登录失效时先续期再试一次（与书架/导入通道同语义）。自定义 bookID 的
+// 长度/形态校验与手动书池一致（invalidCustomBookID）。
+func (s *Server) generateAccountTemplate(ctx context.Context, acc *store.Account, bookID string) (map[string]any, string, *weread.Chapter, error) {
+	bookID = strings.TrimSpace(bookID)
+	// 入口与手动书池同一标准：超长或非法形态（空白字符）拒绝。
+	if msg := invalidCustomBookID(bookID); msg != "" {
+		return nil, "", nil, errors.New(msg)
+	}
 	if bookID == "" {
-		albums, err := s.st.PoolItemsForAccount(store.KindBook, acc.ID)
+		books, err := s.st.PoolItemsForAccount(store.KindBook, acc.ID)
 		if err != nil {
-			s.writeErr(w, http.StatusInternalServerError, "读取书池失败")
-			return
+			return nil, "", nil, fmt.Errorf("读取书池失败：%v", err)
 		}
-		for _, b := range albums {
+		for _, b := range books {
 			if b.Value != "" {
 				bookID = b.Value
 				break
@@ -586,33 +644,41 @@ func (s *Server) handleAccountGeneratePayload(w http.ResponseWriter, r *http.Req
 		}
 	}
 	if bookID == "" {
-		s.writeErr(w, http.StatusBadRequest, "书池是空的：请先在「书池 · 书籍导入」导入书籍，再生成模板")
-		return
+		return nil, "", nil, errors.New("书池还是空的：请先在「书池 · 书籍导入」导入书籍，再生成模板")
 	}
-
 	ck, err := s.accountCookies(acc)
 	if err != nil {
-		s.writeErr(w, http.StatusBadRequest, err.Error())
-		return
+		return nil, "", nil, err
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
-	defer cancel()
 
-	chs, err := s.chapterInfos(ctx, acc.ID, ck, bookID)
+	var chs []weread.Chapter
+	err = s.authedCall(ctx, acc, ck, func() error {
+		toc, tocErr := s.chapterInfos(ctx, acc.ID, ck, bookID)
+		if tocErr != nil {
+			return tocErr
+		}
+		chs = toc
+		return nil
+	})
 	if err != nil {
-		s.writeErr(w, http.StatusBadGateway, "读取目录失败："+err.Error())
-		return
+		return nil, "", nil, fmt.Errorf("读取目录失败：%v", err)
 	}
 	chapter := poolChapterFromTOC(chs)
 	if chapter == nil {
-		s.writeErr(w, http.StatusBadGateway, "这本书在官方目录里没有可读章节，换一本书试试")
-		return
+		return nil, "", nil, errors.New("这本书在官方目录里没有可读章节，换一本书试试")
 	}
 
-	state, err := s.wc.FetchReaderState(ctx, ck, bookID)
+	var state *weread.ReaderState
+	err = s.authedCall(ctx, acc, ck, func() error {
+		st, stErr := s.wc.FetchReaderState(ctx, ck, bookID)
+		if stErr != nil {
+			return stErr
+		}
+		state = st
+		return nil
+	})
 	if err != nil {
-		s.writeErr(w, http.StatusBadGateway, "生成模板失败："+err.Error())
-		return
+		return nil, "", nil, err
 	}
 	pc := state.PCLTS
 	if pc == "" || pc == "0" {
@@ -630,15 +696,7 @@ func (s *Server) handleAccountGeneratePayload(w http.ResponseWriter, r *http.Req
 		"ps":    state.PSVTS,
 		"pc":    pc,
 	}
-	if err := s.st.SavePayload(acc.ID, pl); err != nil {
-		s.writeErr(w, http.StatusInternalServerError, "保存模板失败")
-		return
-	}
-	s.writeJSON(w, http.StatusOK, map[string]any{
-		"ok": true, "has_payload": true,
-		"book_id": bookID, "chapter_id": chapter.ID, "ci": chapter.Index,
-		"book_title": truncateRunes(chapter.Title, 60),
-	})
+	return pl, bookID, chapter, nil
 }
 
 // poolChapterFromTOC 从章节目录中挑选生成模板所用章节：优先取有正文的实章
@@ -660,4 +718,21 @@ func poolChapterFromTOC(chs []weread.Chapter) *weread.Chapter {
 		return nil
 	}
 	return &chs[candidate]
+}
+
+// invalidCustomBookID 校验账号自定义 book_id 的形态与长度，和手动书池入口
+// 同一标准（书池按 TrimSpace 判空 + 64 rune 上限拒绝，见 pool.go）：
+// 非空时不得超过 64 rune、不得含空白字符；空串合法，表示回落书池，由引擎
+// 用 NormalizePayloadID 决定最终形态，这里不做合法 ID 形态的白名单。
+func invalidCustomBookID(id string) string {
+	if id == "" {
+		return ""
+	}
+	if utf8.RuneCountInString(id) > 64 {
+		return "书籍 ID 过长（上限 64 字符）"
+	}
+	if strings.ContainsFunc(id, unicode.IsSpace) {
+		return "书籍 ID 不能包含空白字符"
+	}
+	return ""
 }

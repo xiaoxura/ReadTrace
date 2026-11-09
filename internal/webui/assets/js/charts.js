@@ -2,6 +2,16 @@ import { cssVar, fmtMinutes, escapeHtml } from './util.js';
 
 let ringSeq = 0;
 
+// 缺陷 09：tooltip 水平定位 clamp（纯函数，.tmp 模拟测试直接 import 断言）。
+// 中心点 cx 的期望左缘 = cx - w/2，压回 [padding, hostWidth - padding - w]
+//（容器窄到放不下时贴左缘），返回期望左缘坐标；调用方为悬浮层的
+// translate(-50%) 中心定位方式补回 w/2。
+export function clampTipLeft(cx, tipWidth, hostWidth, padding = 2) {
+  const minLeft = padding;
+  const maxLeft = Math.max(minLeft, hostWidth - padding - tipWidth);
+  return Math.min(Math.max(cx - tipWidth / 2, minLeft), maxLeft);
+}
+
 export function barChart(host, data, opts = {}) {
   if (!host) return;
   host.__chart = { data, opts };
@@ -93,7 +103,12 @@ function paintBar(host) {
       const r = rect.getBoundingClientRect();
       tip.innerHTML = `${escapeHtml(d.label)} · <b>${escapeHtml(format(d.value))}</b>`;
       tip.style.display = 'block';
-      tip.style.left = `${r.left - hostRect.left + r.width / 2}px`;
+      // 缺陷 09：先按提示实际宽度 clamp 左缘，再换算成 translate(-50%) 的
+      // 中心点 left；最右/最左柱的日期、数值与单位都完整落在容器内。
+      const cx = r.left - hostRect.left + r.width / 2;
+      const tipWidth = tip.offsetWidth;
+      const left = clampTipLeft(cx, tipWidth, host.clientWidth);
+      tip.style.left = `${left + tipWidth / 2}px`;
       tip.style.top = `${r.top - hostRect.top + 2}px`;
     };
     rect.addEventListener('mouseenter', showTip);

@@ -32,7 +32,7 @@ export async function renderPool(ctx) {
   if (!ctx.isActive()) return;
 
   root.innerHTML = `
-    ${pageHeaderHTML({ title: '书池管理', sub: '阅读的书籍来源 · 按账号独立 · 指纹模板在设置页' })}
+    ${pageHeaderHTML({ title: '书池管理', sub: '阅读的书籍来源 · 按账号独立 · 扫码导入免抓包' })}
     <div class="card" style="margin-bottom:16px;padding:10px 14px">
       <nav class="pool-tabs" data-pool-tabs aria-label="书池子菜单">
         ${POOL_TABS.map(([key, label, ic]) => `
@@ -396,7 +396,7 @@ function drawShelfPreview() {
       <tr class="shelf-row" data-shelf="${escapeHtml(b.id)}" data-blocked="${blocked ? 1 : 0}">
         <td>${blocked
           ? '<input type="checkbox" disabled title="未付费，章节不可读，不导入">'
-          : `<input type="checkbox" data-shelf-book="${escapeHtml(b.id)}" data-title="${escapeHtml(b.title)}" data-author="${escapeHtml(b.author || '')}" data-cover="${escapeHtml(b.cover || '')}">`}</td>
+          : `<input type="checkbox" data-shelf-book="${escapeHtml(b.id)}" aria-label="选择 ${escapeHtml(b.title || b.id)}" data-title="${escapeHtml(b.title)}" data-author="${escapeHtml(b.author || '')}" data-cover="${escapeHtml(b.cover || '')}">`}</td>
         <td><div class="shelf-cover">${b.cover ? `<img loading="lazy" src="${escapeHtml(b.cover)}" alt="">` : ''}</div></td>
         <td class="cell-strong">${escapeHtml(b.title)}</td>
         <td class="cell-muted">${escapeHtml(b.author || '—')}</td>
@@ -427,6 +427,15 @@ function drawShelfPreview() {
   });
   const recount = () => { $('#shelf-count', host).textContent = `(${String($$('[data-shelf-book]:checked', host).length)})`; };
   $$('[data-shelf-book]', host).forEach((cb) => cb.addEventListener('change', recount));
+  // 整行点击 = 勾选/取消该书籍（未付费禁用的行除外）；行内的按钮与原生
+  // 控件不触发行点击，避免误触导入/翻页。
+  $$('.shelf-row', host).forEach((tr) => tr.addEventListener('click', (e) => {
+    if (e.target.closest('input, button, a, label, details, summary')) return;
+    const cb = tr.querySelector('[data-shelf-book]');
+    if (!cb || cb.disabled) return;
+    cb.checked = !cb.checked;
+    cb.dispatchEvent(new Event('change'));
+  }));
   $('#shelf-reload', host).addEventListener('click', () => loadShelf());
   $('#shelf-import', host).addEventListener('click', () => importSelected());
   $('[data-shelf-more]', host)?.addEventListener('click', loadMoreArchive);
@@ -491,13 +500,16 @@ async function importSelected() {
 
 /* ---------- 通用导入：进度弹窗 + 失败明细 ---------- */
 
-async function importBooks(selected, { accountOverride = 0, auditMap = null } = {}) {
+async function importBooks(selected, { accountOverride = 0, auditMap = null, withChapters: withChaptersOverride, chaptersPer: perOverride = null, ignorePaid: ignorePaidOverride = null } = {}) {
   const box = $('#page');
   const accountId = accountOverride || Number($('#shelf-account', box)?.value || 0);
   const snapshot = shelfCache?.account_id === accountId ? shelfCache : null;
-  const withChapters = Boolean($('#shelf-check-chapters', box)?.checked);
-  const per = Number($('#shelf-chapters-per', box)?.value || 0);
-  const ignorePaid = Boolean($('#shelf-ignore-paid', box)?.checked);
+  // 书池管理页没有导入页的选项控件：从可选覆盖参数取，未给则回落控件值。
+  const withChapters = withChaptersOverride
+    ?? Boolean($('#shelf-check-chapters', box)?.checked);
+  const per = perOverride ?? Number($('#shelf-chapters-per', box)?.value || 0);
+  const ignorePaid = ignorePaidOverride
+    ?? Boolean($('#shelf-ignore-paid', box)?.checked);
   let aborted = false;
   const confirmedIDs = new Set();
   const failures = {};
@@ -532,13 +544,13 @@ async function importBooks(selected, { accountOverride = 0, auditMap = null } = 
   const label = $('#imp-label', mask);
   const detail = $('#imp-detail', mask);
 
-  let added = 0, skipped = 0, chapterTotal = 0, chapterExisted = 0;
+  let added = 0, skipped = 0, chapterTotal = 0, chapterExisted = 0, chapterConflict = 0;
   for (let i = 0; i < selected.length; i++) {
     if (aborted) break;
     const b = selected[i];
     label.textContent = `导入 ${i + 1}/${selected.length}：${b.title || b.book_id}`;
     bar.style.width = `${Math.round((i / selected.length) * 100)}%`;
-    detail.textContent = `已完成：书籍 +${added} · 章节 +${chapterTotal}${chapterExisted ? `（已在池 ${chapterExisted}）` : ''} · 异常 ${Object.keys(failures).length}`;
+    detail.textContent = `已完成：书籍 +${added} · 章节 +${chapterTotal}${chapterExisted ? `（已在池 ${chapterExisted}）` : ''}${chapterConflict ? `（ID 冲突 ${chapterConflict}）` : ''} · 异常 ${Object.keys(failures).length}`;
     try {
       const res = await api.poolShelfImport({
         account_id: accountId,
@@ -552,6 +564,9 @@ async function importBooks(selected, { accountOverride = 0, auditMap = null } = 
       skipped += (res.books_skipped || []).length;
       chapterTotal += res.chapters_added || 0;
       chapterExisted += res.chapters_existed || 0;
+      chapterConflict += res.chapters_conflict || 0;
+      if (res.template_generated) toast('已为该账号自动生成请求模板', 'ok');
+      else if (res.template_hint) toast(`自动生成请求模板失败：${res.template_hint}，可稍后在账号设置手动生成`, 'warn', 8000);
       for (const id of [...(res.books_added || []), ...(res.books_skipped || [])]) confirmedIDs.add(id);
       Object.assign(failures, res.failures || {});
     } catch (e) {
@@ -563,7 +578,7 @@ async function importBooks(selected, { accountOverride = 0, auditMap = null } = 
   bar.style.width = '100%';
   label.textContent = aborted ? '已取消导入' : '导入完成';
   detail.innerHTML = `
-    书籍 +${added}（补充信息 ${skipped}） · 章节 +${chapterTotal}${chapterExisted ? `（其中已在池 ${chapterExisted} 条）` : ''} · 异常 ${Object.keys(failures).length}
+    书籍 +${added}（补充信息 ${skipped}） · 章节 +${chapterTotal}${chapterExisted ? `（其中已在池 ${chapterExisted} 条）` : ''}${chapterConflict ? ` · 章节 ID 冲突 ${chapterConflict} 条` : ''} · 异常 ${Object.keys(failures).length}
   `;
   const failedCount = Object.keys(failures).length;
   if (failedCount) {
@@ -664,6 +679,7 @@ function drawManageTab(box) {
         </select>
         <span class="hint" id="pool-summary"></span>
         <span style="flex:1"></span>
+        <button class="btn" id="pool-refetch" disabled>${icon('refresh')}补拉章节</button>
         <button class="btn btn-danger" id="pool-del-batch" disabled>${icon('trash')}删除所选</button>
       </div>
       <div data-pool-box><div class="hint">加载中…</div></div>
@@ -674,11 +690,13 @@ function drawManageTab(box) {
     poolPage = 1;
     poolCache = null;
     $('#pool-del-batch', box).disabled = true;
+    $('#pool-refetch', box).disabled = true;
     $('#pool-summary', box).textContent = '';
     $('[data-pool-box]', box).innerHTML = '<div class="hint">加载中…</div>';
     refreshPoolData();
   });
   $('#pool-del-batch', box).addEventListener('click', () => batchDeleteBooks());
+  $('#pool-refetch', box).addEventListener('click', () => refetchSelectedChapters());
   refreshPoolData();
 }
 
@@ -799,11 +817,16 @@ function poolBookRowHTML(b, chapterCount, order, progress) {
 function wirePoolRows() {
   const page = $('#page');
   const delBatchBtn = $('#pool-del-batch', page);
+  const refetchBtn = $('#pool-refetch', page);
   const recountSelection = () => {
     const n = $$('[data-book-sel]:checked', page).length;
     if (delBatchBtn) {
       delBatchBtn.disabled = n === 0;
       delBatchBtn.innerHTML = `${icon('trash')}删除所选${n ? ` (${n})` : ''}`;
+    }
+    if (refetchBtn) {
+      refetchBtn.disabled = n === 0;
+      refetchBtn.innerHTML = `${icon('refresh')}补拉章节${n ? ` (${n})` : ''}`;
     }
   };
   $$('[data-book-sel]', page).forEach((cb) => cb.addEventListener('change', recountSelection));
@@ -891,6 +914,30 @@ async function batchDeleteBooks() {
   }
   toast(`批量删除完成：成功 ${done}${failed ? `，失败 ${failed}` : ''}`, failed ? 'warn' : 'ok');
   refreshPoolData();
+}
+
+// refetchSelectedChapters 对选中的书重新拉取官方目录并补齐可读章节：
+// 复用导入的进度弹窗与逐本请求（含重试退避）；不去删除官方已消失的
+// 章节——那是抽屉里「清理付费未购章节」的职责。
+async function refetchSelectedChapters() {
+  const page = $('#page');
+  const selected = $$('[data-book-sel]:checked', page)
+    .map((cb) => (poolCache?.books || []).find((b) => b.id === Number(cb.dataset.bookSel)))
+    .filter(Boolean)
+    .map((b) => ({ book_id: b.value, title: b.title || '', author: b.author || '', cover: b.cover || '' }));
+  if (!selected.length) return;
+  const ok = await confirmDialog({
+    title: '补拉章节',
+    message: `对所选 ${selected.length} 本书重新拉取官方目录并补齐可读章节。已有的章节保持不动，不会删除任何内容。`,
+    confirmText: '补拉',
+  });
+  if (!ok) return;
+  await importBooks(selected, {
+    accountOverride: manageAccount,
+    withChapters: true,
+    chaptersPer: 0,
+    ignorePaid: false,
+  });
 }
 
 /* ---------- 章节抽屉 ---------- */
