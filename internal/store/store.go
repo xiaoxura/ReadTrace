@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS accounts (
 	last_error       TEXT NOT NULL DEFAULT '',
 	last_check_at    INTEGER NOT NULL DEFAULT 0,
 	default_minutes  INTEGER NOT NULL DEFAULT 30,
+	daily_goal_minutes INTEGER NOT NULL DEFAULT 0,
 	tick_seconds     INTEGER NOT NULL DEFAULT 30,
 	max_retries      INTEGER NOT NULL DEFAULT 0,
 	retry_delay      INTEGER NOT NULL DEFAULT 15,
@@ -81,6 +82,15 @@ CREATE TABLE IF NOT EXISTS run_logs (
 	ts      INTEGER NOT NULL,
 	level   TEXT NOT NULL,
 	message TEXT NOT NULL
+);
+
+-- 清理运行详情后保留统计事实。run_id 与仍在 runs 中的记录互斥。
+CREATE TABLE IF NOT EXISTS run_statistics (
+	run_id           INTEGER PRIMARY KEY,
+	account_id       INTEGER NOT NULL,
+	started_at       INTEGER NOT NULL,
+	finished_at      INTEGER NOT NULL,
+	elapsed_seconds  INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS schedules (
@@ -133,6 +143,7 @@ DROP TABLE IF EXISTS bot_messages;
 
 CREATE INDEX IF NOT EXISTS idx_runs_account_started ON runs(account_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_started ON runs(started_at);
+CREATE INDEX IF NOT EXISTS idx_run_statistics_account_started ON run_statistics(account_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_run_logs_run ON run_logs(run_id, id);
 CREATE INDEX IF NOT EXISTS idx_schedules_account ON schedules(account_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
@@ -143,14 +154,19 @@ func Open(dbPath string, box *secure.Box) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0o700); err != nil {
 		return nil, err
 	}
+	// sql.Open does not create the file. Create it with private permissions
+	// before SQLite opens it, including WAL side files in an existing data dir.
+	for _, path := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
+		if err := ensurePrivateDBFile(path); err != nil {
+			return nil, fmt.Errorf("设置数据库文件权限失败 (%s): %w", path, err)
+		}
+	}
 	dsn := "file:" + filepath.ToSlash(dbPath) +
 		"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(1)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
-	// The database holds encrypted credentials; keep it owner-only on POSIX.
-	_ = os.Chmod(dbPath, 0o600)
 	// A single connection keeps writes serialized and avoids SQLITE_BUSY on
 	// platforms where WAL locking is less forgiving.
 	db.SetMaxOpenConns(1)
@@ -160,80 +176,289 @@ func Open(dbPath string, box *secure.Box) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("初始化数据库失败: %w", err)
 	}
-	migrate(db)
+	// SQLite may replace/remove and recreate its side files while switching to
+	// WAL. Check permissions again after the first real connection.
+	for _, path := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
+		if err := chmodExistingDBFile(path); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("设置数据库文件权限失败 (%s): %w", path, err)
+		}
+	}
+	if err := migrate(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("迁移数据库失败: %w", err)
+	}
 	s := &Store{db: db, box: box}
 	return s, nil
 }
 
-// migrate adjusts databases created by older versions in place. Each ALTER
-// only succeeds once; on a fresh database the columns already exist in the
-// schema and the "duplicate column" error is ignored. Backfills rely on the
-// ALTER being the moment the column appears, so old data gets sane values.
-func migrate(db *sql.DB) {
-	// 每个账号的阅读重试配置。retry_delay 列先建立，backfill 才能生效。
-	if _, err := db.Exec(`ALTER TABLE accounts ADD COLUMN retry_delay INTEGER NOT NULL DEFAULT 15`); err != nil {
-		_ = err
+func ensurePrivateDBFile(path string) error {
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return err
 	}
-	if _, err := db.Exec(`ALTER TABLE accounts ADD COLUMN max_retries INTEGER NOT NULL DEFAULT 0`); err == nil {
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0o600)
+}
+
+func chmodExistingDBFile(path string) error {
+	err := os.Chmod(path, 0o600)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	return err
+}
+
+// migrate adjusts databases created by older versions in one transaction.
+// Columns are added only when absent, and unexpected errors stop startup.
+func migrate(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	goalAdded, err := addColumnIfMissing(tx, "accounts", "daily_goal_minutes", `INTEGER NOT NULL DEFAULT 0`)
+	if err != nil {
+		return err
+	}
+	if goalAdded {
+		if _, err := tx.Exec(`UPDATE accounts SET daily_goal_minutes = CASE
+			WHEN default_minutes BETWEEN 1 AND 1440 THEN default_minutes ELSE 30 END`); err != nil {
+			return err
+		}
+	}
+	// 每个账号的阅读重试配置。retry_delay 列先建立，backfill 才能生效。
+	if _, err := addColumnIfMissing(tx, "accounts", "retry_delay", `INTEGER NOT NULL DEFAULT 15`); err != nil {
+		return err
+	}
+	maxRetriesAdded, err := addColumnIfMissing(tx, "accounts", "max_retries", `INTEGER NOT NULL DEFAULT 0`)
+	if err != nil {
+		return err
+	}
+	if maxRetriesAdded {
 		// 老库迁移：保证已有账号的重试间隔不为 0（避免失败后立即重试）。
-		_, _ = db.Exec(`UPDATE accounts SET retry_delay = 15`)
+		if _, err := tx.Exec(`UPDATE accounts SET retry_delay = 15`); err != nil {
+			return err
+		}
 	}
 	// 本项目生成的展示 ID：按创建顺序从 0 开始。-1 表示「尚未分配」，让
 	// 列默认值不会把 MAX(seq)+1 的首个分配从 0 提前到 1。
-	if _, err := db.Exec(`ALTER TABLE accounts ADD COLUMN seq INTEGER NOT NULL DEFAULT -1`); err == nil {
-		_, _ = db.Exec(`UPDATE accounts SET seq = CAST(id - 1 AS INTEGER)`)
+	seqAdded, err := addColumnIfMissing(tx, "accounts", "seq", `INTEGER NOT NULL DEFAULT -1`)
+	if err != nil {
+		return err
+	}
+	if seqAdded {
+		if _, err := tx.Exec(`UPDATE accounts SET seq = CAST(id - 1 AS INTEGER)`); err != nil {
+			return err
+		}
 	}
 	// 稳定模板模式已移除：旧账号统一归入顺序书单。
-	_, _ = db.Exec(`UPDATE accounts SET mode = 'sequence' WHERE mode = 'stable' OR mode = ''`)
+	if _, err := tx.Exec(`UPDATE accounts SET mode = 'sequence' WHERE mode = 'stable' OR mode = ''`); err != nil {
+		return err
+	}
 	// 每个推送渠道可自定义各事件类型的消息模板。
-	if _, err := db.Exec(`ALTER TABLE push_channels ADD COLUMN templates_enc BLOB`); err != nil {
-		_ = err
+	if _, err := addColumnIfMissing(tx, "push_channels", "templates_enc", `BLOB`); err != nil {
+		return err
 	}
 	// 书池的展示元数据与章节归属：kind=book 行存 author/cover；kind=chapter
 	// 行存 book_id 指向所属书籍的 value，供「点进书籍看章节」与按书抽取。
-	for _, col := range []string{
-		`ALTER TABLE pool_items ADD COLUMN author TEXT NOT NULL DEFAULT ''`,
-		`ALTER TABLE pool_items ADD COLUMN cover TEXT NOT NULL DEFAULT ''`,
-		`ALTER TABLE pool_items ADD COLUMN book_id TEXT NOT NULL DEFAULT ''`,
-		`ALTER TABLE pool_items ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0`,
-		`ALTER TABLE pool_items ADD COLUMN word_count INTEGER NOT NULL DEFAULT 0`,
+	for _, col := range []struct{ name, definition string }{
+		{"author", `TEXT NOT NULL DEFAULT ''`},
+		{"cover", `TEXT NOT NULL DEFAULT ''`},
+		{"book_id", `TEXT NOT NULL DEFAULT ''`},
+		{"sort_order", `INTEGER NOT NULL DEFAULT 0`},
+		{"word_count", `INTEGER NOT NULL DEFAULT 0`},
 	} {
-		if _, err := db.Exec(col); err != nil {
-			_ = err
+		if _, err := addColumnIfMissing(tx, "pool_items", col.name, col.definition); err != nil {
+			return err
 		}
 	}
 	// 内置 12 本书/16 章节已彻底移除：书池不再由程序播种，这里不再有兜底
 	// 常量需要清理。
 	// "mpbook" 是微信读书的「文章收藏」合集虚拟书，没法按书阅读，迁移时清理。
-	_, _ = db.Exec(`DELETE FROM pool_items WHERE value = 'mpbook'`)
-	_, _ = db.Exec(`DELETE FROM settings WHERE key = 'pool_seeded_v1'`)
+	if _, err := tx.Exec(`DELETE FROM pool_items WHERE value = 'mpbook'`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM settings WHERE key = 'pool_seeded_v1'`); err != nil {
+		return err
+	}
 	// 书池多账号化：account_id（0=共享）。老库还有 UNIQUE(kind, value) 约束，
 	// 同一本书无法在不同账号各有一条，需要重建表改唯一键。
-	if _, err := db.Exec(`ALTER TABLE pool_items ADD COLUMN account_id INTEGER NOT NULL DEFAULT 0`); err != nil {
-		_ = err
+	if _, err := addColumnIfMissing(tx, "pool_items", "account_id", `INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return err
 	}
-	rebuildPoolUniqueKey(db)
+	if err := rebuildPoolUniqueKey(tx); err != nil {
+		return err
+	}
 	// 共享池已移除：account_id=0 的历史条目归属到第一个已绑定账号。
-	_, _ = db.Exec(`UPDATE pool_items SET account_id = (SELECT MIN(id) FROM accounts)
-		WHERE account_id = 0 AND EXISTS (SELECT 1 FROM accounts)`)
+	if err := migrateSharedPoolOwnership(tx); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
-// rebuildPoolUniqueKey 把 pool_items 的 UNIQUE(kind, value) 升级为
-// UNION(kind, value, account_id)。通过检查旧表 DDL 判断是否已经迁移过，
-// 避免每次重启都要重建表。
-func rebuildPoolUniqueKey(db *sql.DB) {
-	var ddl string
-	if err := db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='pool_items'`).Scan(&ddl); err != nil {
-		return
+// migrateSharedPoolOwnership merges a shared item into the first account's
+// existing copy before changing ownership. The account copy keeps its ID,
+// enabled state and ordering; shared metadata only fills empty fields.
+func migrateSharedPoolOwnership(tx *sql.Tx) error {
+	var firstAccount sql.NullInt64
+	if err := tx.QueryRow(`SELECT MIN(id) FROM accounts`).Scan(&firstAccount); err != nil {
+		return err
 	}
-	if strings.Contains(strings.ToLower(ddl), "account_id") {
-		return // 已经是多账号版本
+	if !firstAccount.Valid {
+		return nil
 	}
-	tx, err := db.Begin()
+	type poolMerge struct {
+		ownedID, sharedID            int64
+		title, author, cover, bookID string
+		wordCount                    int64
+	}
+	rows, err := tx.Query(`SELECT owned.id, shared.id,
+		COALESCE(NULLIF(owned.title, ''), shared.title),
+		COALESCE(NULLIF(owned.author, ''), shared.author),
+		COALESCE(NULLIF(owned.cover, ''), shared.cover),
+		COALESCE(NULLIF(owned.book_id, ''), shared.book_id),
+		CASE WHEN owned.word_count = 0 THEN shared.word_count ELSE owned.word_count END
+		FROM pool_items owned JOIN pool_items shared
+		ON owned.kind = shared.kind AND owned.value = shared.value
+		WHERE owned.account_id = ? AND shared.account_id = 0`, firstAccount.Int64)
 	if err != nil {
-		return
+		return err
 	}
-	defer func() { _ = tx.Rollback() }()
+	merges := []poolMerge{}
+	for rows.Next() {
+		var item poolMerge
+		if err := rows.Scan(&item.ownedID, &item.sharedID, &item.title, &item.author,
+			&item.cover, &item.bookID, &item.wordCount); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		merges = append(merges, item)
+	}
+	err = rows.Err()
+	if closeErr := rows.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return err
+	}
+	for _, item := range merges {
+		if _, err := tx.Exec(`UPDATE pool_items SET title = ?, author = ?, cover = ?, book_id = ?, word_count = ?
+			WHERE id = ?`, item.title, item.author, item.cover, item.bookID, item.wordCount, item.ownedID); err != nil {
+			return fmt.Errorf("合并共享书池条目 %d 失败: %w", item.sharedID, err)
+		}
+		if _, err := tx.Exec(`DELETE FROM pool_items WHERE id = ? AND account_id = 0`, item.sharedID); err != nil {
+			return fmt.Errorf("删除已合并共享书池条目 %d 失败: %w", item.sharedID, err)
+		}
+	}
+	if _, err := tx.Exec(`UPDATE pool_items SET account_id = ? WHERE account_id = 0`, firstAccount.Int64); err != nil {
+		return fmt.Errorf("迁移共享书池归属失败: %w", err)
+	}
+	return nil
+}
+
+func addColumnIfMissing(tx *sql.Tx, table, column, definition string) (bool, error) {
+	rows, err := tx.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return false, fmt.Errorf("检查 %s.%s 列失败: %w", table, column, err)
+	}
+	found, count := false, 0
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, typ string
+		var defaultValue sql.NullString
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			_ = rows.Close()
+			return false, err
+		}
+		count++
+		found = found || strings.EqualFold(name, column)
+	}
+	err = rows.Err()
+	if closeErr := rows.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return false, fmt.Errorf("检查 %s.%s 列失败: %w", table, column, err)
+	}
+	if count == 0 {
+		return false, fmt.Errorf("迁移缺少表 %s", table)
+	}
+	if found {
+		return false, nil
+	}
+	if _, err := tx.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + column + ` ` + definition); err != nil {
+		return false, fmt.Errorf("添加 %s.%s 列失败: %w", table, column, err)
+	}
+	return true, nil
+}
+
+// rebuildPoolUniqueKey replaces legacy unique constraints with the account-
+// scoped key. Inspect actual indexes because the old table can already have an
+// account_id column while still enforcing UNIQUE(kind, value).
+func rebuildPoolUniqueKey(tx *sql.Tx) error {
+	indexes, err := tx.Query(`PRAGMA index_list(pool_items)`)
+	if err != nil {
+		return err
+	}
+	type uniqueIndex struct {
+		name    string
+		partial bool
+	}
+	unique := []uniqueIndex{}
+	for indexes.Next() {
+		var seq, isUnique, partial int
+		var name, origin string
+		if err := indexes.Scan(&seq, &name, &isUnique, &origin, &partial); err != nil {
+			_ = indexes.Close()
+			return err
+		}
+		if isUnique != 0 {
+			unique = append(unique, uniqueIndex{name: name, partial: partial != 0})
+		}
+	}
+	err = indexes.Err()
+	if closeErr := indexes.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return err
+	}
+	hasExpected, hasOther := false, false
+	for _, index := range unique {
+		quoted := `"` + strings.ReplaceAll(index.name, `"`, `""`) + `"`
+		rows, err := tx.Query(`PRAGMA index_info(` + quoted + `)`)
+		if err != nil {
+			return err
+		}
+		columns := []string{}
+		for rows.Next() {
+			var seq, cid int
+			var name sql.NullString
+			if err := rows.Scan(&seq, &cid, &name); err != nil {
+				_ = rows.Close()
+				return err
+			}
+			columns = append(columns, name.String)
+		}
+		err = rows.Err()
+		if closeErr := rows.Close(); err == nil {
+			err = closeErr
+		}
+		if err != nil {
+			return err
+		}
+		if !index.partial && len(columns) == 3 && columns[0] == "kind" && columns[1] == "value" && columns[2] == "account_id" {
+			hasExpected = true
+		} else {
+			hasOther = true
+		}
+	}
+	if hasExpected && !hasOther {
+		return nil
+	}
 	steps := []string{
 		`CREATE TABLE pool_items_new (
 			id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -250,19 +475,19 @@ func rebuildPoolUniqueKey(db *sql.DB) {
 			created_at  INTEGER NOT NULL,
 			UNIQUE(kind, value, account_id)
 		)`,
-		`INSERT OR IGNORE INTO pool_items_new
+		`INSERT INTO pool_items_new
 			(id, kind, value, title, author, cover, book_id, account_id, enabled, sort_order, word_count, created_at)
-		 SELECT id, kind, value, title, author, cover, book_id, COALESCE(account_id, 0), enabled, 0, 0, created_at
+		 SELECT id, kind, value, title, author, cover, book_id, account_id, enabled, sort_order, word_count, created_at
 		 FROM pool_items`,
 		`DROP TABLE pool_items`,
 		`ALTER TABLE pool_items_new RENAME TO pool_items`,
 	}
 	for _, stmt := range steps {
 		if _, err := tx.Exec(stmt); err != nil {
-			return
+			return fmt.Errorf("重建书池唯一键失败: %w", err)
 		}
 	}
-	_ = tx.Commit()
+	return nil
 }
 
 // Close closes the database.

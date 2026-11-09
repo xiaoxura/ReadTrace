@@ -40,21 +40,19 @@ func (f *qrFlow) snapshot() (status, errMsg, logic string, accountID, expiresAt,
 }
 
 type qrManager struct {
-	mu    sync.Mutex
-	flows map[string]*qrFlow
-	st    *store.Store
-	wc    *weread.Client
-	log   *slog.Logger
-	// isRunning reports whether an account already has an active reading run;
-	// rebinding such an account would race with the engine's cookie renewal.
-	isRunning func(accountID int64) bool
+	mu              sync.Mutex
+	flows           map[string]*qrFlow
+	st              *store.Store
+	wc              *weread.Client
+	log             *slog.Logger
+	withIdleAccount func(accountID int64, fn func() error) error
 }
 
-func newQRManager(st *store.Store, wc *weread.Client, log *slog.Logger, isRunning func(int64) bool) *qrManager {
-	if isRunning == nil {
-		isRunning = func(int64) bool { return false }
+func newQRManager(st *store.Store, wc *weread.Client, log *slog.Logger, withIdleAccount func(int64, func() error) error) *qrManager {
+	if withIdleAccount == nil {
+		withIdleAccount = func(_ int64, fn func() error) error { return fn() }
 	}
-	return &qrManager{flows: map[string]*qrFlow{}, st: st, wc: wc, log: log, isRunning: isRunning}
+	return &qrManager{flows: map[string]*qrFlow{}, st: st, wc: wc, log: log, withIdleAccount: withIdleAccount}
 }
 
 // Start creates a fresh QR login flow.
@@ -227,16 +225,18 @@ func (m *qrManager) bind(f *qrFlow, res *weread.LoginPoll) {
 		return
 	}
 	if acc != nil {
-		if m.isRunning(acc.ID) {
-			m.fail(f, "该账号正在阅读中，请先停止任务，再重新扫码绑定")
-			return
-		}
-		if err := m.st.SaveCookies(acc.ID, map[string]string(ck)); err != nil {
+		err := m.withIdleAccount(acc.ID, func() error {
+			if err := m.st.SaveCookies(acc.ID, map[string]string(ck)); err != nil {
+				return err
+			}
+			_ = m.st.UpdateIdentity(acc.ID, vid, nickname, avatar)
+			_ = m.st.SetAccountStatus(acc.ID, "active", "", time.Now().Unix())
+			return nil
+		})
+		if err != nil {
 			m.fail(f, "保存登录状态失败："+err.Error())
 			return
 		}
-		_ = m.st.UpdateIdentity(acc.ID, vid, nickname, avatar)
-		_ = m.st.SetAccountStatus(acc.ID, "active", "", time.Now().Unix())
 		m.set(f.UID, func(fl *qrFlow) {
 			fl.Status = "confirmed"
 			fl.AccountID = acc.ID
@@ -250,15 +250,16 @@ func (m *qrManager) bind(f *qrFlow, res *weread.LoginPoll) {
 	}
 	name = truncateRunes(name, 60)
 	id, err := m.st.CreateAccount(store.Account{
-		Name:           name,
-		Vid:            vid,
-		Nickname:       nickname,
-		Avatar:         avatar,
-		Status:         "active",
-		DefaultMinutes: 30,
-		TickSeconds:    30,
-		Mode:           "sequence",
-		LastCheckAt:    time.Now().Unix(),
+		Name:             name,
+		Vid:              vid,
+		Nickname:         nickname,
+		Avatar:           avatar,
+		Status:           "active",
+		DefaultMinutes:   30,
+		DailyGoalMinutes: 30,
+		TickSeconds:      30,
+		Mode:             "sequence",
+		LastCheckAt:      time.Now().Unix(),
 	}, map[string]string(ck), nil)
 	if err != nil {
 		m.fail(f, "创建账号失败："+err.Error())

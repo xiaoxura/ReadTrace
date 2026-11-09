@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -36,6 +37,10 @@ type Server struct {
 	version string
 	started time.Time
 	limiter *loginLimiter
+	// authMu serializes password verification/session issuance with changes.
+	authMu sync.Mutex
+	// settingsMu coordinates persisted settings with the scheduler/cache reload.
+	settingsMu sync.Mutex
 
 	allowedHosts []string                      // optional Host allowlist (DNS-rebinding defense)
 	tz           atomic.Pointer[time.Location] // cached site timezone
@@ -56,7 +61,7 @@ func New(st *store.Store, eng *engine.Engine, sch *sched.Scheduler, nt *notify.S
 	} else {
 		s.tz.Store(time.Local)
 	}
-	s.qr = newQRManager(st, wc, log, eng.IsRunning)
+	s.qr = newQRManager(st, wc, log, eng.WithIdleAccount)
 	return s
 }
 

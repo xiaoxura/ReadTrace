@@ -3,7 +3,7 @@ import { icon } from './icons.js';
 import { state, refreshAccounts, accountById } from './state.js';
 import { runStatusBadge } from './helpers.js';
 import {
-  $, $$, escapeHtml, openModal, confirmDialog, toast, fmtMinutes, fmtClock, humanCron,
+  $, $$, escapeHtml, openModal, confirmDialog, toast, fmtMinutes, fmtClock, fmtTime, humanCron,
   copyText, debounce, setLoading, initials, lockScroll, unlockScroll,
 } from './util.js';
 
@@ -23,6 +23,15 @@ export function accountSelectHTML(selected = 0, { includeAll = false, id = 'acco
 
 const MINUTE_PRESETS = [15, 30, 60, 90, 120];
 
+// 今日余量可能不足 1 分钟，不能用一位小数的分钟数显示成 0.0。
+function readingTime(seconds) {
+  const total = Math.max(0, Math.floor(Number(seconds) || 0));
+  const minutes = Math.floor(total / 60);
+  const rest = total % 60;
+  if (!minutes) return `${rest} 秒`;
+  return rest ? `${minutes} 分 ${rest} 秒` : `${minutes} 分钟`;
+}
+
 export function startRunDialog({ accountId = 0, onDone } = {}) {
   const accounts = state.accounts;
   if (!accounts.length) {
@@ -32,9 +41,15 @@ export function startRunDialog({ accountId = 0, onDone } = {}) {
   }
   const target = accountById(accountId) || accounts[0];
   const defaultMinutes = target?.default_minutes || 30;
+  let closed = false;
+  let accountRequest = 0;
+  let inputVersion = 0;
+  let accountLoading = false;
+  let submitting = false;
+  let currentAccount = null;
   const { mask, close } = openModal({
     title: '开始阅读',
-    subtitle: '每 30 秒上报一次阅读进度，达标后自动结束',
+    subtitle: '按账号心跳间隔上报进度，达到本次或每日目标后结束',
     body: `
       <div class="field">
         <label class="label" for="run-account">账号</label>
@@ -48,38 +63,114 @@ export function startRunDialog({ accountId = 0, onDone } = {}) {
         </div>
         <div class="hint">账号默认时长可在「账号 → 编辑」中修改。单次最长 24 小时。</div>
       </div>
+      <div class="note" data-daily-preview aria-live="polite">${icon('info')}<div>正在读取今日阅读进度…</div></div>
       <div class="note">
         ${icon('info')}
         <div>运行期间请保持服务在线。进度会实时同步到面板，可随时停止。</div>
       </div>`,
     footer: `<button class="btn btn-ghost" data-cancel>取消</button>
       <button class="btn btn-primary" data-start>${icon('play')}开始阅读</button>`,
+    onClose: () => { closed = true; accountRequest++; },
   });
 
+  const accountSelect = $('#run-account', mask);
+  const minutesInput = $('#run-minutes', mask);
+  const preview = $('[data-daily-preview]', mask);
+  const btn = $('[data-start]', mask);
+  const validMinutes = () => {
+    const raw = minutesInput.value.trim();
+    const value = Number(raw);
+    return raw !== '' && Number.isInteger(value) && value >= 1 && value <= 1440 ? value : null;
+  };
+  const updateChips = () => {
+    $$('.chip', mask).forEach((chip) => chip.classList.toggle('active', Number(chip.dataset.min) === validMinutes()));
+  };
+  const updatePreview = () => {
+    if (closed) return;
+    const minutes = validMinutes();
+    const goal = Number(currentAccount?.daily_goal_minutes) || 0;
+    const today = Math.max(0, Number(currentAccount?.today_seconds) || 0);
+    const remaining = Math.max(0, Number(currentAccount?.daily_remaining_seconds) || 0);
+    let message;
+    if (accountLoading) message = '正在读取今日阅读进度…';
+    else if (!currentAccount) message = '今日进度暂不可用，服务端仍会按最新目标计算本次时长。';
+    else if (!goal) message = `每日目标已关闭 · 今日已读 ${readingTime(today)}。本次按填写时长运行。`;
+    else if (!remaining) message = `今日已读 ${readingTime(today)} / 目标 ${readingTime(goal * 60)}，已达标。`;
+    else message = `今日已读 ${readingTime(today)} / 目标 ${readingTime(goal * 60)} · 还需 ${readingTime(remaining)}${minutes ? `；本次最多 ${readingTime(Math.min(minutes * 60, remaining))}` : ''}。`;
+    preview.innerHTML = `${icon('info')}<div>${escapeHtml(message)}</div>`;
+    btn.disabled = submitting || accountLoading || (goal > 0 && remaining === 0);
+    btn.innerHTML = goal > 0 && remaining === 0 ? '今日已达标' : `${icon('play')}开始阅读`;
+  };
+  const loadAccount = async () => {
+    const id = Number(accountSelect.value);
+    const request = ++accountRequest;
+    const version = inputVersion;
+    accountLoading = true;
+    currentAccount = null;
+    updatePreview();
+    try {
+      const account = await api.account(id);
+      if (closed || request !== accountRequest) return;
+      currentAccount = account;
+      if (version === inputVersion) {
+        minutesInput.value = String(account.default_minutes || 30);
+        updateChips();
+      }
+    } catch {
+      if (closed || request !== accountRequest) return;
+      currentAccount = null;
+    } finally {
+      if (!closed && request === accountRequest) {
+        accountLoading = false;
+        updatePreview();
+      }
+    }
+  };
   $('[data-cancel]', mask).addEventListener('click', close);
   $$('.chip', mask).forEach((chip) => chip.addEventListener('click', () => {
-    $$('.chip', mask).forEach((c) => c.classList.remove('active'));
-    chip.classList.add('active');
-    $('#run-minutes', mask).value = chip.dataset.min;
+    minutesInput.value = chip.dataset.min;
+    inputVersion++;
+    updateChips();
+    updatePreview();
   }));
-  const btn = $('[data-start]', mask);
+  minutesInput.addEventListener('input', () => { inputVersion++; updateChips(); updatePreview(); });
+  accountSelect.addEventListener('change', () => {
+    const selected = accountById(accountSelect.value);
+    minutesInput.value = String(selected?.default_minutes || 30);
+    inputVersion++;
+    updateChips();
+    loadAccount();
+  });
+  loadAccount();
   btn.addEventListener('click', async () => {
-    const minutes = Number($('#run-minutes', mask).value) || 30;
-    if (minutes < 1 || minutes > 1440) {
-      toast('时长需在 1~1440 分钟之间', 'warn');
+    const minutes = validMinutes();
+    if (minutes === null) {
+      toast('时长需为 1~1440 的整数分钟', 'warn');
       return;
     }
+    if (accountLoading || submitting) return;
+    submitting = true;
+    updatePreview();
     setLoading(btn, true);
     try {
-      await api.startRun(Number($('#run-account', mask).value), minutes);
+      const res = await api.startRun(Number(accountSelect.value), minutes);
       close();
+      if (res?.skipped) {
+        toast(res.reason || '今日目标已完成', 'info');
+        onDone?.();
+        return;
+      }
       toast('已开始阅读，进度实时更新中', 'ok');
       onDone?.();
       window.dispatchEvent(new CustomEvent('run:started'));
     } catch (e) {
       toast(e.message, 'error');
     } finally {
-      setLoading(btn, false);
+      submitting = false;
+      if (!closed) {
+        setLoading(btn, false);
+        updatePreview();
+      }
     }
   });
 }
@@ -365,6 +456,11 @@ export function editAccountDialog(acc, { onDone } = {}) {
           <input class="input" id="acc-minutes" type="number" min="1" max="1440" data-minutes value="${escapeHtml(acc.default_minutes)}">
         </div>
       </div>
+      <div class="field">
+        <label class="label" for="acc-daily-goal">每日阅读目标 <span class="opt">分钟</span></label>
+        <input class="input" id="acc-daily-goal" type="number" min="0" max="1440" step="1" data-daily-goal value="${escapeHtml(acc.daily_goal_minutes ?? acc.default_minutes)}">
+        <div class="hint">填 0 关闭。按站点时区累计本工具的今日阅读记录；保存后对新任务生效，最多补足今日余量。</div>
+      </div>
       <div class="grid-2">
         <div class="field">
           <label class="label" for="acc-tick">心跳间隔 <span class="opt">秒</span></label>
@@ -404,14 +500,14 @@ export function editAccountDialog(acc, { onDone } = {}) {
       <div class="section-title">阅读内容</div>
       <div data-mode-extra></div>
 
-      <div class="section-title">推送通知</div>
+      <div class="section-title">问题提醒</div>
       <div class="field">
-        <label class="label" for="acc-channel">完成后推送到</label>
+        <label class="label" for="acc-channel">问题提醒渠道</label>
         <select class="select" id="acc-channel" data-channel>
-          <option value="0">不推送</option>
+          <option value="0">不提醒</option>
           ${channelOptions}
         </select>
-        <div class="hint">可在「推送」页面添加 PushPlus / WxPusher / Telegram / ServerChan。</div>
+        <div class="hint">仅在自动重试后仍失败或确认登录失效时提醒；正常完成和手动停止保持安静。渠道可在「推送」页面添加。</div>
       </div>`,
     footer: `<button class="btn btn-danger" data-delete>${icon('trash')}删除账号</button>
       <span style="flex:1"></span>
@@ -478,7 +574,7 @@ export function editAccountDialog(acc, { onDone } = {}) {
       if (!val) { toast('请粘贴 curl 或请求体', 'warn'); return; }
       setLoading(e.currentTarget, true);
       try {
-        await api.savePayload(acc.id, { curl: val });
+        await api.savePayload(acc.id, val.startsWith('{') ? { payload: val } : { curl: val });
         acc.has_payload = true;
         renderModeExtra();
         toast('模板已保存，该账号所有模式都会用它作为请求基底', 'ok');
@@ -521,9 +617,22 @@ export function editAccountDialog(acc, { onDone } = {}) {
       toast('账号名称不能为空', 'warn');
       return;
     }
+    const defaultRaw = $('[data-minutes]', mask).value.trim();
+    const defaultMinutes = Number(defaultRaw);
+    if (defaultRaw === '' || !Number.isInteger(defaultMinutes) || defaultMinutes < 1 || defaultMinutes > 1440) {
+      toast('默认时长需为 1~1440 的整数分钟', 'warn');
+      return;
+    }
+    const goalRaw = $('[data-daily-goal]', mask).value.trim();
+    const dailyGoalMinutes = Number(goalRaw);
+    if (goalRaw === '' || !Number.isInteger(dailyGoalMinutes) || dailyGoalMinutes < 0 || dailyGoalMinutes > 1440) {
+      toast('每日目标需为 0~1440 的整数分钟', 'warn');
+      return;
+    }
     const patch = {
       name,
-      default_minutes: Number($('[data-minutes]', mask).value) || 30,
+      default_minutes: defaultMinutes,
+      daily_goal_minutes: dailyGoalMinutes,
       tick_seconds: Number($('[data-tick]', mask).value) || 30,
       max_retries: Number($('[data-retries]', mask).value) || 0,
       retry_delay: Number($('[data-retry-delay]', mask).value) || 15,
@@ -755,7 +864,7 @@ export function pushChannelDialog({ channel = null, onDone } = {}) {
   const type = channel?.type || 'pushplus';
   const { mask, close } = openModal({
     title: editing ? '编辑推送渠道' : '添加推送渠道',
-    subtitle: '阅读完成后发送结果通知',
+    subtitle: '阅读遇到问题时发送提醒',
     body: `
       <div class="type-grid" data-types>
         ${PUSH_TYPES.map(([t, label, ic]) =>
@@ -771,7 +880,7 @@ export function pushChannelDialog({ channel = null, onDone } = {}) {
         <label class="check"><span class="switch"><input type="checkbox" data-enabled ${channel?.enabled === false ? '' : 'checked'}><i></i></span> 启用该渠道</label>
       </div>
       <div class="section-title" style="text-transform:none;letter-spacing:0">消息模板 <span style="color:var(--muted);font-size:11px;font-weight:500">可选，留空用默认文案</span></div>
-      <div class="note" style="margin-bottom:12px">${icon('info')}<div>为不同事件自定义推送标题与内容（成功 / 失败 / 账号失效），留空使用默认文案。可用变量：{{account}}、{{plan}}、{{elapsed}}、{{status}}、{{error}}、{{success}}、{{failed}}、{{time}}。</div></div>
+      <div class="note" style="margin-bottom:12px">${icon('info')}<div>自动提醒仅用于重试后仍失败或确认登录失效；成功模板保留兼容，正常完成不自动推送。留空使用默认文案。可用变量：{{account}}、{{plan}}、{{elapsed}}、{{status}}、{{error}}、{{success}}、{{failed}}、{{time}}。</div></div>
       ${TEMPLATE_KINDS.map(([k, label, defTitle, defBody]) => `
         <div class="field">
           <label class="label">${label} · 标题</label>
@@ -854,10 +963,11 @@ export function runDetailDrawer(runId, { onDone } = {}) {
       <div class="grid-2" data-stats style="margin-bottom:14px"></div>
       <div data-run-error style="margin-bottom:14px"></div>
       <div class="card-title" style="margin-bottom:10px">${icon('list')}实时日志</div>
+      <div class="hint" data-log-status style="margin-bottom:8px">正在加载完整日志…</div>
       <div class="console" data-console><div class="empty-log">加载日志…</div></div>
     </div>
     <div class="drawer-foot">
-      <button class="btn btn-sm btn-ghost" data-copy>${icon('copy')}复制日志</button>
+      <button class="btn btn-sm btn-ghost" data-copy disabled>${icon('copy')}日志加载中…</button>
       <button class="btn btn-sm btn-danger" data-stop>${icon('stop')}停止运行</button>
       <button class="btn btn-sm" data-close2>关闭</button>
     </div>`;
@@ -866,9 +976,20 @@ export function runDetailDrawer(runId, { onDone } = {}) {
   lockScroll();
 
   let closed = false;
-  let logAfter = 0;
+  let historyAfter = 0;
+  let historyLoading = false;
+  let historyComplete = false;
+  let catchUpAfterLoad = false;
+  let logRequestToken = 0;
+  let logController = null;
+  let lastRenderedId = 0;
+  let initialLogError = '';
+  const seenLogIDs = new Set();
+  const pendingLiveLogs = [];
   let baseRun = null;
   const consoleEl = $('[data-console]', drawer);
+  const logStatus = $('[data-log-status]', drawer);
+  const copyBtn = $('[data-copy]', drawer);
   const stopBtn = $('[data-stop]', drawer);
 
   const onKey = (e) => {
@@ -881,6 +1002,8 @@ export function runDetailDrawer(runId, { onDone } = {}) {
   const close = () => {
     if (closed) return;
     closed = true;
+    logRequestToken++;
+    logController?.abort();
     mask.remove();
     drawer.remove();
     unlockScroll();
@@ -898,14 +1021,72 @@ export function runDetailDrawer(runId, { onDone } = {}) {
     if (!logs?.length) return;
     if (consoleEl.querySelector('.empty-log')) consoleEl.innerHTML = '';
     for (const log of logs) {
-      if (log.id && log.id <= logAfter && baseRun) continue; // SSE 与初次加载的边界重复行去重
-      logAfter = Math.max(logAfter, log.id || 0);
+      const id = Number(log.id) || 0;
+      if (id && seenLogIDs.has(id)) continue;
+      if (id) seenLogIDs.add(id);
       const line = document.createElement('div');
       line.className = `log-line ${escapeHtml(log.level)}`;
-      line.innerHTML = `<span class="t">${new Date(log.ts * 1000).toLocaleTimeString('zh-CN', { hour12: false })}</span><span class="lv">${escapeHtml(String(log.level).toUpperCase())}</span><span class="m">${escapeHtml(log.message)}</span>`;
-      consoleEl.appendChild(line);
+      if (id) line.dataset.logId = String(id);
+      line.innerHTML = `<span class="t">${fmtTime(log.ts, state.tz, true)}</span><span class="lv">${escapeHtml(String(log.level).toUpperCase())}</span><span class="m">${escapeHtml(log.message)}</span>`;
+      if (id && id < lastRenderedId) {
+        const next = Array.from(consoleEl.children).find((el) => Number(el.dataset.logId) > id);
+        consoleEl.insertBefore(line, next || null);
+      } else {
+        consoleEl.appendChild(line);
+      }
+      lastRenderedId = Math.max(lastRenderedId, id);
     }
     consoleEl.scrollTop = consoleEl.scrollHeight;
+  };
+
+  const loadAllLogs = async () => {
+    if (closed || historyLoading) return;
+    historyLoading = true;
+    historyComplete = false;
+    const token = ++logRequestToken;
+    const controller = new AbortController();
+    logController = controller;
+    copyBtn.disabled = true;
+    copyBtn.innerHTML = `${icon('copy')}日志加载中…`;
+    logStatus.textContent = initialLogError
+      ? `${initialLogError}；正在通过分页接口重新加载…`
+      : '正在加载完整日志…';
+    try {
+      let more = true;
+      while (more && !closed && token === logRequestToken) {
+        const res = await api.runLogs(runId, { afterId: historyAfter, limit: 500, signal: controller.signal });
+        if (closed || token !== logRequestToken) return;
+        const logs = res?.logs;
+        if (!Array.isArray(logs)) throw new Error('日志响应格式错误');
+        const lastID = logs.length ? Number(logs[logs.length - 1].id) : historyAfter;
+        if (logs.length && (!Number.isFinite(lastID) || lastID <= historyAfter)) {
+          throw new Error('日志分页未推进');
+        }
+        appendLogs(logs);
+        historyAfter = lastID;
+        more = logs.length === 500 || catchUpAfterLoad;
+        catchUpAfterLoad = false;
+      }
+      if (closed || token !== logRequestToken) return;
+      pendingLiveLogs.sort((a, b) => (Number(a.id) || 0) - (Number(b.id) || 0));
+      appendLogs(pendingLiveLogs);
+      pendingLiveLogs.length = 0;
+      const logCount = consoleEl.querySelectorAll('.log-line').length;
+      if (!logCount) consoleEl.innerHTML = '<div class="empty-log">暂无日志</div>';
+      historyLoading = false;
+      historyComplete = true;
+      initialLogError = '';
+      logStatus.textContent = `已加载当前全部日志（${logCount} 条）`;
+      copyBtn.disabled = false;
+      copyBtn.innerHTML = `${icon('copy')}复制日志`;
+    } catch (e) {
+      if (closed || token !== logRequestToken) return;
+      historyLoading = false;
+      logStatus.innerHTML = `<div class="note warn">${icon('alert')}<div>日志加载中断：${escapeHtml(e.message)} <button class="btn btn-sm" data-retry-logs>重试加载</button></div></div>`;
+      $('[data-retry-logs]', logStatus).addEventListener('click', loadAllLogs);
+    } finally {
+      if (logController === controller) logController = null;
+    }
   };
 
   const paintRun = (run) => {
@@ -933,7 +1114,10 @@ export function runDetailDrawer(runId, { onDone } = {}) {
   const onEvent = (e) => {
     const ev = e.detail;
     if (ev.run_id !== runId) return;
-    if (ev.type === 'run.log' && ev.data) appendLogs([ev.data]);
+    if (ev.type === 'run.log' && ev.data) {
+      if (historyComplete) appendLogs([ev.data]);
+      else pendingLiveLogs.push(ev.data);
+    }
     if (ev.type === 'run.tick' && ev.data) {
       const d = ev.data;
       if (!baseRun) {
@@ -951,6 +1135,8 @@ export function runDetailDrawer(runId, { onDone } = {}) {
       paintRun(baseRun);
     }
     if (ev.type === 'run.end') {
+      if (historyLoading) catchUpAfterLoad = true;
+      else if (historyComplete) loadAllLogs();
       stopBtn.style.display = 'none';
       if (baseRun) baseRun.status = ev.data?.status || 'success';
       if (baseRun) paintRun(baseRun);
@@ -975,7 +1161,8 @@ export function runDetailDrawer(runId, { onDone } = {}) {
     }
   });
 
-  $('[data-copy]', drawer).addEventListener('click', () => {
+  copyBtn.addEventListener('click', () => {
+    if (!historyComplete) return;
     const text = Array.from(consoleEl.querySelectorAll('.log-line')).map((l) => l.textContent).join('\n');
     copyText(text);
   });
@@ -986,7 +1173,8 @@ export function runDetailDrawer(runId, { onDone } = {}) {
       if (closed) return;
       baseRun = res.run;
       paintRun(res.run);
-      appendLogs(res.logs);
+      initialLogError = res.logs_error || '';
+      await loadAllLogs();
     } catch (e) {
       toast(e.message, 'error');
       close();

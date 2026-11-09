@@ -130,7 +130,7 @@ func (s *Store) PoolChapterCountsForAccount(accountID int64) (map[string]int, er
 }
 
 // PoolChaptersOf returns the pool chapters belonging to one book
-//（accountID<=0 回落到第一个账号）。
+// （accountID<=0 回落到第一个账号）。
 func (s *Store) PoolChaptersOf(bookValue string, accountID int64) ([]PoolItem, error) {
 	if accountID <= 0 {
 		accountID = s.fallbackAccountID()
@@ -197,9 +197,26 @@ func (s *Store) AddChapterItem(accountID int64, bookValue, value, title string, 
 	}
 	value, title, bookValue = strings.TrimSpace(value), strings.TrimSpace(title), strings.TrimSpace(bookValue)
 	var exist int64
-	err := s.db.QueryRow(`SELECT id FROM pool_items WHERE kind = ? AND value = ? AND account_id = ?`,
-		KindChapter, value, accountID).Scan(&exist)
+	var existingBook string
+	err := s.db.QueryRow(`SELECT id, book_id FROM pool_items WHERE kind = ? AND value = ? AND account_id = ?`,
+		KindChapter, value, accountID).Scan(&exist, &existingBook)
 	if err == nil {
+		// Old manual imports lacked a book association. An explicit import
+		// from this book can repair it without guessing or deleting the row.
+		if existingBook == "" {
+			res, err := s.db.Exec(`UPDATE pool_items SET book_id = ?,
+				title = CASE WHEN title = '' THEN ? ELSE title END,
+				word_count = CASE WHEN word_count <= 0 THEN ? ELSE word_count END
+				WHERE id = ? AND book_id = ''`, bookValue, title, wordCount, exist)
+			if err != nil {
+				return 0, err
+			}
+			if n, err := res.RowsAffected(); err != nil {
+				return 0, err
+			} else if n > 0 {
+				return exist, nil
+			}
+		}
 		return 0, ErrPoolItemExists
 	}
 	if err != sql.ErrNoRows {
@@ -428,7 +445,7 @@ func (s *Store) ClearPoolFor(kind string, accountID int64) error {
 }
 
 // MovePoolItem 把一个条目在它所在视角的同类列表里上移/下移 delta 位
-//（±1；越界为无操作）。顺序用于「顺序书单」逐本阅读与列表展示。
+// （±1；越界为无操作）。顺序用于「顺序书单」逐本阅读与列表展示。
 func (s *Store) MovePoolItem(id int64, delta int) error {
 	if delta == 0 {
 		return nil

@@ -2,10 +2,12 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -70,7 +72,7 @@ func (a BookAudit) Label() (string, string) {
 	return text, cls
 }
 
-// auditBooks 并发拉取目录统计每本书的付费结构（上限 50 本，小请求）。
+// auditBooks 并发拉取本页书籍目录，统计每本书的付费结构。
 func (s *Server) auditBooks(ctx context.Context, ck map[string]string, books []weread.Book) map[string]BookAudit {
 	out := map[string]BookAudit{}
 	var mu sync.Mutex
@@ -107,6 +109,15 @@ func (s *Server) auditBooks(ctx context.Context, ck map[string]string, books []w
 // handlePoolShelf 通过协议拉取某个账号的微信读书书架：全部书籍（含归档分组）
 // + 官方 bookCount + 每本书的付费结构（免费/已付费/部分付费/未付费）。
 func (s *Server) handlePoolShelf(w http.ResponseWriter, r *http.Request) {
+	archiveOffset := 0
+	if raw := r.URL.Query().Get("archive_offset"); raw != "" {
+		var err error
+		archiveOffset, err = strconv.Atoi(raw)
+		if err != nil || archiveOffset < 0 {
+			s.writeErr(w, http.StatusBadRequest, "无效的归档分页位置")
+			return
+		}
+	}
 	id, _ := parseInt64(r.URL.Query().Get("account_id"))
 	acc, err := s.resolveAccount(id)
 	if err != nil {
@@ -126,35 +137,82 @@ func (s *Server) handlePoolShelf(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 归档分组里的书不在主列表——逐本补详情后并入 books。
-	archived := make([]weread.Book, 0, len(shelf.ArchiveBookIDs))
-	pending := shelf.ArchiveBookIDs
-	if len(pending) > 50 {
-		pending = pending[:50]
+	// Keep a bounded page of archive details, and expose the cursor rather
+	// than silently dropping everything after the first fifty books.
+	seen := make(map[string]bool, len(shelf.Books))
+	for _, b := range shelf.Books {
+		seen[b.ID] = true
 	}
+	archiveIDs := make([]string, 0, len(shelf.ArchiveBookIDs))
+	for _, id := range shelf.ArchiveBookIDs {
+		if !seen[id] {
+			seen[id] = true
+			archiveIDs = append(archiveIDs, id)
+		}
+	}
+	if archiveOffset > len(archiveIDs) {
+		s.writeErr(w, http.StatusBadRequest, "归档列表已变化，请重新拉取书架")
+		return
+	}
+	mainIDs := make([]string, 0, len(shelf.Books))
+	for _, b := range shelf.Books {
+		mainIDs = append(mainIDs, b.ID)
+	}
+	revisionData, _ := json.Marshal([][]string{mainIDs, archiveIDs})
+	revision := fmt.Sprintf("%x", sha256.Sum256(revisionData))
+	if archiveOffset > 0 && r.URL.Query().Get("archive_revision") != revision {
+		s.writeErr(w, http.StatusConflict, "书架已变化，请重新拉取书架")
+		return
+	}
+	end := archiveOffset + 50
+	if end > len(archiveIDs) {
+		end = len(archiveIDs)
+	}
+	pending := archiveIDs[archiveOffset:end]
+	results := make([]*weread.Book, len(pending))
+	archiveFailures := map[string]string{}
 	if len(pending) > 0 {
 		var mu sync.Mutex
 		var wg sync.WaitGroup
 		sem := make(chan struct{}, 3)
-		for _, bid := range pending {
+		for i, bid := range pending {
 			wg.Add(1)
 			sem <- struct{}{}
-			go func(bid string) {
+			go func(i int, bid string) {
 				defer wg.Done()
 				defer func() { <-sem }()
 				b, err := s.wc.BookInfo(ctx, ck, bid)
 				if err != nil || b == nil {
+					message := "没有返回书籍详情"
+					if err != nil {
+						message = err.Error()
+					}
+					mu.Lock()
+					archiveFailures[bid] = message
+					mu.Unlock()
 					return
 				}
-				mu.Lock()
-				archived = append(archived, *b)
-				mu.Unlock()
-			}(bid)
+				results[i] = b
+			}(i, bid)
 		}
 		wg.Wait()
 	}
 
-	books := append(append([]weread.Book{}, shelf.Books...), archived...)
+	books := []weread.Book{}
+	if archiveOffset == 0 {
+		books = append(books, shelf.Books...)
+	}
+	archived := 0
+	for _, b := range results {
+		if b != nil {
+			books = append(books, *b)
+			archived++
+		}
+	}
+	nextArchiveOffset := -1
+	if end < len(archiveIDs) {
+		nextArchiveOffset = end
+	}
 	audit := s.auditBooks(ctx, ck, books)
 
 	// 「已在池中」按本账号视角标注（含共享）。
@@ -171,7 +229,10 @@ func (s *Server) handlePoolShelf(w http.ResponseWriter, r *http.Request) {
 	}
 	s.writeJSON(w, http.StatusOK, map[string]any{
 		"books": books, "audit": audit, "in_pool": inPool, "account_id": acc.ID,
-		"declared": shelf.Declared, "archived": len(archived), "archive_groups": shelf.ArchiveCount,
+		"declared": shelf.Declared, "archived": archived, "archive_groups": shelf.ArchiveCount,
+		"archive_total": len(archiveIDs), "archive_processed": end,
+		"archive_revision":    revision,
+		"next_archive_offset": nextArchiveOffset, "archive_failures": archiveFailures,
 	})
 }
 
@@ -182,11 +243,11 @@ func (s *Server) handlePoolShelf(w http.ResponseWriter, r *http.Request) {
 // 不再按付费标记过滤。
 func (s *Server) handlePoolShelfImport(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		AccountID    int64               `json:"account_id"`
-		WithChapters bool                `json:"with_chapters"`
-		ChaptersPer  int                 `json:"chapters_per_book"`
-		IgnorePaid   bool                `json:"ignore_paid"`
-		Books        []shelfImportBook   `json:"books"`
+		AccountID    int64                `json:"account_id"`
+		WithChapters bool                 `json:"with_chapters"`
+		ChaptersPer  int                  `json:"chapters_per_book"`
+		IgnorePaid   bool                 `json:"ignore_paid"`
+		Books        []shelfImportBook    `json:"books"`
 		Audit        map[string]BookAudit `json:"audit"`
 	}
 	if !s.decode(w, r, &body) {
@@ -200,15 +261,29 @@ func (s *Server) handlePoolShelfImport(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, http.StatusBadRequest, "一次最多导入 50 本书籍")
 		return
 	}
+	if body.AccountID < 0 {
+		s.writeErr(w, http.StatusBadRequest, "无效的账号 ID")
+		return
+	}
 	// per 语义：0 = 导入全部章节（无章数上限），>0 = 每本精确 per 章。
 	per := body.ChaptersPer
 	full := per == 0
 	if per < 0 {
 		per = 0
 	}
-	scope := body.AccountID
-	if scope < 0 {
-		scope = 0
+	acc, err := s.resolveAccount(body.AccountID)
+	if err != nil {
+		s.writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	scope := acc.ID
+	var ck map[string]string
+	if body.WithChapters {
+		ck, err = s.accountCookies(acc)
+		if err != nil {
+			s.writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
 	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 180*time.Second)
@@ -238,6 +313,7 @@ func (s *Server) handlePoolShelfImport(w http.ResponseWriter, r *http.Request) {
 			}
 		} else {
 			failures[b.BookID] = "写入书池失败：" + err.Error()
+			continue
 		}
 		if body.WithChapters {
 			chapterJobs <- b
@@ -246,11 +322,6 @@ func (s *Server) handlePoolShelfImport(w http.ResponseWriter, r *http.Request) {
 	close(chapterJobs)
 
 	if body.WithChapters {
-		ck, err := s.accountCookiesResolve(body.AccountID)
-		if err != nil {
-			s.writeErr(w, http.StatusBadRequest, err.Error())
-			return
-		}
 		// 低并发拉目录，失败再给一次单独重试的机会（瞬时风控/网络抖动
 		// 常见于批量请求的第一轮）。
 		workers := 2
@@ -273,14 +344,21 @@ func (s *Server) handlePoolShelfImport(w http.ResponseWriter, r *http.Request) {
 						added, existed, err = s.fetchChaptersIntoPool(ctx, ck, scope, b, limit, body.IgnorePaid)
 					}
 					if err != nil {
-						mu.Lock(); failures[b.BookID] = err.Error(); mu.Unlock()
+						mu.Lock()
+						failures[b.BookID] = err.Error()
+						mu.Unlock()
 						continue
 					}
 					if added == 0 && existed == 0 {
-						mu.Lock(); failures[b.BookID] = "没有可读章节可导入（免费章节为空且未购任何付费章节）"; mu.Unlock()
+						mu.Lock()
+						failures[b.BookID] = "没有可读章节可导入（免费章节为空且未购任何付费章节）"
+						mu.Unlock()
 						continue
 					}
-					mu.Lock(); chapAdded += added; chapExisted += existed; mu.Unlock()
+					mu.Lock()
+					chapAdded += added
+					chapExisted += existed
+					mu.Unlock()
 				}
 			}()
 		}
@@ -288,7 +366,7 @@ func (s *Server) handlePoolShelfImport(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.writeJSON(w, http.StatusOK, map[string]any{
-		"ok": true,
+		"ok":          true,
 		"books_added": booksAdded, "books_skipped": booksSkip,
 		"chapters_added": chapAdded, "chapters_existed": chapExisted, "failures": failures,
 	})
@@ -540,7 +618,12 @@ func (s *Server) handlePoolAdd(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, http.StatusBadRequest, "ID 过长")
 		return
 	}
-	id, err := s.st.AddPoolItem(body.Kind, body.Value, truncateRunes(strings.TrimSpace(body.Title), 60), body.AccountID)
+	scope, err := s.poolWriteScope(body.AccountID, body.Kind, body.BookID)
+	if err != nil {
+		s.writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	id, err := s.addLinkedPoolItem(body.Kind, body.Value, truncateRunes(strings.TrimSpace(body.Title), 60), body.BookID, scope)
 	if errors.Is(err, store.ErrPoolItemExists) {
 		s.writeErr(w, http.StatusConflict, kindLabel(body.Kind)+"中已存在该 ID")
 		return
@@ -558,6 +641,44 @@ type poolItemBody struct {
 	Value     string `json:"value"`
 	Title     string `json:"title"`
 	AccountID int64  `json:"account_id"`
+	BookID    string `json:"book_id"`
+}
+
+// Validate the local destination before writing anything. Reading credentials
+// are unnecessary when managing an existing account's local pool.
+func (s *Server) poolWriteScope(accountID int64, kind, bookID string) (int64, error) {
+	acc, err := s.resolveAccount(accountID)
+	if err != nil {
+		return 0, err
+	}
+	if kind == store.KindChapter {
+		bookID = strings.TrimSpace(bookID)
+		if bookID == "" {
+			return 0, errors.New("添加章节时必须指定所属书籍 ID")
+		}
+		books, err := s.st.PoolItemsForAccount(store.KindBook, acc.ID)
+		if err != nil {
+			return 0, err
+		}
+		found := false
+		for _, book := range books {
+			if book.Value == bookID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return 0, errors.New("所属书籍不在该账号的书池中")
+		}
+	}
+	return acc.ID, nil
+}
+
+func (s *Server) addLinkedPoolItem(kind, value, title, bookID string, accountID int64) (int64, error) {
+	if kind == store.KindChapter {
+		return s.st.AddChapterItem(accountID, bookID, value, title, 0)
+	}
+	return s.st.AddPoolItem(kind, value, title, accountID)
 }
 
 // handlePoolImport 批量导入：把一段文本中的所有 ID（空白/逗号分隔）全部
@@ -567,6 +688,7 @@ func (s *Server) handlePoolImport(w http.ResponseWriter, r *http.Request) {
 		Kind      string `json:"kind"`
 		Text      string `json:"text"`
 		AccountID int64  `json:"account_id"`
+		BookID    string `json:"book_id"`
 	}
 	if !s.decode(w, r, &body) {
 		return
@@ -586,24 +708,28 @@ func (s *Server) handlePoolImport(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, http.StatusBadRequest, "一次最多导入 200 个 ID")
 		return
 	}
-	scope := body.AccountID
-	if scope < 0 {
-		scope = 0
+	scope, err := s.poolWriteScope(body.AccountID, body.Kind, body.BookID)
+	if err != nil {
+		s.writeErr(w, http.StatusBadRequest, err.Error())
+		return
 	}
 	added, skipped := make([]string, 0), make([]string, 0)
+	failures := make(map[string]string)
 	for _, v := range values {
 		v = strings.TrimSpace(v)
 		if v == "" || utf8.RuneCountInString(v) > 64 {
 			continue
 		}
-		if _, err := s.st.AddPoolItem(body.Kind, v, "", scope); err == nil {
+		if _, err := s.addLinkedPoolItem(body.Kind, v, "", body.BookID, scope); err == nil {
 			added = append(added, v)
 		} else if errors.Is(err, store.ErrPoolItemExists) {
 			skipped = append(skipped, v)
+		} else {
+			failures[v] = err.Error()
 		}
 	}
 	s.writeJSON(w, http.StatusOK, map[string]any{
-		"ok": true, "added": added, "skipped": skipped,
+		"ok": len(failures) == 0, "added": added, "skipped": skipped, "failures": failures,
 	})
 }
 

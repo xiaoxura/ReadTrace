@@ -44,28 +44,28 @@ type activeRun struct {
 	failed    int
 	status    string
 	tick      int
+	newExpiry bool // explicit auth failure changed this account to expired
 
 	// 书池快照按账号划分：账号专属优先，其次共享，最后回落内置常量。
 	// poolChaptersBy 保存「书 → 章节」映射；无归属章节进入全局备用池。
-	poolBooksOwned    []string
-	poolBooksShared   []string
-	poolChaptersByOwned   map[string][]string
-	poolChaptersByShared  map[string][]string
-	poolChaptersOwned     []string
-	poolChaptersShared    []string
+	poolBooksOwned       []string
+	poolChaptersByOwned  map[string][]string
+	poolChaptersByShared map[string][]string
 
 	// 顺序书单模式：orderedBookList 为按池内顺序拼接的书单；seqPos 为当前
 	// 读到的书/章下标（持久化在 settings，跨次运行衔接）；seqMark 记录本次
 	// 心跳实际使用的位置，成功后才推进。
 	orderedBookList []string
-	seqPos   seqPointer
-	seqMark  seqMark
+	seqPos          seqPointer
+	seqMark         seqMark
+	pageCurrent     map[string]any // co/pr from the last successful heartbeat
+	pagePending     map[string]any // candidate reused until a heartbeat succeeds
 
 	// 书/章节的可读标题（value → title），写日志展示用；章节词数用于按
 	// 字数折算每个章节需要多少次心跳。
-	bookTitles    map[string]string
-	chapterTitles map[string]string
-	chapterTitlesRaw map[string]string
+	bookTitles        map[string]string
+	chapterTitles     map[string]string
+	chapterTitlesRaw  map[string]string
 	chapterWordCounts map[string]int
 
 	ctx    context.Context
@@ -101,22 +101,54 @@ type tickState struct {
 
 // Engine manages concurrent reading runs.
 type Engine struct {
-	st  *store.Store
-	wc  *weread.Client
-	nt  *notify.Sender
-	hub *Hub
-	log *slog.Logger
-	mu  sync.Mutex
-	act map[int64]*activeRun
+	st             *store.Store
+	wc             *weread.Client
+	nt             *notify.Sender
+	hub            *Hub
+	log            *slog.Logger
+	mu             sync.Mutex
+	act            map[int64]*activeRun
+	accountLocksMu sync.Mutex
+	accountLocks   map[int64]*sync.Mutex
 }
 
 // New creates an Engine.
 func New(st *store.Store, wc *weread.Client, nt *notify.Sender, hub *Hub, log *slog.Logger) *Engine {
-	return &Engine{st: st, wc: wc, nt: nt, hub: hub, log: log, act: map[int64]*activeRun{}}
+	return &Engine{st: st, wc: wc, nt: nt, hub: hub, log: log, act: map[int64]*activeRun{}, accountLocks: map[int64]*sync.Mutex{}}
 }
 
 // Hub exposes the event hub.
 func (e *Engine) Hub() *Hub { return e.hub }
+
+// ErrAccountRunning means credentials cannot be replaced while a run owns a
+// copy that may later be written back by renewal.
+var ErrAccountRunning = errors.New("该账号正在阅读中，请先停止任务再更新登录凭据")
+
+// ErrDailyGoalReached means the local-day target has already been consumed.
+var ErrDailyGoalReached = errors.New("今日目标已完成")
+
+func (e *Engine) accountLock(id int64) *sync.Mutex {
+	e.accountLocksMu.Lock()
+	defer e.accountLocksMu.Unlock()
+	lock := e.accountLocks[id]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		e.accountLocks[id] = lock
+	}
+	return lock
+}
+
+// WithIdleAccount coordinates credential replacement with Start's secret
+// read and active-run registration for the same account.
+func (e *Engine) WithIdleAccount(id int64, fn func() error) error {
+	lock := e.accountLock(id)
+	lock.Lock()
+	defer lock.Unlock()
+	if e.IsRunning(id) {
+		return ErrAccountRunning
+	}
+	return fn()
+}
 
 // poolValueSet 返回一个 kind 的抽取池（该账号自己的池，无共享层）；
 // 池为空时引擎会在启动时报错提示用户导入，不用内置常量兜底。
@@ -153,6 +185,20 @@ func (e *Engine) Start(acc *store.Account, minutes int, trigger string) (*store.
 	if acc == nil {
 		return nil, errors.New("账号不存在")
 	}
+	lock := e.accountLock(acc.ID)
+	lock.Lock()
+	defer lock.Unlock()
+	if e.IsRunning(acc.ID) {
+		return nil, fmt.Errorf("「%s」正在阅读中，请先停止", acc.Name)
+	}
+	// The caller may have loaded this row before another request edited it.
+	acc, err := e.st.GetAccount(acc.ID)
+	if err != nil {
+		return nil, fmt.Errorf("读取账号配置失败: %w", err)
+	}
+	if acc == nil {
+		return nil, errors.New("账号不存在")
+	}
 	if minutes <= 0 {
 		minutes = acc.DefaultMinutes
 	}
@@ -163,6 +209,30 @@ func (e *Engine) Start(acc *store.Account, minutes int, trigger string) (*store.
 		minutes = 24 * 60
 	}
 	target := minutes * 60
+	if acc.DailyGoalMinutes > 0 {
+		loc := time.Local
+		zone, err := e.st.GetSetting("timezone")
+		if err != nil {
+			return nil, fmt.Errorf("读取站点时区失败: %w", err)
+		}
+		if strings.TrimSpace(zone) != "" {
+			loc, err = time.LoadLocation(strings.TrimSpace(zone))
+			if err != nil {
+				return nil, fmt.Errorf("加载站点时区失败: %w", err)
+			}
+		}
+		today, err := e.st.DailySeconds(acc.ID, time.Now(), loc)
+		if err != nil {
+			return nil, fmt.Errorf("读取今日阅读统计失败: %w", err)
+		}
+		remaining := acc.DailyGoalMinutes*60 - today
+		if remaining <= 0 {
+			return nil, ErrDailyGoalReached
+		}
+		if remaining < target {
+			target = remaining
+		}
+	}
 
 	cookies, payload, err := e.st.AccountSecrets(acc.ID)
 	if err != nil {
@@ -175,8 +245,22 @@ func (e *Engine) Start(acc *store.Account, minutes int, trigger string) (*store.
 	if len(template) == 0 {
 		template, _ = e.defaultTemplate()
 	}
-	byOwned, byShared, globalOwned, globalShared, _ := e.st.PoolChapterMapForAccount(acc.ID)
+	byOwned, byShared, _, _, err := e.st.PoolChapterMapForAccount(acc.ID)
+	if err != nil {
+		return nil, fmt.Errorf("读取章节池失败: %w", err)
+	}
 	bookFirst, _ := e.poolValueSet(store.KindBook, acc.ID)
+	// Legacy chapters without book_id cannot be paired with an arbitrary book.
+	// Only enabled books with their own enabled chapters can enter a run.
+	readableBooks := make([]string, 0, len(bookFirst))
+	chapterCount := 0
+	for _, book := range bookFirst {
+		n := len(byOwned[book]) + len(byShared[book])
+		if n > 0 {
+			readableBooks = append(readableBooks, book)
+			chapterCount += n
+		}
+	}
 	bookTitles, _ := e.st.PoolTitleMapForAccount(store.KindBook, acc.ID)
 	chapterTitlesRaw, _ := e.st.PoolTitleMapForAccount(store.KindChapter, acc.ID)
 	chapterWordCounts, _ := e.st.PoolWordCountMapForAccount(store.KindChapter, acc.ID)
@@ -206,14 +290,10 @@ func (e *Engine) Start(acc *store.Account, minutes int, trigger string) (*store.
 			return nil, fmt.Errorf("「%s」正在阅读中，请先停止", acc.Name)
 		}
 	}
-	if err := e.st.CreateRun(run); err != nil {
-		e.mu.Unlock()
-		return nil, fmt.Errorf("创建运行记录失败: %w", err)
-	}
 	// 顺序书单：按书池列表顺序（sort_order）读完整书单再循环。
 	var seqBooks []string
 	if acc.Mode != "custom" {
-		seqBooks = append(seqBooks, bookFirst...)
+		seqBooks = append(seqBooks, readableBooks...)
 	}
 
 	// 池与模板均为纯用户配置：缺内容就明确报错，引导用户去书池导入。
@@ -233,46 +313,46 @@ func (e *Engine) Start(acc *store.Account, minutes int, trigger string) (*store.
 			e.mu.Unlock()
 			return nil, errors.New("书池为空：请先在「书池 · 书籍导入」导入书籍")
 		}
-		if len(byOwned)+len(byShared)+len(globalOwned)+len(globalShared) == 0 {
+		if len(readableBooks) == 0 {
 			e.mu.Unlock()
-			return nil, errors.New("书池里没有可读章节：请在导入时选择「同时导入章节」，或在章节抽屉里手动添加")
+			return nil, errors.New("书池里没有带章节的可读书籍：请在导入时选择「同时导入章节」，或在章节抽屉里手动添加")
 		}
 	default:
 		// 默认/未知/缺失模式一律按顺序书单处理。
 		if len(seqBooks) == 0 {
 			e.mu.Unlock()
+			if len(bookFirst) > 0 {
+				return nil, errors.New("书单里的书都没有可读章节：请在导入时选择「同时导入章节」，或在章节抽屉里手动添加")
+			}
 			return nil, errors.New("顺序书单为空：请先在「书池 · 书籍导入」导入书籍")
 		}
-		if len(byOwned)+len(byShared)+len(globalOwned)+len(globalShared) == 0 {
-			e.mu.Unlock()
-			return nil, errors.New("书单里的书都没有可读章节：请在导入时选择「同时导入章节」，或在章节抽屉里手动添加")
-		}
+	}
+	if err := e.st.CreateRun(run); err != nil {
+		e.mu.Unlock()
+		return nil, fmt.Errorf("创建运行记录失败: %w", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	ar := &activeRun{
 		runID: run.ID, accountID: acc.ID, account: acc.Name, target: target,
 		started: run.StartedAt, status: "running", tick: clampTick(acc.TickSeconds),
-		poolBooksOwned:    bookFirst,
-		poolBooksShared:   nil,
-		poolChaptersByOwned:   byOwned,
-		poolChaptersByShared:  byShared,
-		poolChaptersOwned:     globalOwned,
-		poolChaptersShared:    globalShared,
-		orderedBookList: seqBooks,
-		seqPos:              e.loadSeqPos(acc.ID),
-		bookTitles:          bookTitlesN,
-		chapterTitles:       chapterTitlesN,
-		chapterTitlesRaw:    chapterTitlesRaw,
-		chapterWordCounts:   chapterWordCounts,
-		ctx:               ctx, cancel: cancel, done: make(chan struct{}),
+		poolBooksOwned:       readableBooks,
+		poolChaptersByOwned:  byOwned,
+		poolChaptersByShared: byShared,
+		orderedBookList:      seqBooks,
+		seqPos:               e.loadSeqPos(acc.ID),
+		bookTitles:           bookTitlesN,
+		chapterTitles:        chapterTitlesN,
+		chapterTitlesRaw:     chapterTitlesRaw,
+		chapterWordCounts:    chapterWordCounts,
+		ctx:                  ctx, cancel: cancel, done: make(chan struct{}),
 	}
 	e.act[run.ID] = ar
 	e.mu.Unlock()
 
 	e.hub.Publish(Event{Type: "run.start", RunID: run.ID, AccountID: acc.ID, TS: time.Now().Unix(), Data: e.progress(ar)})
 	if acc.Mode == "rotate" {
-		e.logLine(ar, "info", fmt.Sprintf("轮换书池 %d 本书、%d 个章节", len(ar.poolBooksOwned), len(ar.poolChaptersOwned)))
+		e.logLine(ar, "info", fmt.Sprintf("轮换书池 %d 本书、%d 个章节", len(ar.poolBooksOwned), chapterCount))
 	}
 	if acc.Mode == "sequence" {
 		e.logLine(ar, "info", fmt.Sprintf("顺序书单 %d 本书，从「%s」继续（进度跨次运行衔接）",
@@ -485,11 +565,31 @@ func (e *Engine) session(ar *activeRun, acc *store.Account, ck weread.Cookies,
 	}()
 
 	interval := time.Duration(clampTick(acc.TickSeconds)) * time.Second
-	elapsed, success := tick.elapsed, tick.success
 	// consecutiveFailures counts failures since the last success within this
 	// session; tick.failed stays cumulative for the run record.
 	consecutive := 0
 	authRetried, repairs := 0, 0
+	renewAfterAuth := func() (expired bool, renewErr error) {
+		if authRetried >= 2 {
+			// Two successful renewals followed by another explicit auth
+			// rejection are enough evidence that this login cannot read.
+			return true, nil
+		}
+		key, err := e.wc.Renew(ar.ctx, ck)
+		if errors.Is(err, weread.ErrUnauthorized) {
+			return true, err
+		}
+		if err != nil {
+			return false, err
+		}
+		if key == "" {
+			return false, errors.New("renewal 未返回新的 wr_skey")
+		}
+		authRetried++
+		_ = e.st.SaveCookies(acc.ID, map[string]string(ck))
+		e.logLine(ar, "info", "已自动续期登录状态，继续阅读")
+		return false, nil
+	}
 	// Refresh the session up front; failures are non-fatal.
 	if key, err := e.wc.Renew(ar.ctx, ck); err == nil && key != "" {
 		_ = e.st.SaveCookies(acc.ID, map[string]string(ck))
@@ -498,7 +598,7 @@ func (e *Engine) session(ar *activeRun, acc *store.Account, ck weread.Cookies,
 		e.logLine(ar, "warn", "登录状态刷新失败，继续使用现有 Cookie："+err.Error())
 	}
 
-	for elapsed < ar.target {
+	for tick.elapsed < ar.target {
 		if ar.ctx.Err() != nil {
 			finishS("stopped", "", false)
 			return
@@ -509,7 +609,7 @@ func (e *Engine) session(ar *activeRun, acc *store.Account, ck weread.Cookies,
 		}
 
 		tick.tickIndex++
-		built := e.buildPayload(ar, template, acc, tick.tickIndex, rnd)
+		built := e.buildPayload(ar, template, acc, rnd)
 		reading := describeReading(ar, acc, built)
 		payload := weread.SignPayload(built, time.Now(), tick.last, rnd)
 		now := time.Now()
@@ -523,7 +623,19 @@ func (e *Engine) session(ar *activeRun, acc *store.Account, ck weread.Cookies,
 			consecutive++
 			tick.failed++
 			e.logLine(ar, "warn", fmt.Sprintf("第 %d 次请求失败：%v", tick.tickIndex, err))
-			e.update(ar, elapsed, success, tick.failed, "running")
+			e.update(ar, tick.elapsed, tick.success, tick.failed, "running")
+			if errors.Is(err, weread.ErrUnauthorized) {
+				expired, renewErr := renewAfterAuth()
+				if expired {
+					e.markExpired(ar, acc)
+					finishS("failed", "登录已失效，请重新扫码登录", false)
+					return
+				}
+				if renewErr == nil {
+					continue
+				}
+				e.logLine(ar, "warn", "登录续期暂时失败，稍后重试："+renewErr.Error())
+			}
 			if consecutive >= 5 {
 				finishS("failed", fmt.Sprintf("连续请求失败：%v", err), true)
 				return
@@ -538,19 +650,27 @@ func (e *Engine) session(ar *activeRun, acc *store.Account, ck weread.Cookies,
 		switch {
 		case res.Succ && res.HasSyncKey:
 			repairs, authRetried, consecutive = 0, 0, 0
-			success++
-			elapsed += int(interval.Seconds())
-			if elapsed > ar.target {
-				elapsed = ar.target
+			if acc.Status != "active" {
+				if err := e.st.SetAccountStatus(acc.ID, "active", "", time.Now().Unix()); err != nil {
+					e.log.Warn("恢复账号状态失败", "account", acc.ID, "err", err)
+				} else {
+					acc.Status = "active"
+				}
+			}
+			ar.pageCurrent, ar.pagePending = ar.pagePending, nil
+			tick.success++
+			tick.elapsed += int(interval.Seconds())
+			if tick.elapsed > ar.target {
+				tick.elapsed = ar.target
 			}
 			tick.last = now
 			// 顺序书单：成功一次才推进书/章指针（失败重试不跳章）。
 			if acc.Mode == "sequence" {
 				e.seqAdvance(ar)
 			}
-			e.update(ar, elapsed, success, tick.failed, "running")
+			e.update(ar, tick.elapsed, tick.success, tick.failed, "running")
 			e.logLine(ar, "info", fmt.Sprintf("第 %d 次成功 · %s · 已读 %s / %s · synckey=%d",
-				tick.tickIndex, reading, humanMinutes(elapsed), humanMinutes(ar.target), res.SyncKey))
+				tick.tickIndex, reading, humanMinutes(tick.elapsed), humanMinutes(ar.target), res.SyncKey))
 			if !sleepCtx(ar.ctx, tickJitter(interval, rnd)) {
 				finishS("stopped", "", false)
 				return
@@ -561,7 +681,7 @@ func (e *Engine) session(ar *activeRun, acc *store.Account, ck weread.Cookies,
 			consecutive++
 			tick.failed++
 			e.logLine(ar, "warn", fmt.Sprintf("第 %d 次未返回 synckey，尝试修复（%d/3）· %s", tick.tickIndex, repairs, reading))
-			e.update(ar, elapsed, success, tick.failed, "running")
+			e.update(ar, tick.elapsed, tick.success, tick.failed, "running")
 			if repairs > 3 {
 				finishS("failed", "连续多次未获得 synckey，已停止", true)
 				return
@@ -580,23 +700,17 @@ func (e *Engine) session(ar *activeRun, acc *store.Account, ck weread.Cookies,
 			tick.failed++
 			if isAuthError(res.ErrCode) {
 				e.logLine(ar, "warn", fmt.Sprintf("登录状态异常（errCode=%d），尝试自动续期", res.ErrCode))
-				e.update(ar, elapsed, success, tick.failed, "running")
-				if authRetried >= 2 {
-					_ = e.st.SetAccountStatus(acc.ID, "expired", "登录已失效，请重新扫码登录", time.Now().Unix())
+				e.update(ar, tick.elapsed, tick.success, tick.failed, "running")
+				expired, renewErr := renewAfterAuth()
+				if expired {
+					e.markExpired(ar, acc)
 					finishS("failed", "登录已失效，请重新扫码登录", false)
 					return
 				}
-				authRetried++
-				key, renewErr := e.wc.Renew(ar.ctx, ck)
-				if renewErr != nil || key == "" {
-					_ = e.st.SetAccountStatus(acc.ID, "expired", "登录已失效，请重新扫码登录", time.Now().Unix())
-					finishS("failed", "登录已失效，请重新扫码登录", false)
-					return
+				if renewErr == nil {
+					continue
 				}
-				_ = e.st.SaveCookies(acc.ID, map[string]string(ck))
-				e.logLine(ar, "info", "已自动续期登录状态，继续阅读")
-				success = 0
-				continue
+				e.logLine(ar, "warn", "登录续期暂时失败，稍后重试："+renewErr.Error())
 			}
 
 			msg := res.ErrMsg
@@ -604,7 +718,7 @@ func (e *Engine) session(ar *activeRun, acc *store.Account, ck weread.Cookies,
 				msg = fmt.Sprintf("errCode=%d", res.ErrCode)
 			}
 			e.logLine(ar, "warn", fmt.Sprintf("第 %d 次返回异常：%s · %s", tick.tickIndex, msg, reading))
-			e.update(ar, elapsed, success, tick.failed, "running")
+			e.update(ar, tick.elapsed, tick.success, tick.failed, "running")
 			if consecutive >= 5 {
 				finishS("failed", "接口持续返回异常："+msg, true)
 				return
@@ -617,6 +731,23 @@ func (e *Engine) session(ar *activeRun, acc *store.Account, ck weread.Cookies,
 	}
 	finishS("success", "", false)
 	return
+}
+
+// markExpired records a confirmed authentication failure once per valid to
+// expired transition. The active run owns the account credentials until it
+// finalizes, so the checker and rebind path cannot race this state change.
+func (e *Engine) markExpired(ar *activeRun, acc *store.Account) {
+	current, err := e.st.GetAccount(acc.ID)
+	if err != nil || current == nil {
+		e.log.Warn("读取账号失效状态失败", "account", acc.ID, "err", err)
+		return
+	}
+	if err := e.st.SetAccountStatus(acc.ID, "expired", "登录已失效，请重新扫码登录", time.Now().Unix()); err != nil {
+		e.log.Warn("保存账号失效状态失败", "account", acc.ID, "err", err)
+		return
+	}
+	ar.newExpiry = current.Status != "expired"
+	acc.Status = "expired"
 }
 
 // finalize persists the run result, broadcasts run.end and pushes the
@@ -650,7 +781,7 @@ func (e *Engine) finalize(ar *activeRun, acc *store.Account, inStatus, errMsg st
 			"success": success, "failed": failed, "target": target,
 		}})
 
-	if acc.PushChannelID > 0 {
+	if status == "failed" && acc.PushChannelID > 0 && (errMsg != "登录已失效，请重新扫码登录" || ar.newExpiry) {
 		go e.notifyResult(acc, ar, status, errMsg, elapsed)
 	}
 }
@@ -801,22 +932,16 @@ func (e *Engine) applyRotatePayload(ar *activeRun, p map[string]any, rnd *rand.R
 	}
 	book := books[rnd.Intn(len(books))]
 	p["b"] = weread.NormalizePayloadID(book)
-	// 先抽书、再抽章节：该书没有链接章节时回退到无归属的全局备用章节。
+	// Start only admitted books with linked, enabled chapters.
 	chapters := chaptersForBook(ar, book)
 	if len(chapters) == 0 {
-		if len(ar.poolChaptersOwned) > 0 {
-			chapters = ar.poolChaptersOwned
-		} else {
-			chapters = ar.poolChaptersShared
-		}
-	}
-	if len(chapters) == 0 {
-		return // Start 已校验存在可读章节，这里只是防御
+		delete(p, "c") // defensive: never pair this book with the template chapter
+		return
 	}
 	p["c"] = weread.NormalizePayloadID(chapters[rnd.Intn(len(chapters))])
 }
 
-func (e *Engine) buildPayload(ar *activeRun, template map[string]any, acc *store.Account, tick int, rnd *rand.Rand) map[string]any {
+func (e *Engine) buildPayload(ar *activeRun, template map[string]any, acc *store.Account, rnd *rand.Rand) map[string]any {
 	p := make(map[string]any, len(template)+4)
 	for k, v := range template {
 		p[k] = v
@@ -848,28 +973,14 @@ func (e *Engine) buildPayload(ar *activeRun, template map[string]any, acc *store
 		if ci < 0 || (len(chapters) > 0 && ci >= len(chapters)) {
 			ci = 0
 		}
-		var chapter string
-		switch {
-		case len(chapters) > 0:
-			chapter = chapters[ci]
-		case len(ar.poolChaptersOwned) > 0:
-			chapter = ar.poolChaptersOwned[rnd.Intn(len(ar.poolChaptersOwned))]
-		case len(ar.poolChaptersShared) > 0:
-			chapter = ar.poolChaptersShared[rnd.Intn(len(ar.poolChaptersShared))]
-		}
-		if chapter == "" {
-			e.applyRotatePayload(ar, p, rnd) // 不可能出现：Start 已校验章节存在
+		if len(chapters) == 0 {
+			delete(p, "c") // defensive: never reuse the template chapter
 			break
 		}
+		chapter := chapters[ci]
 		p["b"] = weread.NormalizePayloadID(book)
 		p["c"] = weread.NormalizePayloadID(chapter)
-		// 与「指定书籍」一致：像真实阅读一样推进页码参数。
-		if co, ok := numeric(p["co"]); ok {
-			p["co"] = co + 1 + rnd.Intn(3)
-		}
-		if pr, ok := numeric(p["pr"]); ok && pr < 100 {
-			p["pr"] = pr + 1
-		}
+		e.applyPagePayload(ar, p, rnd)
 		ar.seqPos = pos
 		ar.seqMark = seqMark{bi: pos.Bi, ci: ci, chapters: chapters, rawChapter: chapter}
 	case "rotate":
@@ -881,15 +992,37 @@ func (e *Engine) buildPayload(ar *activeRun, template map[string]any, acc *store
 		if acc.ChapterID != "" {
 			p["c"] = weread.NormalizePayloadID(acc.ChapterID)
 		}
-		// Simulate page turns so the session looks like real reading.
-		if co, ok := numeric(p["co"]); ok {
-			p["co"] = co + 1 + rnd.Intn(3)
-		}
-		if pr, ok := numeric(p["pr"]); ok && pr < 100 {
-			p["pr"] = pr + 1
-		}
+		e.applyPagePayload(ar, p, rnd)
 	}
 	return p
+}
+
+// applyPagePayload prepares one page turn. Failed requests reuse the same
+// candidate; only the successful heartbeat commits it as the next baseline.
+func (e *Engine) applyPagePayload(ar *activeRun, p map[string]any, rnd *rand.Rand) {
+	if ar.pagePending != nil {
+		for k, v := range ar.pagePending {
+			p[k] = v
+		}
+		return
+	}
+	for k, v := range ar.pageCurrent {
+		p[k] = v
+	}
+	pending := make(map[string]any, 2)
+	if co, ok := numeric(p["co"]); ok {
+		p["co"] = co + 1 + rnd.Intn(3)
+		pending["co"] = p["co"]
+	}
+	if pr, ok := numeric(p["pr"]); ok {
+		if pr < 100 {
+			p["pr"] = pr + 1
+		}
+		pending["pr"] = p["pr"]
+	}
+	if len(pending) > 0 {
+		ar.pagePending = pending
+	}
 }
 
 func (e *Engine) notifyResult(acc *store.Account, ar *activeRun, status, errMsg string, elapsed int) {
@@ -897,12 +1030,9 @@ func (e *Engine) notifyResult(acc *store.Account, ar *activeRun, status, errMsg 
 	if err != nil || ch == nil {
 		return
 	}
-	kind := notify.KindSuccess
-	title := "微信读书 · 阅读完成"
-	if status == "failed" {
-		kind, title = notify.KindFailed, "微信读书 · 阅读失败"
-	} else if status == "stopped" {
-		kind, title = notify.KindFailed, "微信读书 · 已停止"
+	kind, title := notify.KindFailed, "微信读书 · 阅读失败"
+	if ar.newExpiry {
+		kind, title = notify.KindExpired, "微信读书 · 账号失效"
 	}
 	vars := map[string]string{
 		"account": acc.Name,

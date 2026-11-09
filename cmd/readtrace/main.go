@@ -72,6 +72,12 @@ func main() {
 }
 
 func run(addr, dataDir string, openBrowser bool, retainDays int, hostAllow string, logger *slog.Logger) error {
+	lock, err := secure.LockDataDir(dataDir)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+
 	box, err := secure.New(dataDir)
 	if err != nil {
 		return fmt.Errorf("初始化加密密钥失败: %w", err)
@@ -201,6 +207,12 @@ func parseHostAllow(s string) []string {
 }
 
 func resetPanelPassword(dataDir string) error {
+	lock, err := secure.LockDataDir(dataDir)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+
 	box, err := secure.New(dataDir)
 	if err != nil {
 		return err

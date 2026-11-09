@@ -111,6 +111,9 @@ func (c *Client) doJSON(ctx context.Context, method, path string, ck Cookies, bo
 	if err != nil {
 		return resp, err
 	}
+	if resp.StatusCode == http.StatusUnauthorized {
+		return resp, fmt.Errorf("%w（HTTP 401）", ErrUnauthorized)
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return resp, fmt.Errorf("HTTP %d: %s", resp.StatusCode, snippet(data))
 	}
@@ -157,6 +160,12 @@ func (c *Client) Read(ctx context.Context, ck Cookies, payload map[string]any) (
 	if err != nil {
 		return nil, err
 	}
+	if resp.StatusCode == http.StatusUnauthorized {
+		return nil, fmt.Errorf("%w（HTTP 401）", ErrUnauthorized)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, snippet(data))
+	}
 	var raw map[string]any
 	if err := json.Unmarshal(data, &raw); err != nil {
 		if isHTML(data) {
@@ -189,16 +198,16 @@ func (c *Client) Renew(ctx context.Context, ck Cookies) (string, error) {
 		{"rq": "/web/book/read", "ql": true},
 		{"rq": "/web/book/read"},
 	}
-	var lastErr error
+	var authErr, transientErr error
 	for _, body := range variants {
 		req, err := c.newRequest(ctx, http.MethodPost, "/web/login/renewal", ck, body)
 		if err != nil {
-			lastErr = err
+			transientErr = err
 			continue
 		}
 		resp, err := c.HTTP.Do(req)
 		if err != nil {
-			lastErr = err
+			transientErr = err
 			continue
 		}
 		for _, rc := range resp.Cookies() {
@@ -208,22 +217,40 @@ func (c *Client) Renew(ctx context.Context, ck Cookies) (string, error) {
 				return rc.Value, nil
 			}
 		}
-		_, readErr := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		data, readErr := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 		resp.Body.Close()
 		if readErr != nil {
-			lastErr = readErr
+			transientErr = readErr
 			continue
+		}
+		if resp.StatusCode == http.StatusUnauthorized {
+			authErr = fmt.Errorf("%w（renewal HTTP 401）", ErrUnauthorized)
+			continue
+		}
+		if resp.StatusCode >= 500 || resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode == http.StatusTooManyRequests {
+			transientErr = fmt.Errorf("HTTP %d", resp.StatusCode)
+			continue
+		}
+		var raw map[string]any
+		if json.Unmarshal(data, &raw) == nil {
+			if code := toInt(raw["errCode"]); isAuthCode(code) {
+				authErr = fmt.Errorf("%w（renewal errCode=%d）", ErrUnauthorized, code)
+				continue
+			}
 		}
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
+			transientErr = fmt.Errorf("HTTP %d", resp.StatusCode)
 			continue
 		}
-		lastErr = errors.New("renewal 未返回新的 wr_skey")
+		transientErr = errors.New("renewal 未返回新的 wr_skey")
 	}
-	if lastErr == nil {
-		lastErr = errors.New("renewal 未返回新的 wr_skey")
+	if transientErr != nil {
+		return "", transientErr
 	}
-	return "", lastErr
+	if authErr != nil {
+		return "", authErr
+	}
+	return "", errors.New("renewal 未返回新的 wr_skey")
 }
 
 // FixSyncKey asks the chapterInfos endpoint to re-bind the sync state.

@@ -62,6 +62,15 @@ func (c *Client) SearchBooks(ctx context.Context, ck Cookies, keyword string) ([
 	if _, err := c.doJSON(ctx, http.MethodGet, "/web/search/global?"+q.Encode(), ck, nil, &raw); err != nil {
 		return nil, err
 	}
+	if m, ok := raw.(map[string]any); ok {
+		if code := toInt(m["errCode"]); code != 0 {
+			message := fmt.Sprintf("%s（errCode=%d）", apiErrText(m, code), code)
+			if isAuthCode(code) {
+				return nil, fmt.Errorf("%w：%s", ErrUnauthorized, message)
+			}
+			return nil, fmt.Errorf("%s", message)
+		}
+	}
 
 	books := make([]Book, 0, 15)
 	seen := map[string]bool{}

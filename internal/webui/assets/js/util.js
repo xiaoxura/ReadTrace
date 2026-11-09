@@ -37,14 +37,18 @@ export function fmtClock(ts, tz, withDate = true) {
   }
 }
 
-export function fmtTime(ts, tz) {
+export function fmtTime(ts, tz, withSeconds = false) {
   if (!ts) return '—';
   try {
-    return new Intl.DateTimeFormat('zh-CN', {
+    const opts = {
       timeZone: tz, hour: '2-digit', minute: '2-digit', hour12: false,
-    }).format(new Date(ts * 1000));
+    };
+    if (withSeconds) opts.second = '2-digit';
+    return new Intl.DateTimeFormat('zh-CN', opts).format(new Date(ts * 1000));
   } catch {
-    return new Date(ts * 1000).toLocaleTimeString();
+    return withSeconds
+      ? new Date(ts * 1000).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })
+      : new Date(ts * 1000).toLocaleTimeString();
   }
 }
 

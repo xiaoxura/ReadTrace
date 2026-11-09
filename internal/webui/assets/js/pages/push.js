@@ -77,7 +77,7 @@ export async function renderPush(ctx) {
       <article class="card"><div class="empty" style="padding:54px 20px">
         <div class="empty-ico" style="width:60px;height:60px;border-radius:18px">${icon('bell')}</div>
         <h3>还没有推送渠道</h3>
-        <p>阅读完成后，把本次时长与状态推送到微信或 Telegram，随时掌握运行结果。</p>
+        <p>阅读重试后仍失败或确认登录失效时，可通过微信、Telegram 等渠道收到提醒。</p>
         <button class="btn btn-primary" id="empty-add">${icon('plus')}添加第一个渠道</button>
       </div></article>`}
 

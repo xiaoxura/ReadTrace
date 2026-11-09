@@ -26,23 +26,45 @@ func New(dataDir string) (*Box, error) {
 	keyPath := filepath.Join(dataDir, "secret.key")
 	key, err := os.ReadFile(keyPath)
 	if errors.Is(err, os.ErrNotExist) {
-		key = make([]byte, 32)
-		if _, err := rand.Read(key); err != nil {
+		candidate := make([]byte, 32)
+		if _, err := rand.Read(candidate); err != nil {
 			return nil, err
 		}
-		// Write through a temp file + rename so an interrupted first run can
-		// never leave a truncated (zero-length) key behind: every encrypted
-		// cookie would become unreadable.
-		tmp := keyPath + ".tmp"
-		if err := os.WriteFile(tmp, key, 0o600); err != nil {
+		// A unique temp file plus atomic hard link installs a complete key
+		// without ever replacing another creator's key. Every process then
+		// reads the same final file, whether it won or lost the race.
+		tmp, err := os.CreateTemp(dataDir, ".secret.key-*")
+		if err != nil {
 			return nil, fmt.Errorf("写入密钥文件失败: %w", err)
 		}
-		if err := os.Rename(tmp, keyPath); err != nil {
-			_ = os.Remove(tmp)
+		defer os.Remove(tmp.Name())
+		if err := tmp.Chmod(0o600); err != nil {
+			_ = tmp.Close()
+			return nil, err
+		}
+		if _, err := tmp.Write(candidate); err != nil {
+			_ = tmp.Close()
+			return nil, fmt.Errorf("写入密钥文件失败: %w", err)
+		}
+		if err := tmp.Sync(); err != nil {
+			_ = tmp.Close()
+			return nil, fmt.Errorf("同步密钥文件失败: %w", err)
+		}
+		if err := tmp.Close(); err != nil {
+			return nil, err
+		}
+		if err := os.Link(tmp.Name(), keyPath); err != nil && !errors.Is(err, os.ErrExist) {
 			return nil, fmt.Errorf("保存密钥文件失败: %w", err)
+		}
+		key, err = os.ReadFile(keyPath)
+		if err != nil {
+			return nil, err
 		}
 	} else if err != nil {
 		return nil, err
+	}
+	if err := os.Chmod(keyPath, 0o600); err != nil {
+		return nil, fmt.Errorf("设置密钥文件权限失败: %w", err)
 	}
 	if len(key) != 32 {
 		return nil, fmt.Errorf("密钥文件损坏（长度 %d）。删除 %s 可以重新开始，但所有已加密的 Cookie 将无法恢复，所有账号需要重新登录", len(key), keyPath)

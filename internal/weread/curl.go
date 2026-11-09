@@ -30,6 +30,10 @@ var (
 
 // ParseCurl accepts either a full cURL command or a bare cookie string.
 func ParseCurl(raw string) (*CurlImport, error) {
+	return parseCurl(raw, true)
+}
+
+func parseCurl(raw string, requireCookies bool) (*CurlImport, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return nil, fmt.Errorf("内容为空")
@@ -83,10 +87,40 @@ func ParseCurl(raw string) (*CurlImport, error) {
 		}
 	}
 
-	if len(imp.Cookies) == 0 {
+	if requireCookies && len(imp.Cookies) == 0 {
 		return nil, fmt.Errorf("未从 curl 中找到 Cookie，请确认复制的是 /web/book/read 请求")
 	}
 	return imp, nil
+}
+
+// ParseReadTemplate accepts a JSON request body or a captured cURL without
+// requiring login credentials. Credential imports still use ParseCurl.
+func ParseReadTemplate(raw string) (map[string]any, error) {
+	raw = strings.TrimSpace(raw)
+	var payload map[string]any
+	var err error
+	if strings.HasPrefix(raw, "{") {
+		payload, err = DecodePayload(raw)
+	} else {
+		var imported *CurlImport
+		imported, err = parseCurl(raw, false)
+		if err == nil {
+			payload = imported.Payload
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	if len(payload) == 0 {
+		return nil, fmt.Errorf("未找到请求体模板，请粘贴 JSON 或包含 --data-raw 的 read 请求")
+	}
+	for _, key := range []string{"b", "c"} {
+		id, ok := payload[key].(string)
+		if !ok || strings.TrimSpace(id) == "" {
+			return nil, fmt.Errorf("模板缺少有效的 %q 字段（书籍/章节 ID）", key)
+		}
+	}
+	return payload, nil
 }
 
 // ParseCookieString parses "a=1; b=2" into a map.

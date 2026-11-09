@@ -2,11 +2,13 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
 	"time"
 
+	"readtrace/internal/engine"
 	"readtrace/internal/store"
 )
 
@@ -24,6 +26,10 @@ func (s *Server) handleRunStart(w http.ResponseWriter, r *http.Request) {
 	}
 	run, err := s.eng.Start(acc, body.Minutes, "manual")
 	if err != nil {
+		if errors.Is(err, engine.ErrDailyGoalReached) {
+			s.writeJSON(w, http.StatusOK, map[string]any{"ok": true, "skipped": true, "reason": "今日目标已完成"})
+			return
+		}
 		s.writeErr(w, http.StatusConflict, err.Error())
 		return
 	}

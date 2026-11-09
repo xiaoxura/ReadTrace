@@ -2,6 +2,7 @@
 package sched
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand"
@@ -24,12 +25,24 @@ type Scheduler struct {
 	mu     sync.Mutex // guards the fields below
 	cron   *cron.Cron
 	loc    *time.Location
-	ids    map[int64]cron.EntryID
+	jobs   map[int64]*scheduleJob
 	next   map[int64]int64 // schedule id -> next fire unix, self-managed
-	stopCh chan struct{}   // closed by Stop; releases fire() during jitter delay
-	stopMu sync.Mutex      // guards stopCh lifecycle (each generation closes once)
-	stopOn bool
+	jitter func() time.Duration
 }
+
+// Each registration owns its cancellation signal. The cron closure captures
+// this object, so a fire from an old generation cannot observe a new signal.
+type scheduleJob struct {
+	id        int64
+	accountID int64
+	cron      string
+	minutes   int
+	entryID   cron.EntryID
+	stop      chan struct{}
+	once      sync.Once
+}
+
+func (j *scheduleJob) cancel() { j.once.Do(func() { close(j.stop) }) }
 
 var parser = cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor)
 
@@ -37,30 +50,8 @@ var parser = cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cr
 func New(st *store.Store, eng *engine.Engine, log *slog.Logger) *Scheduler {
 	return &Scheduler{
 		st: st, eng: eng, log: log,
-		ids: map[int64]cron.EntryID{}, next: map[int64]int64{}, loc: time.Local,
-	}
-}
-
-// rotateStopCh closes the previous stop channel (if open) and opens a fresh
-// one for the new cron generation.
-func (s *Scheduler) rotateStopCh() {
-	s.stopMu.Lock()
-	defer s.stopMu.Unlock()
-	if s.stopOn {
-		close(s.stopCh)
-	}
-	s.stopCh = make(chan struct{})
-	s.stopOn = true
-}
-
-// closeStopCh closes the active stop channel so waiting fire() goroutines
-// return; calling it again is a no-op until rotateStopCh.
-func (s *Scheduler) closeStopCh() {
-	s.stopMu.Lock()
-	defer s.stopMu.Unlock()
-	if s.stopOn {
-		close(s.stopCh)
-		s.stopOn = false
+		jobs: map[int64]*scheduleJob{}, next: map[int64]int64{}, loc: time.Local,
+		jitter: func() time.Duration { return time.Duration(rand.Int63n(int64(90 * time.Second))) },
 	}
 }
 
@@ -74,29 +65,28 @@ func (s *Scheduler) Start(loc *time.Location) error {
 	}
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
+	// Preserve the current cron and waiting jobs if the new configuration
+	// cannot be read. A failed reload must not silently disable schedules.
+	rows, err := s.st.EnabledSchedules()
+	if err != nil {
+		return err
+	}
 
 	s.mu.Lock()
 	if s.cron != nil {
 		s.cron.Stop()
 	}
-	// 新一代 stopCh：旧的（若已关闭）让历史 fire goroutine 直接退出。
-	s.rotateStopCh()
+	for _, job := range s.jobs {
+		job.cancel()
+	}
 	s.loc = loc
 	c := cron.New(cron.WithLocation(loc), cron.WithParser(parser),
 		cron.WithChain(cron.Recover(cron.DefaultLogger)))
 	s.cron = c
-	s.ids = map[int64]cron.EntryID{}
+	s.jobs = map[int64]*scheduleJob{}
 	s.next = map[int64]int64{}
 	s.mu.Unlock()
 
-	rows, err := s.st.EnabledSchedules()
-	if err != nil {
-		// Start the (empty) cron anyway so later Add() calls work.
-		s.mu.Lock()
-		c.Start()
-		s.mu.Unlock()
-		return err
-	}
 	s.mu.Lock()
 	c.Start()
 	s.mu.Unlock()
@@ -121,11 +111,16 @@ func (s *Scheduler) Stop() {
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, job := range s.jobs {
+		job.cancel()
+	}
 	if s.cron != nil {
 		s.cron.Stop()
+		s.cron = nil
 	}
-	s.mu.Unlock()
-	s.closeStopCh()
+	s.jobs = map[int64]*scheduleJob{}
+	s.next = map[int64]int64{}
 }
 
 // Add registers one schedule. It is safe to call on a started scheduler.
@@ -141,12 +136,6 @@ func (s *Scheduler) Add(v *store.Schedule) error {
 		return fmt.Errorf("调度器尚未启动")
 	}
 
-	s.mu.Lock()
-	old, ok := s.ids[v.ID]
-	s.mu.Unlock()
-	if ok {
-		c.Remove(old)
-	}
 	_, next, err := s.tryAdd(c, loc, v)
 	if err != nil {
 		return err
@@ -162,13 +151,20 @@ func (s *Scheduler) tryAdd(c *cron.Cron, loc *time.Location, v *store.Schedule) 
 	if err != nil {
 		return 0, time.Time{}, fmt.Errorf("Cron 表达式无效：%w", err)
 	}
-	entryID, err := c.AddFunc(v.Cron, func() { s.fire(v.ID) })
+	job := &scheduleJob{id: v.ID, accountID: v.AccountID, cron: v.Cron,
+		minutes: v.Minutes, stop: make(chan struct{})}
+	entryID, err := c.AddFunc(v.Cron, func() { s.fire(job) })
 	if err != nil {
 		return 0, time.Time{}, err
 	}
+	job.entryID = entryID
 	next := schedParsed.Next(time.Now().In(loc))
 	s.mu.Lock()
-	s.ids[v.ID] = entryID
+	if old := s.jobs[v.ID]; old != nil {
+		old.cancel()
+		c.Remove(old.entryID)
+	}
+	s.jobs[v.ID] = job
 	s.next[v.ID] = next.Unix()
 	s.mu.Unlock()
 	return entryID, next, nil
@@ -180,9 +176,17 @@ func (s *Scheduler) Remove(id int64) {
 	defer s.opMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if entryID, ok := s.ids[id]; ok {
-		s.cron.Remove(entryID)
-		delete(s.ids, id)
+	s.removeLocked(id)
+}
+
+// removeLocked requires opMu and mu, in that order.
+func (s *Scheduler) removeLocked(id int64) {
+	if job := s.jobs[id]; job != nil {
+		job.cancel()
+		if s.cron != nil {
+			s.cron.Remove(job.entryID)
+		}
+		delete(s.jobs, id)
 	}
 	delete(s.next, id)
 }
@@ -243,13 +247,47 @@ func (s *Scheduler) Timezone() *time.Location {
 	return s.loc
 }
 
-func (s *Scheduler) fire(id int64) {
+func (s *Scheduler) currentJob(job *scheduleJob) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.jobs[job.id] != job {
+		return false
+	}
+	select {
+	case <-job.stop:
+		return false
+	default:
+		return true
+	}
+}
+
+func matchesJob(v *store.Schedule, job *scheduleJob) bool {
+	return v != nil && v.Enabled && v.AccountID == job.accountID &&
+		v.Cron == job.cron && v.Minutes == job.minutes
+}
+
+func (s *Scheduler) fire(job *scheduleJob) {
+	id := job.id
+	// Hold opMu only for short state/DB operations, never across jitter. Stop
+	// and Remove must be able to cancel a waiting fire immediately.
+	s.opMu.Lock()
+	if !s.currentJob(job) {
+		s.opMu.Unlock()
+		return
+	}
 	v, err := s.st.GetSchedule(id)
 	if err != nil || v == nil {
+		s.mu.Lock()
+		if s.jobs[id] == job {
+			s.removeLocked(id)
+		}
+		s.mu.Unlock()
+		s.opMu.Unlock()
 		s.log.Warn("定时任务不存在", "schedule", id, "err", err)
-		// The schedule row is gone (e.g. its account was deleted); drop the
-		// entry so it cannot keep firing on removed data.
-		s.Remove(id)
+		return
+	}
+	if !matchesJob(v, job) {
+		s.opMu.Unlock()
 		return
 	}
 	now := time.Now().Unix()
@@ -263,6 +301,7 @@ func (s *Scheduler) fire(id int64) {
 	s.next[id] = next
 	s.mu.Unlock()
 	_ = s.st.SetScheduleTimes(id, now, next)
+	s.opMu.Unlock()
 
 	acc, err := s.st.GetAccount(v.AccountID)
 	if err != nil || acc == nil {
@@ -276,7 +315,6 @@ func (s *Scheduler) fire(id int64) {
 	s.publish(id, acc.ID, "schedule.fire", map[string]any{
 		"schedule_id": id, "account_id": acc.ID, "account_name": acc.Name, "minutes": v.Minutes,
 	})
-
 	if s.eng.IsRunning(acc.ID) {
 		s.log.Info("账号已有运行中的任务，跳过定时触发", "account", acc.ID, "schedule", id)
 		s.publish(id, acc.ID, "schedule.skip", map[string]any{
@@ -286,19 +324,47 @@ func (s *Scheduler) fire(id int64) {
 	}
 
 	// 触发抖动：cron 整点启动是固定秒级指纹，加 0~90s 随机延迟弱化它。
-	// Stop（退出或时区重载）会立即放行并取消本次触发。
-	if d := time.Duration(rand.Int63n(int64(90 * time.Second))); d > 0 {
+	// Each registration's signal cancels it on disable, edit, delete or reload.
+	if d := s.jitter(); d > 0 {
 		timer := time.NewTimer(d)
+		defer timer.Stop()
 		select {
 		case <-timer.C:
-		case <-s.stopCh:
-			timer.Stop()
+		case <-job.stop:
 			return
 		}
 	}
 
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
+	if !s.currentJob(job) {
+		return
+	}
+	// The row may have been disabled or edited during jitter, before Add/Remove
+	// has replaced the registration. Compare the whole scheduled configuration.
+	v, err = s.st.GetSchedule(id)
+	if err != nil || !matchesJob(v, job) {
+		return
+	}
+	acc, err = s.st.GetAccount(v.AccountID)
+	if err != nil || acc == nil {
+		return
+	}
+	if s.eng.IsRunning(acc.ID) {
+		s.log.Info("账号已有运行中的任务，跳过定时触发", "account", acc.ID, "schedule", id)
+		s.publish(id, acc.ID, "schedule.skip", map[string]any{
+			"schedule_id": id, "account_name": acc.Name, "reason": "该账号已有阅读任务在运行",
+		})
+		return
+	}
 	run, err := s.eng.Start(acc, v.Minutes, "schedule")
 	if err != nil {
+		if errors.Is(err, engine.ErrDailyGoalReached) {
+			s.publish(id, acc.ID, "schedule.skip", map[string]any{
+				"schedule_id": id, "account_name": acc.Name, "reason": "今日目标已完成",
+			})
+			return
+		}
 		s.log.Warn("定时任务启动失败", "schedule", id, "err", err)
 		s.publish(id, acc.ID, "schedule.error", map[string]any{
 			"schedule_id": id, "account_name": acc.Name, "error": err.Error(),

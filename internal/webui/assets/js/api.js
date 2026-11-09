@@ -1,4 +1,4 @@
-async function request(path, { method = 'GET', body } = {}) {
+async function request(path, { method = 'GET', body, signal } = {}) {
   const headers = {};
   if (body !== undefined) headers['Content-Type'] = 'application/json';
   if (method !== 'GET') headers['X-Requested-With'] = 'readtrace';
@@ -10,6 +10,7 @@ async function request(path, { method = 'GET', body } = {}) {
       headers,
       credentials: 'same-origin',
       body: body !== undefined ? JSON.stringify(body) : undefined,
+      signal,
     });
   } catch {
     throw new Error('网络连接失败，请确认服务仍在运行');
@@ -23,7 +24,7 @@ async function request(path, { method = 'GET', body } = {}) {
     data = { error: text.slice(0, 160) || '响应格式错误' };
   }
 
-  if (res.status === 401) {
+  if (res.status === 401 && path !== '/api/login') {
     window.dispatchEvent(new CustomEvent('auth:expired'));
   }
   if (!res.ok) {
@@ -66,14 +67,15 @@ export const api = {
     request(`/api/pool/book/${encodeURIComponent(bookId)}/chapters?account_id=${account_id}${refresh ? '&refresh=1' : ''}`),
   poolBookPrune: (bookId, account_id = 0) =>
     request(`/api/pool/book/${encodeURIComponent(bookId)}/prune?account_id=${account_id}`, { method: 'POST', body: {} }),
-  poolAdd: (kind, value, title = '', accountId = 0) => request('/api/pool/add', { method: 'POST', body: { kind, value, title, account_id: accountId } }),
-  poolImport: (kind, text, accountId = 0) => request('/api/pool/import', { method: 'POST', body: { kind, text, account_id: accountId } }),
+  poolAdd: (kind, value, title = '', accountId = 0, bookId = '') => request('/api/pool/add', { method: 'POST', body: { kind, value, title, account_id: accountId, book_id: bookId } }),
+  poolImport: (kind, text, accountId = 0, bookId = '') => request('/api/pool/import', { method: 'POST', body: { kind, text, account_id: accountId, book_id: bookId } }),
   poolUpdate: (id, patch) => request(`/api/pool/items/${id}`, { method: 'PATCH', body: patch }),
   poolMove: (id, direction) => request(`/api/pool/items/${id}/move`, { method: 'POST', body: { direction } }),
   poolDelete: (id) => request(`/api/pool/items/${id}`, { method: 'DELETE' }),
   poolReset: (kind, accountId = 0) => request('/api/pool/reset', { method: 'POST', body: { kind, account_id: accountId } }),
   poolTemplate: (template) => request('/api/pool/template', { method: 'PUT', body: { template } }),
-  poolShelf: (accountId = 0) => request(`/api/pool/shelf?account_id=${accountId}`),
+  poolShelf: (accountId = 0, archiveOffset = 0, archiveRevision = '') =>
+    request(`/api/pool/shelf?account_id=${accountId}&archive_offset=${archiveOffset}${archiveRevision ? `&archive_revision=${encodeURIComponent(archiveRevision)}` : ''}`),
   poolShelfImport: (payload) => request('/api/pool/shelf/import', { method: 'POST', body: payload }),
 
   startRun: (accountId, minutes) => request('/api/runs', { method: 'POST', body: { account_id: accountId, minutes } }),
@@ -81,10 +83,10 @@ export const api = {
   runs: (accountId = 0, limit = 100) =>
     request(`/api/runs?limit=${limit}${accountId ? `&account_id=${accountId}` : ''}`),
   run: (id) => request(`/api/runs/${id}`),
-  runLogs: (id, { afterId = 0, tail = false, limit = 500 } = {}) => {
+  runLogs: (id, { afterId = 0, tail = false, limit = 500, signal } = {}) => {
     const q = new URLSearchParams({ after_id: String(afterId), limit: String(limit) });
     if (tail) q.set('tail', '1');
-    return request(`/api/runs/${id}/logs?${q.toString()}`);
+    return request(`/api/runs/${id}/logs?${q.toString()}`, { signal });
   },
 
   schedules: () => request('/api/schedules'),

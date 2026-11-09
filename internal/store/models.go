@@ -2,29 +2,32 @@ package store
 
 // Account is a bound WeRead account.
 type Account struct {
-	ID             int64  `json:"id"`
-	Seq            int64  `json:"seq"` // 本项目生成的展示 ID：从 0 开始逐个增加
-	Name           string `json:"name"`
-	Vid            string `json:"vid"`
-	Nickname       string `json:"nickname"`
-	Avatar         string `json:"avatar"`
-	Status         string `json:"status"`
-	LastError      string `json:"last_error"`
-	LastCheckAt    int64  `json:"last_check_at"`
-	DefaultMinutes int    `json:"default_minutes"`
-	TickSeconds    int    `json:"tick_seconds"`
-	MaxRetries     int    `json:"max_retries"` // 阅读失败自动重试次数，0 表示不重试
-	RetryDelay     int    `json:"retry_delay"` // 重试间隔，秒
-	BookID         string `json:"book_id"`
-	BookTitle      string `json:"book_title"`
-	ChapterID      string `json:"chapter_id"`
-	ChapterTitle   string `json:"chapter_title"`
-	Mode           string `json:"mode"`
-	PushChannelID  int64  `json:"push_channel_id"`
-	HasPayload     bool   `json:"has_payload"`
-	Running        bool   `json:"running"`
-	CreatedAt      int64  `json:"created_at"`
-	UpdatedAt      int64  `json:"updated_at"`
+	ID                    int64  `json:"id"`
+	Seq                   int64  `json:"seq"` // 本项目生成的展示 ID：从 0 开始逐个增加
+	Name                  string `json:"name"`
+	Vid                   string `json:"vid"`
+	Nickname              string `json:"nickname"`
+	Avatar                string `json:"avatar"`
+	Status                string `json:"status"`
+	LastError             string `json:"last_error"`
+	LastCheckAt           int64  `json:"last_check_at"`
+	DefaultMinutes        int    `json:"default_minutes"`
+	DailyGoalMinutes      int    `json:"daily_goal_minutes"`
+	TodaySeconds          int    `json:"today_seconds"`
+	DailyRemainingSeconds int    `json:"daily_remaining_seconds"`
+	TickSeconds           int    `json:"tick_seconds"`
+	MaxRetries            int    `json:"max_retries"` // 阅读失败自动重试次数，0 表示不重试
+	RetryDelay            int    `json:"retry_delay"` // 重试间隔，秒
+	BookID                string `json:"book_id"`
+	BookTitle             string `json:"book_title"`
+	ChapterID             string `json:"chapter_id"`
+	ChapterTitle          string `json:"chapter_title"`
+	Mode                  string `json:"mode"`
+	PushChannelID         int64  `json:"push_channel_id"`
+	HasPayload            bool   `json:"has_payload"`
+	Running               bool   `json:"running"`
+	CreatedAt             int64  `json:"created_at"`
+	UpdatedAt             int64  `json:"updated_at"`
 }
 
 // Run is one reading session.

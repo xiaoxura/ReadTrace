@@ -99,8 +99,8 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, http.StatusBadRequest, "密码至少需要 6 位")
 		return
 	}
-	if len(body.Password) > 128 {
-		s.writeErr(w, http.StatusBadRequest, "密码过长")
+	if len(body.Password) > 72 {
+		s.writeErr(w, http.StatusBadRequest, "密码最多 72 字节（中文等字符会占多个字节）")
 		return
 	}
 	b, err := bcrypt.GenerateFromPassword([]byte(body.Password), 12)
@@ -108,28 +108,51 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, http.StatusInternalServerError, "生成密码失败")
 		return
 	}
-	if err := s.st.SetSetting(keyPasswordHash, string(b)); err != nil {
-		s.writeErr(w, http.StatusInternalServerError, "保存密码失败")
+	won, problem := s.claimSetupSession(w, r, string(b), body.SiteName, nil)
+	if problem != "" {
+		s.writeErr(w, http.StatusInternalServerError, problem)
 		return
 	}
-	if name := strings.TrimSpace(body.SiteName); name != "" {
-		_ = s.st.SetSetting(keySiteName, name)
-	}
-	if err := s.newSession(w, r); err != nil {
-		s.writeErr(w, http.StatusInternalServerError, "创建会话失败")
+	if !won {
+		s.writeErr(w, http.StatusConflict, "已完成初始化，请直接登录")
 		return
 	}
 	s.log.Info("面板初始化完成")
 	s.writeJSON(w, http.StatusOK, map[string]any{"ok": true, "site_name": s.siteName()})
 }
 
+// claimSetupSession keeps the winning setup's password write and session
+// issuance in one auth critical section. afterClaim is nil in the handler;
+// tests pass a local barrier to check the interleaving deterministically.
+func (s *Server) claimSetupSession(w http.ResponseWriter, r *http.Request, hash, siteName string, afterClaim func()) (bool, string) {
+	s.authMu.Lock()
+	defer s.authMu.Unlock()
+	won, err := s.st.SetSettingIfEmpty(keyPasswordHash, hash)
+	if err != nil {
+		return false, "保存密码失败"
+	}
+	if !won {
+		return false, ""
+	}
+	if afterClaim != nil {
+		afterClaim()
+	}
+	if name := strings.TrimSpace(siteName); name != "" {
+		_ = s.st.SetSetting(keySiteName, name)
+	}
+	if err := s.newSession(w, r); err != nil {
+		return true, "创建会话失败"
+	}
+	return true, ""
+}
+
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	ip := clientIP(r)
-	if ok, wait := s.limiter.Allow(ip); !ok {
-		s.writeErr(w, http.StatusTooManyRequests, "尝试次数过多，请在 "+wait.Round(time.Second).String()+" 后重试")
+	hash, err := s.st.GetSetting(keyPasswordHash)
+	if err != nil {
+		s.writeErr(w, http.StatusInternalServerError, "读取密码失败")
 		return
 	}
-	hash, _ := s.st.GetSetting(keyPasswordHash)
 	if hash == "" {
 		s.writeErr(w, http.StatusBadRequest, "面板尚未初始化")
 		return
@@ -140,12 +163,32 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if !s.decode(w, r, &body) {
 		return
 	}
+	attempt, wait := s.limiter.Reserve(ip)
+	if attempt == nil {
+		s.writeErr(w, http.StatusTooManyRequests, "尝试次数过多，请在 "+wait.Round(time.Second).String()+" 后重试")
+		return
+	}
+	s.authMu.Lock()
+	defer s.authMu.Unlock()
+	// Re-read under the password lock: a concurrent password change can
+	// complete while this request waits, and no old hash may mint a session.
+	hash, err = s.st.GetSetting(keyPasswordHash)
+	if err != nil {
+		s.limiter.Cancel(attempt)
+		s.writeErr(w, http.StatusInternalServerError, "读取密码失败")
+		return
+	}
+	if hash == "" {
+		s.limiter.Cancel(attempt)
+		s.writeErr(w, http.StatusBadRequest, "面板尚未初始化")
+		return
+	}
 	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(body.Password)); err != nil {
-		s.limiter.Fail(ip)
+		s.limiter.Settle(attempt, false)
 		s.writeErr(w, http.StatusUnauthorized, "密码错误")
 		return
 	}
-	s.limiter.Reset(ip)
+	s.limiter.Settle(attempt, true)
 	if err := s.newSession(w, r); err != nil {
 		s.writeErr(w, http.StatusInternalServerError, "创建会话失败")
 		return
@@ -172,13 +215,20 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 
 // loginLimiter throttles failed password attempts per IP address.
 type loginLimiter struct {
-	mu      sync.Mutex
-	entries map[string]*limitEntry
+	mu        sync.Mutex
+	entries   map[string]*limitEntry
+	lastSweep time.Time
 }
 
 type limitEntry struct {
-	fails int
-	reset time.Time
+	fails    int
+	inFlight int
+	reset    time.Time
+}
+
+type loginAttempt struct {
+	ip    string
+	entry *limitEntry
 }
 
 const (
@@ -190,39 +240,64 @@ func newLoginLimiter() *loginLimiter {
 	return &loginLimiter{entries: map[string]*limitEntry{}}
 }
 
-func (l *loginLimiter) Allow(ip string) (bool, time.Duration) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	e, ok := l.entries[ip]
-	if !ok {
-		return true, 0
-	}
-	if time.Now().After(e.reset) {
-		// Expired window: drop the entry so rotating attacker IPs cannot grow
-		// the map without bound.
-		delete(l.entries, ip)
-		return true, 0
-	}
-	if e.fails < maxLoginFails {
-		return true, 0
-	}
-	return false, time.Until(e.reset)
-}
-
-func (l *loginLimiter) Fail(ip string) {
+// Reserve atomically occupies one verification slot before bcrypt runs.
+func (l *loginLimiter) Reserve(ip string) (*loginAttempt, time.Duration) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := time.Now()
-	e, ok := l.entries[ip]
-	if !ok || now.After(e.reset) {
-		l.entries[ip] = &limitEntry{fails: 1, reset: now.Add(loginWindow)}
-		return
+	if now.Sub(l.lastSweep) >= time.Minute {
+		for key, entry := range l.entries {
+			if !now.Before(entry.reset) && entry.inFlight == 0 {
+				delete(l.entries, key)
+			}
+		}
+		l.lastSweep = now
 	}
-	e.fails++
+	e, ok := l.entries[ip]
+	if !ok {
+		e = &limitEntry{reset: now.Add(loginWindow)}
+		l.entries[ip] = e
+	} else if !now.Before(e.reset) {
+		// Keep outstanding reservations across the window boundary.
+		e.fails = 0
+		e.reset = now.Add(loginWindow)
+	}
+	if e.fails+e.inFlight >= maxLoginFails {
+		return nil, time.Until(e.reset)
+	}
+	e.inFlight++
+	return &loginAttempt{ip: ip, entry: e}, 0
 }
 
-func (l *loginLimiter) Reset(ip string) {
+// Settle charges a failed attempt or clears failures after a valid password.
+func (l *loginLimiter) Settle(a *loginAttempt, success bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	delete(l.entries, ip)
+	e := l.entries[a.ip]
+	if e != a.entry {
+		return
+	}
+	e.inFlight--
+	if success {
+		e.fails = 0
+	} else {
+		e.fails++
+	}
+	if e.fails == 0 && e.inFlight == 0 {
+		delete(l.entries, a.ip)
+	}
+}
+
+// Cancel refunds a slot if verification never ran (for example DB failure).
+func (l *loginLimiter) Cancel(a *loginAttempt) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	e := l.entries[a.ip]
+	if e != a.entry {
+		return
+	}
+	e.inFlight--
+	if e.fails == 0 && e.inFlight == 0 {
+		delete(l.entries, a.ip)
+	}
 }

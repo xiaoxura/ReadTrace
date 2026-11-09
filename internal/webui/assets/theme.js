@@ -6,6 +6,9 @@
   } catch (e) { /* 私密模式下 localStorage 不可用 */ }
 
   function resolve() {
+    try {
+      pref = localStorage.getItem('wxread-theme') || 'dark';
+    } catch (e) { /* 保持上一次可读取的偏好 */ }
     var dark = pref === 'system' ? !(mq && mq.matches) : pref !== 'light';
     var theme = dark ? 'dark' : 'light';
     document.documentElement.dataset.theme = theme;

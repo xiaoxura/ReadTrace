@@ -6,7 +6,7 @@ import {
 } from '../components.js';
 import { renderError, skeletonHTML, bindStopButtons } from '../helpers.js';
 import {
-  $, $$, escapeHtml, relTime, statusBadge, toast, confirmDialog, fmtMinutes, pageHeaderHTML,
+  $, $$, escapeHtml, relTime, statusBadge, toast, confirmDialog, fmtDuration, fmtMinutes, pageHeaderHTML,
 } from '../util.js';
 
 const MODE_LABEL = { custom: '指定书籍', rotate: '随机轮换', sequence: '顺序书单' };
@@ -82,6 +82,45 @@ export async function renderAccounts(ctx) {
   });
 
   drawCards(ctx);
+
+  let refreshTimer;
+  let refreshing = false;
+  let refreshAgain = false;
+  let disposed = false;
+  const refreshCards = async () => {
+    if (disposed || !ctx.isActive()) return;
+    if (refreshing) {
+      refreshAgain = true;
+      return;
+    }
+    refreshing = true;
+    try {
+      do {
+        refreshAgain = false;
+        await refreshAccounts();
+        if (disposed || !ctx.isActive()) return;
+        const sub = $('.page-sub', root);
+        if (sub) sub.textContent = `${state.accounts.length} 个账号 · ${state.active.length} 个正在阅读`;
+        drawCards(ctx);
+      } while (refreshAgain);
+    } catch (e) {
+      if (!disposed && ctx.isActive()) toast(`刷新账号进度失败：${e.message}`, 'warn');
+    } finally {
+      refreshing = false;
+    }
+  };
+  const scheduleRefresh = () => {
+    if (disposed || !ctx.isActive()) return;
+    clearTimeout(refreshTimer);
+    refreshTimer = setTimeout(refreshCards, 300);
+  };
+  ctx.onCleanup(() => {
+    disposed = true;
+    clearTimeout(refreshTimer);
+  });
+  ctx.setHandler((ev) => {
+    if (ev.type === 'run.start' || ev.type === 'run.tick' || ev.type === 'run.end') scheduleRefresh();
+  });
 }
 
 function runningMap() {
@@ -114,9 +153,9 @@ function drawCards(ctx) {
     <table class="table acc-table table-wide">
       <thead><tr>
         <th style="min-width:260px">账号</th>
-        <th style="min-width:300px">定时 / 心跳 / 模板</th>
+        <th style="min-width:300px">阅读目标 / 心跳 / 模板</th>
         <th style="width:150px">阅读</th>
-        <th style="min-width:170px">推送渠道</th>
+        <th style="min-width:170px">问题提醒渠道</th>
         <th style="width:300px">管理</th>
       </tr></thead>
       <tbody>${list.map((a) => accountCard(a, running.get(a.id))).join('')}</tbody>
@@ -153,13 +192,13 @@ function wireCards(ctx, running) {
 
   bindStopButtons(root, { onDone: () => ctx.reload() });
 
-  // 推送渠道绑定：下拉即选即存，每个账号可绑定不同渠道。
+  // 问题提醒渠道绑定：下拉即选即存，每个账号可绑定不同渠道。
   $$('[data-push-channel]', root).forEach((sel) => sel.addEventListener('change', async () => {
     const id = Number(sel.dataset.pushChannel);
     const channelId = Number(sel.value) || 0;
     try {
       await api.updateAccount(id, { push_channel_id: channelId });
-      toast(channelId ? '已绑定推送渠道' : '已取消推送', 'ok');
+      toast(channelId ? '已绑定问题提醒渠道' : '已关闭问题提醒', 'ok');
       await refreshAccounts();
       drawCards(ctx);
     } catch (e) {
@@ -227,6 +266,13 @@ function wireCards(ctx, running) {
 function accountCard(a, active) {
   const pct = active && active.target ? Math.min(100, Math.round((active.elapsed / active.target) * 100)) : 0;
   const nickname = a.nickname && a.nickname !== a.name ? `${escapeHtml(a.nickname)} · ` : '';
+  const goal = Math.max(0, Number(a.daily_goal_minutes) || 0);
+  const today = Math.max(0, Number(a.today_seconds) || 0);
+  const remaining = Math.max(0, Number(a.daily_remaining_seconds) || 0);
+  const dailyStatus = goal
+    ? `<span class="badge neutral">每日目标 ${escapeHtml(goal)} 分钟</span>
+       <span class="hint">今日已读 ${fmtDuration(today)} · ${remaining ? `还需 ${fmtDuration(remaining)}` : '已达标'}</span>`
+    : `<span class="badge neutral">每日目标关闭</span><span class="hint">今日已读 ${fmtDuration(today)}</span>`;
   // 检查信息单独一行，与上一行的 #ID、状态徽标同列同左缘。
   const checkText = a.last_check_at
     ? `上次检查 ${relTime(a.last_check_at, state.tz)}`
@@ -258,6 +304,7 @@ function accountCard(a, active) {
     <td>
       <div class="acc-badges">
         <span class="badge neutral">${icon('timer')}默认 ${escapeHtml(a.default_minutes)} 分钟</span>
+        ${dailyStatus}
         <span class="badge neutral">${escapeHtml(a.tick_seconds)}s 心跳</span>
         <span class="badge neutral">${escapeHtml(MODE_LABEL[a.mode] || a.mode)}</span>
         ${a.has_payload ? '<span class="badge ok">自定义模板</span>' : ''}
@@ -273,9 +320,9 @@ function accountCard(a, active) {
       </div>
     </td>
     <td>
-      <select class="select" data-push-channel="${a.id}" aria-label="推送渠道"
-        style="min-width:150px" title="阅读完成后的推送渠道（完成后通知）">
-        <option value="0" ${!a.push_channel_id ? 'selected' : ''}>不推送</option>
+      <select class="select" data-push-channel="${a.id}" aria-label="问题提醒渠道"
+        style="min-width:150px" title="仅在重试后仍失败或确认登录失效时提醒">
+        <option value="0" ${!a.push_channel_id ? 'selected' : ''}>不提醒</option>
         ${state.channels.map((c) => `<option value="${c.id}" ${a.push_channel_id === c.id ? 'selected' : ''}>${escapeHtml(c.name)}</option>`).join('')}
       </select>
     </td>

@@ -95,11 +95,19 @@ func (s *Store) ListRuns(accountID int64, limit int) ([]Run, error) {
 	return out, rows.Err()
 }
 
-// RunsSince returns runs started after the timestamp, oldest first.
+// RunsSince returns statistical run facts overlapping the time from since,
+// oldest first. Purged rows carry only the fields retained in run_statistics;
+// use GetRun or ListRuns when full run details are needed.
 func (s *Store) RunsSince(since int64) ([]Run, error) {
 	rows, err := s.db.Query(`SELECT `+runCols+` FROM runs r
 		LEFT JOIN accounts a ON a.id = r.account_id
-		WHERE r.started_at >= ? ORDER BY r.started_at ASC`, since)
+		WHERE MAX(r.finished_at, r.started_at + r.elapsed_seconds) > ?
+		UNION ALL
+		SELECT h.run_id, h.account_id, COALESCE(a.name, ''), '', 0,
+			h.elapsed_seconds, 0, 0, '', '', h.started_at, h.finished_at
+		FROM run_statistics h LEFT JOIN accounts a ON a.id = h.account_id
+		WHERE MAX(h.finished_at, h.started_at + h.elapsed_seconds) > ?
+		ORDER BY 11 ASC, 1 ASC`, since, since)
 	if err != nil {
 		return nil, err
 	}
@@ -129,15 +137,32 @@ func (s *Store) PurgeHistory(retainDays int) (int64, error) {
 // PurgeHistoryBefore deletes finished runs with finished_at < cutoff.
 // Exposed as-is so tests can pin the cutoff.
 func (s *Store) PurgeHistoryBefore(cutoff int64) (int64, error) {
-	if _, err := s.db.Exec(`DELETE FROM run_logs WHERE run_id IN
-		(SELECT id FROM runs WHERE finished_at > 0 AND finished_at < ?)`, cutoff); err != nil {
-		return 0, err
-	}
-	res, err := s.db.Exec(`DELETE FROM runs WHERE finished_at > 0 AND finished_at < ?`, cutoff)
+	tx, err := s.db.Begin()
 	if err != nil {
 		return 0, err
 	}
-	n, _ := res.RowsAffected()
+	defer tx.Rollback()
+	if _, err := tx.Exec(`INSERT INTO run_statistics
+		(run_id, account_id, started_at, finished_at, elapsed_seconds)
+		SELECT id, account_id, started_at, finished_at, elapsed_seconds
+		FROM runs WHERE finished_at > 0 AND finished_at < ?`, cutoff); err != nil {
+		return 0, err
+	}
+	if _, err := tx.Exec(`DELETE FROM run_logs WHERE run_id IN
+		(SELECT id FROM runs WHERE finished_at > 0 AND finished_at < ?)`, cutoff); err != nil {
+		return 0, err
+	}
+	res, err := tx.Exec(`DELETE FROM runs WHERE finished_at > 0 AND finished_at < ?`, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
 	return n, nil
 }
 

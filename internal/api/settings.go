@@ -46,28 +46,23 @@ func (s *Server) handleSettingsUpdate(w http.ResponseWriter, r *http.Request) {
 	if !s.decode(w, r, &body) {
 		return
 	}
+	values := map[string]string{}
 	if name := strings.TrimSpace(body.SiteName); name != "" {
 		if len(name) > 40 {
 			s.writeErr(w, http.StatusBadRequest, "站点名称过长")
 			return
 		}
-		_ = s.st.SetSetting(keySiteName, name)
+		values[keySiteName] = name
 	}
+	var newLocation *time.Location
 	if tz := strings.TrimSpace(body.Timezone); tz != "" {
 		loc, err := time.LoadLocation(tz)
 		if err != nil {
 			s.writeErr(w, http.StatusBadRequest, "时区无效："+tz)
 			return
 		}
-		if err := s.st.SetSetting(keyTimezone, tz); err != nil {
-			s.writeErr(w, http.StatusInternalServerError, "保存时区失败")
-			return
-		}
-		s.setTimezone(loc)
-		if err := s.sch.Start(loc); err != nil {
-			s.writeErr(w, http.StatusInternalServerError, "重建定时任务失败："+err.Error())
-			return
-		}
+		values[keyTimezone] = tz
+		newLocation = loc
 	}
 	// 0 disables the background account check; the checker picks the new
 	// value up on its next poll without a restart.
@@ -77,10 +72,36 @@ func (s *Server) handleSettingsUpdate(w http.ResponseWriter, r *http.Request) {
 			s.writeErr(w, http.StatusBadRequest, "自动检测间隔需在 0~1440 分钟之间，0 表示关闭")
 			return
 		}
-		if err := s.st.SetSetting(checker.SettingInterval, strconv.Itoa(v)); err != nil {
-			s.writeErr(w, http.StatusInternalServerError, "保存检测设置失败")
+		values[checker.SettingInterval] = strconv.Itoa(v)
+	}
+	s.settingsMu.Lock()
+	defer s.settingsMu.Unlock()
+	previous, err := s.st.AllSettings()
+	if err != nil {
+		s.writeErr(w, http.StatusInternalServerError, "读取设置失败")
+		return
+	}
+	if err := s.st.SetSettings(values); err != nil {
+		s.writeErr(w, http.StatusInternalServerError, "保存设置失败")
+		return
+	}
+	if newLocation != nil && newLocation.String() != s.timezone().String() {
+		if err := s.sch.Start(newLocation); err != nil {
+			// Scheduler.Start leaves its previous generation running when the
+			// configuration cannot be read. Restore the matching stored values.
+			rollback := make(map[string]string, len(values))
+			for key := range values {
+				rollback[key] = previous[key]
+			}
+			message := "重建定时任务失败：" + err.Error()
+			if rollbackErr := s.st.SetSettings(rollback); rollbackErr != nil {
+				s.log.Error("恢复设置失败", "err", rollbackErr)
+				message += "；恢复设置失败，请重新保存设置"
+			}
+			s.writeErr(w, http.StatusInternalServerError, message)
 			return
 		}
+		s.setTimezone(newLocation)
 	}
 	s.writeJSON(w, http.StatusOK, map[string]any{
 		"ok":        true,
@@ -97,17 +118,27 @@ func (s *Server) handlePasswordChange(w http.ResponseWriter, r *http.Request) {
 	if !s.decode(w, r, &body) {
 		return
 	}
-	hash, _ := s.st.GetSetting(keyPasswordHash)
+	if len(body.New) < 6 {
+		s.writeErr(w, http.StatusBadRequest, "新密码至少需要 6 位")
+		return
+	}
+	if len(body.New) > 72 {
+		s.writeErr(w, http.StatusBadRequest, "新密码最多 72 字节（中文等字符会占多个字节）")
+		return
+	}
+	s.authMu.Lock()
+	defer s.authMu.Unlock()
+	hash, err := s.st.GetSetting(keyPasswordHash)
+	if err != nil {
+		s.writeErr(w, http.StatusInternalServerError, "读取密码失败")
+		return
+	}
 	if hash == "" {
 		s.writeErr(w, http.StatusBadRequest, "面板尚未初始化")
 		return
 	}
 	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(body.Current)); err != nil {
-		s.writeErr(w, http.StatusUnauthorized, "当前密码不正确")
-		return
-	}
-	if len(body.New) < 6 {
-		s.writeErr(w, http.StatusBadRequest, "新密码至少需要 6 位")
+		s.writeErr(w, http.StatusBadRequest, "当前密码不正确")
 		return
 	}
 	b, err := bcrypt.GenerateFromPassword([]byte(body.New), 12)
@@ -115,12 +146,14 @@ func (s *Server) handlePasswordChange(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, http.StatusInternalServerError, "生成密码失败")
 		return
 	}
-	if err := s.st.SetSetting(keyPasswordHash, string(b)); err != nil {
+	changed, err := s.st.ChangePassword(hash, string(b), sessionID(r))
+	if err != nil {
 		s.writeErr(w, http.StatusInternalServerError, "保存密码失败")
 		return
 	}
-	if id := sessionID(r); id != "" {
-		_ = s.st.DeleteOtherSessions(id)
+	if !changed {
+		s.writeErr(w, http.StatusConflict, "密码已发生变化，请重新登录")
+		return
 	}
 	s.writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }

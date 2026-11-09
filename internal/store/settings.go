@@ -22,6 +22,35 @@ func (s *Store) SetSetting(key, value string) error {
 	return err
 }
 
+// SetSettings commits a group of settings together, so a failed write cannot
+// leave a partially applied configuration.
+func (s *Store) SetSettings(values map[string]string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for key, value := range values {
+		if _, err := tx.Exec(`INSERT INTO settings (key, value) VALUES (?, ?)
+			ON CONFLICT(key) DO UPDATE SET value = excluded.value`, key, value); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// SetSettingIfEmpty sets a value only when it is absent or empty. The single
+// SQLite statement makes first-time setup safe across concurrent requests.
+func (s *Store) SetSettingIfEmpty(key, value string) (bool, error) {
+	res, err := s.db.Exec(`INSERT INTO settings (key, value) VALUES (?, ?)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value WHERE settings.value = ''`, key, value)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
+}
+
 // AllSettings returns every setting.
 func (s *Store) AllSettings() (map[string]string, error) {
 	rows, err := s.db.Query(`SELECT key, value FROM settings`)
@@ -85,6 +114,28 @@ func (s *Store) DeleteSession(id string) error {
 func (s *Store) DeleteOtherSessions(keep string) error {
 	_, err := s.db.Exec(`DELETE FROM sessions WHERE id <> ?`, keep)
 	return err
+}
+
+// ChangePassword replaces the expected hash and revokes other sessions in one
+// transaction. A stale password change cannot overwrite a newer one.
+func (s *Store) ChangePassword(expected, next, keepSession string) (bool, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`UPDATE settings SET value = ? WHERE key = ? AND value = ?`, next, "password_hash", expected)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil || n != 1 {
+		return false, err
+	}
+	if _, err := tx.Exec(`DELETE FROM sessions WHERE id <> ?`, keepSession); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
 }
 
 // PurgeSessions removes expired sessions.

@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -99,13 +101,13 @@ func TestCheckLoginAuthFailureExpired(t *testing.T) {
 
 // While the account is running, unknown failures must not rotate the skey.
 func TestCheckLoginRunningNoProbe(t *testing.T) {
-	renews := 0
+	var renews atomic.Int32
 	mux := http.NewServeMux()
 	mux.HandleFunc("/web/user", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`{"errCode":-2003}`))
 	})
 	mux.HandleFunc("/web/login/renewal", func(w http.ResponseWriter, _ *http.Request) {
-		renews++
+		renews.Add(1)
 		http.SetCookie(w, &http.Cookie{Name: "wr_skey", Value: "NEW"})
 		_, _ = w.Write([]byte(`{"succ":1}`))
 	})
@@ -138,15 +140,70 @@ func TestCheckLoginRunningNoProbe(t *testing.T) {
 	// The engine's own upfront Renew runs asynchronously; wait for it so the
 	// baseline below does not race with it.
 	deadline := time.Now().Add(2 * time.Second)
-	for renews < 1 && time.Now().Before(deadline) {
+	for renews.Load() < 1 && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
-	before := renews
+	before := renews.Load()
 	outcome, checkErr := s.checkLoginClassified(context.Background(), id, weread.Cookies{"wr_vid": "1", "wr_skey": "OLD"})
 	if outcome != "error" || checkErr == nil {
 		t.Fatalf("want error outcome while running, got %s/%v", outcome, checkErr)
 	}
-	if renews != before {
-		t.Fatalf("renewal must not be probed while the account is running (%d calls)", renews-before)
+	if renews.Load() != before {
+		t.Fatalf("renewal must not be probed while the account is running (%d calls)", renews.Load()-before)
+	}
+}
+
+func TestRefreshUsesRenewedCookieAndPreservesIdentityOnUserInfoFailure(t *testing.T) {
+	seenUserInfoKey := make(chan string, 1)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/web/user", func(w http.ResponseWriter, r *http.Request) {
+		cookie, _ := r.Cookie("wr_skey")
+		if cookie == nil || cookie.Value != "NEW" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		_, _ = w.Write([]byte(`{"errCode":0}`))
+	})
+	mux.HandleFunc("/web/login/renewal", func(w http.ResponseWriter, _ *http.Request) {
+		http.SetCookie(w, &http.Cookie{Name: "wr_skey", Value: "NEW"})
+		_, _ = w.Write([]byte(`{"succ":1}`))
+	})
+	mux.HandleFunc("/api/userInfo", func(w http.ResponseWriter, r *http.Request) {
+		cookie, _ := r.Cookie("wr_skey")
+		if cookie != nil {
+			seenUserInfoKey <- cookie.Value
+		}
+		_, _ = w.Write([]byte(`{}`)) // lookup has no identity fields
+	})
+	s := newCheckTestServer(t, mux)
+	id := startTestAccount(t, s)
+	if err := s.st.UpdateIdentity(id, "1", "Saved Nick", "saved-avatar"); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/accounts/1/refresh", nil)
+	req.SetPathValue("id", strconv.FormatInt(id, 10))
+	rec := httptest.NewRecorder()
+	s.handleAccountRefresh(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("refresh status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	select {
+	case key := <-seenUserInfoKey:
+		if key != "NEW" {
+			t.Fatalf("UserInfo used %q, want NEW", key)
+		}
+	default:
+		t.Fatal("UserInfo not requested")
+	}
+	acc, err := s.st.GetAccount(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acc.Nickname != "Saved Nick" || acc.Avatar != "saved-avatar" || acc.Status != "active" {
+		t.Fatalf("refresh erased identity or status: %+v", acc)
+	}
+	ck, _, err := s.st.AccountSecrets(id)
+	if err != nil || ck["wr_skey"] != "NEW" {
+		t.Fatalf("saved cookies=%v err=%v", ck, err)
 	}
 }

@@ -48,9 +48,9 @@ type Checker struct {
 	stop chan struct{}
 	done sync.WaitGroup
 
-	mu       sync.Mutex
-	lastRun  time.Time
-	running  bool
+	mu      sync.Mutex
+	lastRun time.Time
+	running bool
 }
 
 // New creates a Checker (call Start to activate the background loop).
@@ -124,6 +124,11 @@ func (c *Checker) tick() {
 	c.lastRun = time.Now()
 	c.mu.Unlock()
 
+	defer func() {
+		c.mu.Lock()
+		c.running = false
+		c.mu.Unlock()
+	}()
 	c.RunOnce(context.Background())
 }
 
@@ -147,22 +152,48 @@ func (c *Checker) RunOnce(ctx context.Context) {
 		if c.eng.IsRunning(acc.ID) {
 			continue
 		}
-		cookies, _, err := c.st.AccountSecrets(acc.ID)
-		if err != nil || len(cookies) == 0 {
+		actx, cancel := context.WithTimeout(ctx, perAccountTimeout)
+		var notifyAcc *store.Account
+		outcome, outcomeErr, opErr := CheckLoginAndUpdate(actx, c.st, c.wc, c.eng, acc.ID,
+			func(_ weread.Cookies, outcome string, checkErr error) error {
+				current, err := c.st.GetAccount(acc.ID)
+				if err != nil {
+					return err
+				}
+				if current == nil {
+					return errors.New("账号不存在")
+				}
+				switch outcome {
+				case "active":
+					return c.st.SetAccountStatus(acc.ID, "active", "", time.Now().Unix())
+				case "expired":
+					if current.Status != "expired" && current.PushChannelID > 0 {
+						notifyAcc = current
+					}
+					return c.st.SetAccountStatus(acc.ID, "expired", validateErrString(checkErr), time.Now().Unix())
+				default:
+					// Keep the current status and last error on transient failures.
+					if current.Status != "expired" {
+						return c.st.SetAccountStatus(acc.ID, current.Status, "", time.Now().Unix())
+					}
+					return nil
+				}
+			})
+		cancel()
+		if errors.Is(opErr, engine.ErrAccountRunning) || errors.Is(opErr, ErrNoCookies) {
 			continue
 		}
-		actx, cancel := context.WithTimeout(ctx, perAccountTimeout)
-		outcome, outcomeErr := c.CheckLogin(actx, acc.ID, weread.Cookies(cookies))
-		cancel()
+		if opErr != nil {
+			c.log.Warn("账号自动检查提交失败", "account", acc.Name, "err", opErr)
+			continue
+		}
 		checked++
 		switch outcome {
 		case "active":
-			_ = c.st.SetAccountStatus(acc.ID, "active", "", time.Now().Unix())
 		case "expired":
 			expired++
-			_ = c.st.SetAccountStatus(acc.ID, "expired", validateErrString(outcomeErr), time.Now().Unix())
-			if acc.Status != "expired" && acc.PushChannelID > 0 {
-				go c.notifyExpired(acc, outcomeErr)
+			if notifyAcc != nil {
+				go c.notifyExpired(notifyAcc, outcomeErr)
 			}
 		default: // "error": transient trouble — log only, never touch the row.
 			// -2003 这类参数错误/网络抖动是临时的，手动检查就能恢复；
@@ -171,9 +202,6 @@ func (c *Checker) RunOnce(ctx context.Context) {
 			// last_check_at 即可。
 			c.log.Info("账号自动检查遇到临时错误，本次跳过",
 				"account", acc.Name, "status", acc.Status, "err", validateErrString(outcomeErr))
-			if acc.Status != "expired" {
-				_ = c.st.SetAccountStatus(acc.ID, acc.Status, "", time.Now().Unix())
-			}
 		}
 	}
 	c.log.Info("账号状态自动检查完成", "checked", checked, "active", checked-expired, "expired", expired)
@@ -216,8 +244,55 @@ func (c *Checker) notifyExpired(acc *store.Account, cause error) {
 // account gets one renewal probe: a live session can always renew, a dead one
 // is refused — that decides liveness more reliably than /web/user itself.
 func (c *Checker) CheckLogin(ctx context.Context, accountID int64, ck weread.Cookies) (string, error) {
-	isRunning := func(id int64) bool { return c.eng.IsRunning(id) }
-	return CheckLogin(ctx, c.st, c.wc, isRunning, accountID, ck)
+	return CheckLoginWithEngine(ctx, c.st, c.wc, c.eng, accountID, ck)
+}
+
+// ErrNoCookies means an account has no credentials to validate.
+var ErrNoCookies = errors.New("账号没有可用的 Cookie")
+
+// CheckLoginWithEngine serializes renewal with credential replacement and run
+// startup. The latest stored cookies are loaded inside that account lock.
+func CheckLoginWithEngine(ctx context.Context, st *store.Store, wc *weread.Client,
+	eng *engine.Engine, accountID int64, ck weread.Cookies,
+) (string, error) {
+	outcome, checkErr, opErr := CheckLoginAndUpdate(ctx, st, wc, eng, accountID, nil)
+	if errors.Is(opErr, engine.ErrAccountRunning) {
+		// A running loop owns the skey. Validate only; never renew or persist the
+		// caller's possibly stale cookie copy underneath it.
+		if validateErr := wc.Validate(ctx, ck); validateErr != nil {
+			return "error", validateErr
+		}
+		return "active", nil
+	}
+	if opErr != nil {
+		return "error", opErr
+	}
+	return outcome, checkErr
+}
+
+// CheckLoginAndUpdate holds the account lock from the latest cookie read
+// through validation, optional renewal and the caller's resulting DB update.
+// A running account is left untouched: its loop owns the credentials/status.
+func CheckLoginAndUpdate(ctx context.Context, st *store.Store, wc *weread.Client,
+	eng *engine.Engine, accountID int64,
+	update func(ck weread.Cookies, outcome string, checkErr error) error,
+) (outcome string, checkErr, opErr error) {
+	opErr = eng.WithIdleAccount(accountID, func() error {
+		latest, _, readErr := st.AccountSecrets(accountID)
+		if readErr != nil {
+			return readErr
+		}
+		if len(latest) == 0 {
+			return ErrNoCookies
+		}
+		ck := weread.Cookies(latest)
+		outcome, checkErr = CheckLogin(ctx, st, wc, eng.IsRunning, accountID, ck)
+		if update != nil {
+			return update(ck, outcome, checkErr)
+		}
+		return nil
+	})
+	return outcome, checkErr, opErr
 }
 
 // CheckLogin is the shared classified check, callable without a Checker.
@@ -228,37 +303,46 @@ func CheckLogin(ctx context.Context, st *store.Store, wc *weread.Client,
 	if err == nil {
 		return "active", nil
 	}
+	if isRunning(accountID) {
+		return "error", err
+	}
 	if !errors.Is(err, weread.ErrUnauthorized) && !errors.Is(err, weread.ErrRiskControl) {
-		if isRunning(accountID) {
-			// Never rotate the skey underneath a running loop; report only.
-			return "error", err
-		}
 		key, renewErr := wc.Renew(ctx, ck)
 		if renewErr != nil || key == "" {
+			if errors.Is(renewErr, weread.ErrUnauthorized) {
+				return "expired", renewErr
+			}
 			// Can't prove liveness one way or the other; keep the account
 			// untouched and surface the original failure.
 			return "error", err
 		}
-		_ = st.SaveCookies(accountID, map[string]string(ck))
+		if saveErr := st.SaveCookies(accountID, map[string]string(ck)); saveErr != nil {
+			return "error", fmt.Errorf("保存续期 Cookie 失败: %w", saveErr)
+		}
 		// Renewal succeeded ⇒ the session is alive even though /web/user misbehaved.
 		return "active", nil
 	}
 	key, renewErr := wc.Renew(ctx, ck)
 	if renewErr != nil || key == "" {
+		if errors.Is(renewErr, weread.ErrUnauthorized) {
+			return "expired", renewErr
+		}
 		if renewErr == nil {
 			renewErr = errors.New("renewal 未返回新的 wr_skey")
 		}
-		return "expired", renewErr
+		return "error", renewErr
 	}
-	_ = st.SaveCookies(accountID, map[string]string(ck))
+	if saveErr := st.SaveCookies(accountID, map[string]string(ck)); saveErr != nil {
+		return "error", fmt.Errorf("保存续期 Cookie 失败: %w", saveErr)
+	}
 	e := wc.Validate(ctx, ck)
 	if e == nil {
 		return "active", nil
 	}
-	if !errors.Is(e, weread.ErrUnauthorized) && !errors.Is(e, weread.ErrRiskControl) {
-		return "error", e
+	if errors.Is(e, weread.ErrUnauthorized) {
+		return "expired", e
 	}
-	return "expired", e
+	return "error", e
 }
 
 func validateErrString(err error) string {

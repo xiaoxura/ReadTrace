@@ -19,6 +19,8 @@ let poolPage = 1;         // 书池列表分页状态
 let poolPageSize = 20;
 let shelfPage = 1;        // 书架审查列表分页状态
 let shelfPageSize = 20;
+let importEpoch = 0;      // 切换账号或重新查询后忽略旧响应
+let poolRequestEpoch = 0; // 多次刷新书池时只展示最后一次结果
 
 export async function renderPool(ctx) {
   const { root } = ctx;
@@ -70,6 +72,9 @@ function accountLabel(a) {
 /* ---------- 二级菜单一：书籍导入（一键书架 + ID/书名查询） ---------- */
 
 function drawImportTab(box) {
+  importEpoch++;
+  shelfCache = null;
+  shelfPage = 1;
   const accounts = activeAccounts();
   if (!accounts.length) {
     box.innerHTML = `
@@ -84,7 +89,7 @@ function drawImportTab(box) {
     <article class="card">
       <div class="card-head"><div><div class="card-title">${icon('download')}书籍导入</div><div class="card-sub">一键从书架导入全部可读书籍；未付费的书籍会自动跳过</div></div></div>
       <div class="tool-row" style="margin-bottom:12px">
-        <select class="select" id="shelf-account" style="min-width:200px">
+        <select class="select" id="shelf-account" aria-label="书籍导入账号" style="min-width:200px">
           ${accounts.map((a) => `<option value="${a.id}">${escapeHtml(accountLabel(a))}</option>`).join('')}
         </select>
         <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer">
@@ -115,6 +120,19 @@ function drawImportTab(box) {
   });
   $('#book-query-btn', box).addEventListener('click', () => queryBooks());
   $('#shelf-load', box).addEventListener('click', () => loadShelf());
+  $('#shelf-account', box).addEventListener('change', () => {
+    importEpoch++;
+    shelfCache = null;
+    shelfPage = 1;
+    setLoading($('#book-query-btn', box), false);
+    setLoading($('#shelf-load', box), false);
+    $('[data-import-result]', box).innerHTML = '<div class="hint">已切换账号，请重新查询书籍或拉取书架。</div>';
+  });
+}
+
+function currentImport(accountId, epoch, host) {
+  return poolTab === 'import' && host?.isConnected && epoch === importEpoch
+    && Number($('#shelf-account', $('#page'))?.value || 0) === accountId;
 }
 
 async function queryBooks() {
@@ -123,7 +141,10 @@ async function queryBooks() {
   const host = $('[data-import-result]', box);
   if (!q) { toast('请输入书籍 ID 或书名', 'warn'); return; }
   const accountId = Number($('#shelf-account', box).value || 0);
+  const epoch = ++importEpoch;
+  shelfCache = null;
   const btn = $('#book-query-btn', box);
+  setLoading($('#shelf-load', box), false);
   setLoading(btn, true);
   host.innerHTML = `<div class="hint">查询中…</div>`;
   const single = /^[0-9]{4,}$/.test(q);
@@ -132,24 +153,29 @@ async function queryBooks() {
       // 直接按 bookId 拉详情与目录；失败再退回按书名搜索一次。
       try {
         const detail = await api.bookDetail(accountId, q);
+        if (!currentImport(accountId, epoch, host)) return;
         if (detail?.book) {
-          drawBookCandidates([detail.book], auditFromChapters(detail.chapters || []));
+          drawBookCandidates([detail.book], auditFromChapters(detail.chapters || []), accountId, epoch, host);
           return;
         }
       } catch (e) {
         // fallthrough to keyword search
+        if (!currentImport(accountId, epoch, host)) return;
       }
     }
     const res = await api.searchBooks(accountId, q);
+    if (!currentImport(accountId, epoch, host)) return;
     if (!res.books?.length) {
       host.innerHTML = `<div class="empty" style="padding:22px"><h3>没有找到相关书籍</h3><p>换个书名，或确认书籍 ID 是否正确。</p></div>`;
       return;
     }
-    drawBookCandidates(res.books, null);
+    drawBookCandidates(res.books, null, accountId, epoch, host);
   } catch (e) {
-    host.innerHTML = `<div class="note warn">${icon('alert')}<div>查询失败：${escapeHtml(e.message)}</div></div>`;
+    if (currentImport(accountId, epoch, host)) {
+      host.innerHTML = `<div class="note warn">${icon('alert')}<div>查询失败：${escapeHtml(e.message)}</div></div>`;
+    }
   } finally {
-    setLoading(btn, false);
+    if (epoch === importEpoch) setLoading(btn, false);
   }
 }
 
@@ -163,9 +189,8 @@ function auditFromChapters(chapters) {
   return a;
 }
 
-function drawBookCandidates(books, audit) {
-  const host = $('[data-import-result]');
-  if (!host) return;
+function drawBookCandidates(books, audit, accountId, epoch, host) {
+  if (!currentImport(accountId, epoch, host)) return;
   host.innerHTML = `
     <div class="list" style="margin-top:12px">
       ${books.map((b, i) => {
@@ -186,8 +211,8 @@ function drawBookCandidates(books, audit) {
     </div>
   `;
   $$('[data-import-book]', host).forEach((btn) => btn.addEventListener('click', async () => {
+    if (!currentImport(accountId, epoch, host)) return;
     const bookId = btn.dataset.importBook;
-    const accountId = Number($('#shelf-account', $('#page')).value || 0);
     const b = {
       book_id: bookId,
       title: btn.dataset.title || '',
@@ -198,6 +223,7 @@ function drawBookCandidates(books, audit) {
     try {
       // 拉一次目录核对付费结构：除非开了"全本导入"，全书付费未购的书直接拒绝。
       const detail = await api.bookDetail(accountId, bookId);
+      if (!currentImport(accountId, epoch, host)) return;
       const audit = auditFromChapters(detail.chapters || []);
       const ignorePaid = Boolean($('#shelf-ignore-paid', $('#page'))?.checked);
       const allPaid = audit.total > 0 && audit.priced === audit.total;
@@ -205,9 +231,9 @@ function drawBookCandidates(books, audit) {
         toast(`「${b.title || bookId}」全书 ${audit.total} 章都要付费且未购买，无法导入（已购/会员请先勾选「全本导入」）`, 'error', 6000);
         return;
       }
-      await importBooks([b]);
+      await importBooks([b], { accountOverride: accountId });
     } catch (e) {
-      toast(e.message, 'error');
+      if (currentImport(accountId, epoch, host)) toast(e.message, 'error');
     } finally {
       setLoading(btn, false);
     }
@@ -235,26 +261,121 @@ async function loadShelf() {
   const box = $('#page');
   const btn = $('#shelf-load', box);
   const accountId = Number($('#shelf-account', box).value || 0);
+  const host = $('[data-import-result]', box);
+  const epoch = ++importEpoch;
+  shelfCache = null;
+  host.innerHTML = '<div class="hint">正在拉取书架…</div>';
+  setLoading($('#book-query-btn', box), false);
   setLoading(btn, true);
   try {
-    shelfCache = await api.poolShelf(accountId);
+    const data = await api.poolShelf(accountId);
+    if (!currentImport(accountId, epoch, host)) return;
+    shelfCache = {
+      ...data,
+      account_id: accountId,
+      books: data.books || [],
+      archive_failures: data.archive_failures || {},
+      archive_error: '',
+    };
+    shelfPage = 1;
     drawShelfPreview();
   } catch (e) {
-    $('[data-import-result]', box).innerHTML = `<div class="note warn">${icon('alert')}<div>拉取书架失败：${escapeHtml(e.message)}</div></div>`;
+    if (currentImport(accountId, epoch, host)) {
+      host.innerHTML = `<div class="note warn">${icon('alert')}<div>拉取书架失败：${escapeHtml(e.message)}</div></div>`;
+    }
   } finally {
-    setLoading(btn, false);
+    if (epoch === importEpoch) setLoading(btn, false);
+  }
+}
+
+function archiveStatusHTML(snapshot) {
+  const total = Number(snapshot.archive_total) || 0;
+  const processed = Number(snapshot.archive_processed) || 0;
+  const remaining = Math.max(0, total - processed);
+  const failures = Object.entries(snapshot.archive_failures || {});
+  const next = Number(snapshot.next_archive_offset ?? -1);
+  if (!total && !failures.length && next < 0 && !snapshot.archive_error) return '';
+  return `
+    <div class="note ${failures.length || snapshot.archive_error ? 'warn' : ''}" style="margin-top:12px">
+      ${icon('book')}<div>
+        <b>归档进度：已处理 ${processed}/${total} 本</b> · 剩余 ${remaining} 本待处理
+        ${snapshot.archive_error ? `<div style="margin-top:6px">加载中断：${escapeHtml(snapshot.archive_error)}。归档尚未全部加载。</div>` : ''}
+        ${failures.length ? `<details style="margin-top:6px"><summary>${failures.length} 本归档书籍详情获取失败，点击查看 ID</summary>
+          <ul style="margin:6px 0 0 18px;padding:0">${failures.map(([id, message]) => `<li><span class="mono">${escapeHtml(id)}</span>：${escapeHtml(message)}</li>`).join('')}</ul>
+        </details>` : ''}
+        ${next >= 0 ? `<button class="btn btn-sm" data-shelf-more style="margin-top:8px">${icon('plus')}${snapshot.archive_error ? '重试加载归档' : `加载更多归档（剩余 ${remaining} 本）`}</button>` : ''}
+      </div>
+    </div>
+  `;
+}
+
+function redrawShelfPreservingSelection(host) {
+  const checked = new Map($$('[data-shelf-book]', host).map((cb) => [cb.dataset.shelfBook, cb.checked]));
+  const checkNew = $('#shelf-check-new', host)?.checked;
+  drawShelfPreview();
+  $$('[data-shelf-book]', host).forEach((cb) => {
+    if (checked.has(cb.dataset.shelfBook)) cb.checked = checked.get(cb.dataset.shelfBook);
+  });
+  if (checkNew !== undefined && $('#shelf-check-new', host)) $('#shelf-check-new', host).checked = checkNew;
+  const count = $('#shelf-count', host);
+  if (count) count.textContent = `(${$$('[data-shelf-book]:checked', host).length})`;
+}
+
+async function loadMoreArchive() {
+  const snapshot = shelfCache;
+  const host = $('[data-import-result]');
+  const accountId = snapshot?.account_id;
+  const epoch = importEpoch;
+  const offset = Number(snapshot?.next_archive_offset ?? -1);
+  if (!snapshot || snapshot.archive_loading || offset < 0 || !currentImport(accountId, epoch, host)) return;
+  const btn = $('[data-shelf-more]', host);
+  snapshot.archive_loading = true;
+  setLoading(btn, true);
+  try {
+    const data = await api.poolShelf(accountId, offset, snapshot.archive_revision || '');
+    if (snapshot !== shelfCache || !currentImport(accountId, epoch, host)) return;
+    if (Number(data.account_id) !== accountId || data.archive_revision !== snapshot.archive_revision
+      || (Number(data.next_archive_offset) >= 0 && Number(data.next_archive_offset) <= offset)) {
+      throw new Error('归档分页状态已变化，请重新拉取书架');
+    }
+    const seen = new Set((snapshot.books || []).map((b) => b.id));
+    for (const book of data.books || []) {
+      if (!seen.has(book.id)) {
+        snapshot.books.push(book);
+        seen.add(book.id);
+      }
+    }
+    snapshot.audit = { ...(snapshot.audit || {}), ...(data.audit || {}) };
+    snapshot.in_pool = [...new Set([...(snapshot.in_pool || []), ...(data.in_pool || [])])];
+    snapshot.archive_failures = { ...(snapshot.archive_failures || {}), ...(data.archive_failures || {}) };
+    for (const book of data.books || []) delete snapshot.archive_failures[book.id];
+    snapshot.archive_total = data.archive_total;
+    snapshot.archive_processed = data.archive_processed;
+    snapshot.next_archive_offset = data.next_archive_offset;
+    snapshot.archive_revision = data.archive_revision;
+    snapshot.archive_error = '';
+  } catch (e) {
+    if (snapshot === shelfCache && currentImport(accountId, epoch, host)) snapshot.archive_error = e.message;
+  } finally {
+    snapshot.archive_loading = false;
+    if (snapshot === shelfCache && currentImport(accountId, epoch, host)) redrawShelfPreservingSelection(host);
+    else setLoading(btn, false);
   }
 }
 
 // 书架审查列表：勾选需要导入的书（未付费的行禁用），点「导入选中」才开始写库。
 function drawShelfPreview() {
   const host = $('[data-import-result]');
-  if (!shelfCache || !host) return;
+  if (!shelfCache || !host?.isConnected || Number($('#shelf-account')?.value || 0) !== shelfCache.account_id) return;
   const audit = shelfCache.audit || {};
   const inPool = new Set(shelfCache.in_pool || []);
   const books = shelfCache.books || [];
+  const archiveStatus = archiveStatusHTML(shelfCache);
   if (!books.length) {
-    host.innerHTML = `<div class="empty" style="padding:28px"><h3>书架是空的</h3><p>该账号的微信读书书架没有读到任何书籍。</p></div>`;
+    const pendingArchive = Number(shelfCache.next_archive_offset ?? -1) >= 0 || Object.keys(shelfCache.archive_failures || {}).length > 0;
+    host.innerHTML = `<div class="empty" style="padding:28px"><h3>${pendingArchive ? '当前还没有可导入的书籍' : '书架是空的'}</h3>
+      <p>${pendingArchive ? '归档书籍尚未全部取得，详情见下方。' : '该账号的微信读书书架没有读到任何书籍。'}</p></div>${archiveStatus}`;
+    $('[data-shelf-more]', host)?.addEventListener('click', loadMoreArchive);
     return;
   }
   const pages = Math.max(1, Math.ceil(books.length / shelfPageSize));
@@ -292,6 +413,7 @@ function drawShelfPreview() {
       </table>
     </div>
     ${books.length > 10 ? pagerHTML(books.length, shelfPage, shelfPageSize) : ''}
+    ${archiveStatus}
   `;
   bindPager(host, {
     onPage: (delta) => { shelfPage = Math.max(1, shelfPage + delta); drawShelfPreview(); },
@@ -304,11 +426,16 @@ function drawShelfPreview() {
   });
   $('#shelf-reload', host).addEventListener('click', () => loadShelf());
   $('#shelf-import', host).addEventListener('click', () => importSelected());
+  $('[data-shelf-more]', host)?.addEventListener('click', loadMoreArchive);
   recount();
 }
 
 async function importSelected() {
   const host = $('[data-import-result]');
+  const snapshot = shelfCache;
+  const accountId = Number($('#shelf-account')?.value || 0);
+  const epoch = importEpoch;
+  if (!snapshot || snapshot.account_id !== accountId || !currentImport(accountId, epoch, host)) return;
   const selected = $$('[data-shelf-book]:checked', host).map((cb) => ({
     book_id: cb.dataset.shelfBook,
     title: cb.dataset.title || '',
@@ -321,8 +448,8 @@ async function importSelected() {
     message: `将把勾选的 ${selected.length} 本书写入所选账号的书池（含可读章节），未付费的书不会导入。`,
     confirmText: '导入',
   });
-  if (!ok) return;
-  await importBooks(selected, { auditMap: (shelfCache && shelfCache.audit) || {} });
+  if (!ok || snapshot !== shelfCache || !currentImport(accountId, epoch, host)) return;
+  await importBooks(selected, { accountOverride: accountId, auditMap: snapshot.audit || {} });
 }
 
 /* ---------- 通用导入：进度弹窗 + 失败明细 ---------- */
@@ -330,10 +457,21 @@ async function importSelected() {
 async function importBooks(selected, { accountOverride = 0, auditMap = null } = {}) {
   const box = $('#page');
   const accountId = accountOverride || Number($('#shelf-account', box)?.value || 0);
+  const snapshot = shelfCache?.account_id === accountId ? shelfCache : null;
   const withChapters = Boolean($('#shelf-check-chapters', box)?.checked);
   const per = Number($('#shelf-chapters-per', box)?.value || 0);
   const ignorePaid = Boolean($('#shelf-ignore-paid', box)?.checked);
   let aborted = false;
+  const confirmedIDs = new Set();
+  const failures = {};
+
+  const updatePreview = () => {
+    if (!snapshot || snapshot !== shelfCache || poolTab !== 'import'
+      || Number($('#shelf-account')?.value || 0) !== accountId) return;
+    snapshot.in_pool = [...new Set([...(snapshot.in_pool || []), ...confirmedIDs])];
+    drawShelfPreview();
+    drawImportFailures(failures, selected);
+  };
 
   const { mask, close: closeModalFn } = openModal({
     title: '导入书池',
@@ -351,23 +489,13 @@ async function importBooks(selected, { accountOverride = 0, auditMap = null } = 
   cancelBtn.addEventListener('click', () => {
     aborted = true;
     closeModalFn();
-    // 用户主动取消：已发生的部分结果仍然更新「已在池」标注并展示明细。
-    if (shelfCache) {
-      const failedIDs = new Set(Object.keys(failures).filter((f) => failures[f]));
-      shelfCache.in_pool = [...new Set([
-        ...(shelfCache.in_pool || []),
-        ...selected.map((s) => s.book_id).filter((id) => !failedIDs.has(id)),
-      ])];
-      drawShelfPreview();
-    }
-    drawImportFailures(failures, selected);
+    updatePreview();
   });
   const bar = $('#imp-bar', mask);
   const label = $('#imp-label', mask);
   const detail = $('#imp-detail', mask);
 
   let added = 0, skipped = 0, chapterTotal = 0, chapterExisted = 0;
-  const failures = {};
   for (let i = 0; i < selected.length; i++) {
     if (aborted) break;
     const b = selected[i];
@@ -387,6 +515,7 @@ async function importBooks(selected, { accountOverride = 0, auditMap = null } = 
       skipped += (res.books_skipped || []).length;
       chapterTotal += res.chapters_added || 0;
       chapterExisted += res.chapters_existed || 0;
+      for (const id of [...(res.books_added || []), ...(res.books_skipped || [])]) confirmedIDs.add(id);
       Object.assign(failures, res.failures || {});
     } catch (e) {
       failures[b.book_id] = e.message;
@@ -403,19 +532,11 @@ async function importBooks(selected, { accountOverride = 0, auditMap = null } = 
   closeBtn.innerHTML = `${icon('check')}关闭`;
   closeBtn.addEventListener('click', () => {
     closeModalFn();
-    // 书架流程：回填最新的「已在池中」标注后再补失败明细。
-    if (shelfCache) {
-      const failedIDs = new Set(Object.keys(failures).filter((f) => failures[f]));
-      shelfCache.in_pool = [...new Set([
-        ...(shelfCache.in_pool || []),
-        ...selected.map((s) => s.book_id).filter((id) => !failedIDs.has(id)),
-      ])];
-      drawShelfPreview();
-    }
-    drawImportFailures(failures, selected);
+    updatePreview();
     refreshPoolDataIfLive();
   });
   cancelBtn.replaceWith(closeBtn);
+  if (aborted) updatePreview();
 }
 
 function refreshPoolDataIfLive() {
@@ -476,12 +597,12 @@ function drawImportFailures(failures, selected) {
 /* ---------- 二级菜单二：书池管理（列表 + 多选批量删除 + 顺序书单排序） ---------- */
 
 function drawManageTab(box) {
-  const accounts = activeAccounts();
+  const accounts = state.accounts;
   if (!accounts.length) {
     box.innerHTML = `
       <article class="card">
         <div class="card-head"><div><div class="card-title">${icon('book')}书池管理</div><div class="card-sub">书池条目归属账号；阅读只从当前账号的池中抽取，池为空时无法发起阅读</div></div></div>
-        <div class="note warn">${icon('alert')}<div>还没有登录可用的微信读书账号。请先到「账号」页扫码绑定账号，再来这里导入书籍。</div></div>
+        <div class="note warn">${icon('alert')}<div>还没有绑定微信读书账号。请先到「账号」页扫码绑定账号，再来这里管理书池。</div></div>
       </article>
     `;
     return;
@@ -489,10 +610,15 @@ function drawManageTab(box) {
   if (!accounts.some((a) => a.id === manageAccount)) {
     manageAccount = accounts[0].id;
   }
+  poolCache = null;
   box.innerHTML = `
     <article class="card">
       <div class="card-head"><div><div class="card-title">${icon('book')}书池管理</div><div class="card-sub">当前账号的书池（顺序书单/随机轮换都从这里取书）</div></div></div>
       <div class="tool-row" style="margin-bottom:8px;flex-wrap:wrap;gap:8px">
+        <label class="hint" for="pool-account">账号</label>
+        <select class="select" id="pool-account" style="min-width:200px;max-width:100%">
+          ${accounts.map((a) => `<option value="${a.id}" ${a.id === manageAccount ? 'selected' : ''}>${escapeHtml(accountLabel(a))}${a.status === 'expired' ? '（已失效）' : ''}</option>`).join('')}
+        </select>
         <span class="hint" id="pool-summary"></span>
         <span style="flex:1"></span>
         <button class="btn btn-danger" id="pool-del-batch" disabled>${icon('trash')}删除所选</button>
@@ -500,6 +626,15 @@ function drawManageTab(box) {
       <div data-pool-box><div class="hint">加载中…</div></div>
     </article>
   `;
+  $('#pool-account', box).addEventListener('change', (e) => {
+    manageAccount = Number(e.target.value);
+    poolPage = 1;
+    poolCache = null;
+    $('#pool-del-batch', box).disabled = true;
+    $('#pool-summary', box).textContent = '';
+    $('[data-pool-box]', box).innerHTML = '<div class="hint">加载中…</div>';
+    refreshPoolData();
+  });
   $('#pool-del-batch', box).addEventListener('click', () => batchDeleteBooks());
   refreshPoolData();
 }
@@ -507,7 +642,12 @@ function drawManageTab(box) {
 function refreshPoolData() {
   const poolBox = $('[data-pool-box]', $('#page'));
   if (!poolBox) return Promise.resolve();
-  return api.pool(manageAccount).then((data) => {
+  const accountId = manageAccount;
+  const epoch = ++poolRequestEpoch;
+  const current = () => epoch === poolRequestEpoch && accountId === manageAccount && poolBox.isConnected
+    && poolBox === $('[data-pool-box]', $('#page'));
+  return api.pool(accountId).then((data) => {
+    if (!current()) return;
     poolCache = data;
     const books = data.books || [];
     const counts = data.chapter_counts || {};
@@ -553,7 +693,9 @@ function refreshPoolData() {
     });
     wirePoolRows();
   }).catch((e) => {
-    poolBox.innerHTML = `<div class="note warn">${icon('alert')}<div>书池加载失败：${escapeHtml(e.message)}</div></div>`;
+    if (current()) {
+      poolBox.innerHTML = `<div class="note warn">${icon('alert')}<div>书池加载失败：${escapeHtml(e.message)}</div></div>`;
+    }
   });
 }
 
@@ -799,7 +941,7 @@ async function openChaptersDrawer(book, accountID) {
   await load();
 
   $('[data-chap-bulk]', mask).addEventListener('click', () => {
-    bulkImportDialog('chapter', () => { load(); refreshPoolData(); }, accountID);
+    bulkImportDialog('chapter', () => { load(); refreshPoolData(); }, accountID, book.value);
   });
 
   $('[data-chap-prune]', mask).addEventListener('click', async (e) => {
@@ -851,7 +993,7 @@ async function openChaptersDrawer(book, accountID) {
 
 /* ---------- 章节手动导入弹窗（章节抽屉内使用） ---------- */
 
-function bulkImportDialog(kind, done, accountId = 0) {
+function bulkImportDialog(kind, done, accountId = 0, bookId = '') {
   const { mask, close } = openModal({
     title: kind === 'book' ? '批量导入书籍 ID' : '批量导入章节 ID',
     subtitle: accountId > 0 ? '写入当前账号的书池' : '写入书池',
@@ -863,7 +1005,7 @@ function bulkImportDialog(kind, done, accountId = 0) {
     const text = $('#bulk-ids', mask).value;
     if (!text.trim()) { toast('请先粘贴 ID', 'warn'); return; }
     try {
-      const res = await api.poolImport(kind, text, accountId);
+      const res = await api.poolImport(kind, text, accountId, bookId);
       const a = (res.added || []).length, s = (res.skipped || []).length;
       close();
       toast(`导入完成：新增 ${a} 个，跳过重复 ${s} 个`, 'ok');

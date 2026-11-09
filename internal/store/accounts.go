@@ -7,7 +7,7 @@ import (
 )
 
 const accountCols = `id, seq, name, vid, nickname, avatar, status, last_error, last_check_at,
-	default_minutes, tick_seconds, max_retries, retry_delay,
+	default_minutes, daily_goal_minutes, tick_seconds, max_retries, retry_delay,
 	book_id, book_title, chapter_id, chapter_title,
 	mode, push_channel_id, created_at, updated_at,
 	CASE WHEN payload_enc IS NOT NULL AND length(payload_enc) > 0 THEN 1 ELSE 0 END`
@@ -16,7 +16,7 @@ func scanAccount(sc interface{ Scan(...any) error }) (*Account, error) {
 	var a Account
 	var hasPayload int
 	err := sc.Scan(&a.ID, &a.Seq, &a.Name, &a.Vid, &a.Nickname, &a.Avatar, &a.Status, &a.LastError,
-		&a.LastCheckAt, &a.DefaultMinutes, &a.TickSeconds, &a.MaxRetries, &a.RetryDelay,
+		&a.LastCheckAt, &a.DefaultMinutes, &a.DailyGoalMinutes, &a.TickSeconds, &a.MaxRetries, &a.RetryDelay,
 		&a.BookID, &a.BookTitle, &a.ChapterID, &a.ChapterTitle,
 		&a.Mode, &a.PushChannelID, &a.CreatedAt, &a.UpdatedAt,
 		&hasPayload)
@@ -93,11 +93,11 @@ func (s *Store) CreateAccount(a Account, cookies map[string]string, payload map[
 	ts := now()
 	res, err := s.db.Exec(`INSERT INTO accounts
 		(seq, name, vid, nickname, avatar, cookie_enc, payload_enc, status, last_error, last_check_at,
-		 default_minutes, tick_seconds, max_retries, retry_delay, book_id, book_title, chapter_id, chapter_title,
+		 default_minutes, daily_goal_minutes, tick_seconds, max_retries, retry_delay, book_id, book_title, chapter_id, chapter_title,
 		 mode, push_channel_id, created_at, updated_at)
-		VALUES ((SELECT COALESCE(MAX(seq), -1) + 1 FROM accounts), ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		VALUES ((SELECT COALESCE(MAX(seq), -1) + 1 FROM accounts), ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		a.Name, a.Vid, a.Nickname, a.Avatar, ck, pl, a.Status, a.LastError, a.LastCheckAt,
-		a.DefaultMinutes, a.TickSeconds, a.MaxRetries, a.RetryDelay, a.BookID, a.BookTitle,
+		a.DefaultMinutes, a.DailyGoalMinutes, a.TickSeconds, a.MaxRetries, a.RetryDelay, a.BookID, a.BookTitle,
 		a.ChapterID, a.ChapterTitle, a.Mode, a.PushChannelID, ts, ts)
 	if err != nil {
 		return 0, err
@@ -108,11 +108,11 @@ func (s *Store) CreateAccount(a Account, cookies map[string]string, payload map[
 // UpdateAccount updates editable settings.
 func (s *Store) UpdateAccount(a Account) error {
 	_, err := s.db.Exec(`UPDATE accounts SET
-		name = ?, default_minutes = ?, tick_seconds = ?, max_retries = ?, retry_delay = ?,
+		name = ?, default_minutes = ?, daily_goal_minutes = ?, tick_seconds = ?, max_retries = ?, retry_delay = ?,
 		book_id = ?, book_title = ?, chapter_id = ?, chapter_title = ?,
 		mode = ?, push_channel_id = ?, updated_at = ?
 		WHERE id = ?`,
-		a.Name, a.DefaultMinutes, a.TickSeconds, a.MaxRetries, clampRetryDelay(a.RetryDelay),
+		a.Name, a.DefaultMinutes, a.DailyGoalMinutes, a.TickSeconds, a.MaxRetries, clampRetryDelay(a.RetryDelay),
 		a.BookID, a.BookTitle, a.ChapterID, a.ChapterTitle,
 		a.Mode, a.PushChannelID, now(), a.ID)
 	return err
@@ -188,7 +188,8 @@ func (s *Store) AccountSecrets(id int64) (map[string]string, map[string]any, err
 	return cookies, payload, nil
 }
 
-// DeleteAccount removes the account and all of its runs, logs and schedules.
+// DeleteAccount removes the account and its runs, statistics, schedules, pool,
+// and sequence progress in one transaction.
 func (s *Store) DeleteAccount(id int64) error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -202,7 +203,16 @@ func (s *Store) DeleteAccount(id int64) error {
 	if _, err := tx.Exec(`DELETE FROM runs WHERE account_id = ?`, id); err != nil {
 		return err
 	}
+	if _, err := tx.Exec(`DELETE FROM run_statistics WHERE account_id = ?`, id); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(`DELETE FROM schedules WHERE account_id = ?`, id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM pool_items WHERE account_id = ?`, id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM settings WHERE key = ?`, fmt.Sprintf("sequence_pos_%d", id)); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`DELETE FROM accounts WHERE id = ?`, id); err != nil {
