@@ -182,115 +182,17 @@ data/
 
 ## 部署
 
-### Linux 服务器
+完整部署指南见 **[docs/deployment.md](docs/deployment.md)**，包含：
 
-二进制放哪个目录，数据就生成在同级 `data/` 目录（例如 `/opt/readtrace/readtrace` + `/opt/readtrace/data`），无需传 `-data`；同一份代码交叉编译即可：
+- Linux 二进制 + systemd / 手动运行
+- Windows 开机自启
+- Docker / Docker Compose / NAS
+- 1Panel Go 运行环境
+- Nginx / Caddy 反向代理与 HTTPS
+- 升级、回滚、备份与迁移
+- 端口、权限、SSE 等常见问题排查
 
-```bash
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w -X main.version=0.1.0" -o readtrace ./cmd/readtrace
-```
-
-### Windows 开机自启
-
-将 `readtrace.exe` 放入一个固定目录（建议 `C:\ReadTrace`），首次运行后会在同级自动生成 `data` 目录。创建一个快捷方式放到 `shell:startup`：
-
-```
-目标： "C:\ReadTrace\readtrace.exe"
-起始位置： C:\ReadTrace
-```
-
-或者用任务计划程序，触发器设为“登录时”，操作指向 exe，参数 `-no-open`。数据默认就在 exe 同级的 `data` 目录，也可以用 `-data` 显式指定。
-
-### Linux systemd
-
-```ini
-[Unit]
-Description=ReadTrace
-After=network.target
-
-[Service]
-Type=simple
-User=readtrace
-WorkingDirectory=/opt/readtrace
-ExecStart=/opt/readtrace/readtrace -addr 127.0.0.1:8720 -data /opt/readtrace/data -no-open
-Restart=always
-RestartSec=3
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now readtrace
-```
-
-### Docker
-
-```bash
-docker build -t readtrace .
-docker volume create readtrace-data
-docker run -d --name readtrace -p 8720:8720 \
-  -v readtrace-data:/opt/readtrace/data readtrace
-```
-
-新建的命名卷会继承镜像中数据目录的所有权。容器内以 UID/GID `10001:10001` 的非 root 用户运行；若改用宿主机目录挂载，需先为该目录设置对应所有权和写入权限（例如 `sudo install -d -m 700 -o 10001 -g 10001 /srv/readtrace/data`），再挂载到 `/opt/readtrace/data`。不要用一个普通的 `0755` 空目录直接替换可写数据目录。
-
-默认监听 `0.0.0.0`，请务必设置管理密码，并建议只在局域网或反代后暴露。
-
-### 1Panel
-
-1Panel 的 Go 运行环境/容器可以直接运行 Release 里的预编译二进制，不需要在服务器上安装 Go。下面以运行目录 `/opt/ReadTrace` 为例（Linux 路径区分大小写，改了目录就同步改启动命令和挂载路径）。
-
-先确认服务器架构并准备目录：
-
-```bash
-uname -m   # x86_64 用 linux_amd64，aarch64/arm64 用 linux_arm64
-mkdir -p /opt/ReadTrace/data
-# 从 Release 下载对应架构的二进制，重命名为 readtrace 后放到 /opt/ReadTrace/
-chmod +x /opt/ReadTrace/readtrace
-```
-
-当前 v0.1.0 的资产名带版本号（如 `readtrace_0.1.0_linux_amd64`），后续版本使用固定名 `readtrace_linux_amd64`。
-
-创建容器时按下表填写：
-
-| 字段 | 填写 |
-| --- | --- |
-| 名称 | `ReadTrace` |
-| 应用 | 选 Go 1.27；面板只有 Go 1.26 也可以，但必须运行预编译二进制，不能 `go run` |
-| 运行目录 | `/opt/ReadTrace` |
-| 启动命令 | `exec ./readtrace -addr 0.0.0.0:8720` |
-| 容器名称 | `ReadTrace` |
-| 端口 | 容器端口 `8720` |
-| 主机映射 | 宿主 `8720` → 容器 `8720`，宿主端口被占用时换成其他端口 |
-| 挂载 | 不需要。1Panel 已把宿主运行目录挂载到容器 `/app` |
-| 环境变量 | 可选 `TZ=Asia/Shanghai`；用域名访问时可加 `READTRACE_HOST_ALLOW=你的域名` |
-
-1Panel 的 Go 运行环境本质上是 `golang` 容器，工作目录是 `/app`，宿主运行目录会挂载到 `/app`：
-
-- 宿主 `/opt/ReadTrace/readtrace` ↔ 容器 `/app/readtrace`
-- 宿主 `/opt/ReadTrace/data` ↔ 容器 `/app/data`
-
-因此只要把二进制命名为 `readtrace` 放在运行目录，启动命令就可以写成 `exec ./readtrace -addr 0.0.0.0:8720`。`exec` 会让进程直接接管容器，停止/重启时信号能正确传递。
-
-这里必须显式监听 `0.0.0.0`。程序默认只监听 `127.0.0.1`，这是为了本地直接运行时的安全；容器内只监听回环地址时，1Panel 的「端口外部访问」即使打开，宿主端口映射也到不了容器里的服务。「端口外部访问」只负责宿主机端口和防火墙，不改变进程监听地址。
-
-启动命令和「环境变量」二选一即可，效果相同：
-
-```text
-# 方式一：写在启动命令里（推荐）
-exec ./readtrace -addr 0.0.0.0:8720
-
-# 方式二：启动命令保持 exec ./readtrace
-READTRACE_ADDR=0.0.0.0:8720
-```
-
-不需要 `-data`，也不需要额外挂载：程序默认把数据放在可执行文件同级的 `data/` 目录，也就是容器内的 `/app/data`，对应宿主 `/opt/ReadTrace/data`。`-no-open` 也可以省略：容器内没有 `xdg-open`，启动浏览器失败会被忽略，不影响服务。
-
-项目 `go.mod` 要求 Go 1.27+，所以如果面板走源码编译，必须选 1.27；选 1.26 会报 `go.mod requires go >= 1.27.0`。上传预编译二进制则不依赖 Go 版本。
-
-启动后访问 `http://服务器IP:8720` 设置管理密码。更新时在 1Panel 停止容器，替换宿主 `/opt/ReadTrace/readtrace`，再启动容器即可，`/opt/ReadTrace/data/` 不要删。若容器以非 root 用户运行且数据目录不可写，需把宿主 `/opt/ReadTrace/data` 的所有权交给容器用户。
+本地快速体验见上方「快速开始」。
 
 ---
 
@@ -417,6 +319,7 @@ internal/secure/       AES-GCM 加密
 internal/weread/       微信读书客户端、签名、curl 解析
 internal/webui/assets/ 内嵌前端（原生 ES Module，无构建步骤）
 docs/screenshots/      README 截图
+docs/deployment.md    部署指南（Linux / Windows / Docker / 1Panel / 反代 / 升级备份）
 ```
 
 前端刻意不使用打包器：`go:embed` 直接嵌入原生 ES Module、CSS 与 SVG 图标，改样式不需要 Node 工具链，保证“单二进制”这一目标。
