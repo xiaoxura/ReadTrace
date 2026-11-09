@@ -386,6 +386,8 @@ git push origin v0.1.0
 产物不套压缩包，也不在文件名里带版本号，直接是 `readtrace_linux_amd64`、`readtrace_macos_arm64` 这样的固定文件名（文件名里的 `macos` 即 Go 的 `darwin` 目标；v0.1.0 是带版本号的旧命名）。版本由 Release 标签和 `readtrace -version` 提供，服务器更新脚本始终使用同一个下载路径。Linux / macOS 下载后需要 `chmod +x`：
 
 ```bash
+# 以后每个版本都使用同一个下载地址
+curl -fLO https://github.com/xiaoxura/ReadTrace/releases/latest/download/readtrace_linux_amd64
 chmod +x readtrace_linux_amd64
 ./readtrace_linux_amd64
 ```
