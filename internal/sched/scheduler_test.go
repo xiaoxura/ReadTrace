@@ -107,6 +107,68 @@ func TestPendingFireCancelledByScheduleChange(t *testing.T) {
 	}
 }
 
+func TestFailedScheduleStartDoesNotPublishFire(t *testing.T) {
+	dir := t.TempDir()
+	box, err := secure.New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.Open(filepath.Join(dir, "sched.db"), box)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	accountID, err := st.CreateAccount(store.Account{Name: "no-cookie"}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := &store.Schedule{AccountID: accountID, Cron: "30 2 * * *", Minutes: 1, Enabled: true, LastRunAt: 123}
+	if err := st.CreateSchedule(v); err != nil {
+		t.Fatal(err)
+	}
+	log := slogDefault()
+	hub := engine.NewHub()
+	eng := engine.New(st, nil, nil, hub, log)
+	s := New(st, eng, log)
+	s.jitter = func() time.Duration { return 0 }
+	if err := s.Start(time.UTC); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Stop()
+	subID, events := hub.Subscribe()
+	defer hub.Unsubscribe(subID)
+
+	s.mu.Lock()
+	job := s.jobs[v.ID]
+	s.mu.Unlock()
+	s.fire(job)
+
+	runs, err := st.ListRuns(accountID, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 0 {
+		t.Fatalf("failed start created a run: %+v", runs)
+	}
+	got, err := st.GetSchedule(v.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.LastRunAt != 123 {
+		t.Fatalf("failed start changed last_run_at to %d", got.LastRunAt)
+	}
+	for drained := false; !drained; {
+		select {
+		case ev := <-events:
+			if ev.Type == "schedule.fire" {
+				t.Fatal("failed start published schedule.fire")
+			}
+		default:
+			drained = true
+		}
+	}
+}
+
 func TestReloadReadFailurePreservesExistingJob(t *testing.T) {
 	st, err := store.Open(filepath.Join(t.TempDir(), "sched.db"), nil)
 	if err != nil {

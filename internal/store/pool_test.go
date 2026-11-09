@@ -153,6 +153,32 @@ func TestDeleteBookCascadesChaptersInScope(t *testing.T) {
 	_ = id
 }
 
+func TestPoolChaptersPage(t *testing.T) {
+	st := newTestStore(t)
+	if _, err := st.AddPoolItem(KindBook, "book1", "书", 1); err != nil {
+		t.Fatalf("add book: %v", err)
+	}
+	for i := 0; i < 5; i++ {
+		if _, err := st.AddChapterItem(1, "book1", "ch"+string(rune('a'+i)), "章", 1000); err != nil {
+			t.Fatalf("add chapter: %v", err)
+		}
+	}
+	items, total, enabled, err := st.PoolChaptersPage("book1", 1, 2, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 2 || total != 5 || enabled != 5 {
+		t.Fatalf("page1 len=%d total=%d enabled=%d", len(items), total, enabled)
+	}
+	items, total, enabled, err = st.PoolChaptersPage("book1", 1, 2, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || total != 5 || enabled != 5 {
+		t.Fatalf("page3 len=%d total=%d enabled=%d", len(items), total, enabled)
+	}
+}
+
 func TestClearPoolPerAccount(t *testing.T) {
 	st := newTestStore(t)
 	acc1 := seedAccount(t, st, "A")

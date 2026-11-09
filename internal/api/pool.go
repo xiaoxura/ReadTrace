@@ -18,21 +18,13 @@ import (
 )
 
 // validateDefaultTemplate parses and normalizes a user-supplied default read
-// template: it must be a JSON object carrying string book ("b") and chapter
-// ("c") IDs; the normalized compact JSON is stored.
+// template. It accepts either the JSON object itself or a full curl / Copy as
+// cURL (bash) command, then stores the compact JSON payload. The payload must
+// carry string book ("b") and chapter ("c") IDs.
 func validateDefaultTemplate(raw string) (string, error) {
-	var m map[string]any
-	if err := json.Unmarshal([]byte(raw), &m); err != nil {
-		return "", fmt.Errorf("模板必须是 JSON 对象：%v", err)
-	}
-	if len(m) == 0 {
-		return "", errors.New("模板不能是空对象")
-	}
-	for _, key := range []string{"b", "c"} {
-		v, ok := m[key].(string)
-		if !ok || strings.TrimSpace(v) == "" {
-			return "", fmt.Errorf("模板缺少必需的 %q 字段（书籍/章节 ID）", key)
-		}
+	m, err := weread.ParseReadTemplate(raw)
+	if err != nil {
+		return "", fmt.Errorf("模板解析失败：%v", err)
 	}
 	out, err := json.Marshal(m)
 	if err != nil {
@@ -73,7 +65,7 @@ func (a BookAudit) Label() (string, string) {
 }
 
 // auditBooks 并发拉取本页书籍目录，统计每本书的付费结构。
-func (s *Server) auditBooks(ctx context.Context, ck map[string]string, books []weread.Book) map[string]BookAudit {
+func (s *Server) auditBooks(ctx context.Context, accountID int64, ck map[string]string, books []weread.Book) map[string]BookAudit {
 	out := map[string]BookAudit{}
 	var mu sync.Mutex
 	var wg sync.WaitGroup
@@ -84,7 +76,7 @@ func (s *Server) auditBooks(ctx context.Context, ck map[string]string, books []w
 		go func(bid string) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			chs, err := s.wc.ChapterInfos(ctx, ck, bid)
+			chs, err := s.chapterInfos(ctx, accountID, ck, bid)
 			if err != nil {
 				return // 审计失败就缺省，不阻塞主流程
 			}
@@ -213,7 +205,7 @@ func (s *Server) handlePoolShelf(w http.ResponseWriter, r *http.Request) {
 	if end < len(archiveIDs) {
 		nextArchiveOffset = end
 	}
-	audit := s.auditBooks(ctx, ck, books)
+	audit := s.auditBooks(ctx, acc.ID, ck, books)
 
 	// 「已在池中」按本账号视角标注（含共享）。
 	items, err := s.st.PoolItemsForAccount(store.KindBook, acc.ID)
@@ -286,7 +278,7 @@ func (s *Server) handlePoolShelfImport(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 180*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
 	defer cancel()
 
 	var (
@@ -338,12 +330,23 @@ func (s *Server) handlePoolShelfImport(w http.ResponseWriter, r *http.Request) {
 					if full {
 						limit = 0 // 0 = 不限量，导入全书可读章节
 					}
-					added, existed, err := s.fetchChaptersIntoPool(ctx, ck, scope, b, limit, body.IgnorePaid)
-					if err != nil {
-						time.Sleep(500 * time.Millisecond)
+					var added, existed int
+					var err error
+					// TOC fetches are the most rate-limited part of the import.
+					// Retry with backoff instead of giving up after one retry,
+					// otherwise large shelf imports end with later books at 0
+					// chapters while the books themselves are already in the pool.
+					for attempt := 0; attempt < 3; attempt++ {
 						added, existed, err = s.fetchChaptersIntoPool(ctx, ck, scope, b, limit, body.IgnorePaid)
+						if err == nil {
+							break
+						}
+						if attempt < 2 {
+							time.Sleep(time.Duration(attempt+1) * time.Second)
+						}
 					}
 					if err != nil {
+						s.log.Warn("导入书籍章节失败", "book", b.BookID, "title", b.Title, "err", err)
 						mu.Lock()
 						failures[b.BookID] = err.Error()
 						mu.Unlock()
@@ -385,7 +388,7 @@ type shelfImportBook struct {
 // 区分「已购/会员可读」，所以 ignorePaid=true 时由调用方显式声明不过滤。
 // 返回（新增数，已在池数）；重复导入时"已在池"不为零，不算失败。
 func (s *Server) fetchChaptersIntoPool(ctx context.Context, ck map[string]string, accountID int64, b shelfImportBook, per int, ignorePaid bool) (int, int, error) {
-	chs, err := s.wc.ChapterInfos(ctx, ck, b.BookID)
+	chs, err := s.chapterInfos(ctx, accountID, ck, b.BookID)
 	if err != nil {
 		return 0, 0, fmt.Errorf("拉取目录失败：%w", err)
 	}
@@ -453,20 +456,16 @@ func (s *Server) handlePoolGet(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	opts := []string{store.KindBook, store.KindChapter}
 	out := map[string]any{}
-	books := []store.PoolItem(nil)
-	for _, kind := range opts {
-		items, err := s.st.PoolItemsForAccount(kind, view)
-		if err != nil {
-			s.writeErr(w, http.StatusInternalServerError, "读取"+kindLabel(kind)+"失败")
-			return
-		}
-		out[kind+"s"] = items
-		if kind == store.KindBook {
-			books = items
-		}
+	// The pool overview only needs books and chapter counts. Returning every
+	// chapter row here made a 8000-chapter pool serialize thousands of items on
+	// each page load; the chapter drawer fetches its own paginated slice.
+	books, err := s.st.PoolItemsForAccount(store.KindBook, view)
+	if err != nil {
+		s.writeErr(w, http.StatusInternalServerError, "读取书池失败")
+		return
 	}
+	out["books"] = books
 	chapterCounts, err := s.st.PoolChapterCountsForAccount(view)
 	if err != nil {
 		s.writeErr(w, http.StatusInternalServerError, "统计章节数失败")
@@ -511,19 +510,34 @@ func (s *Server) handlePoolBookChapters(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
-	items, err := s.st.PoolChaptersOf(bookValue, view)
+	limit, offset := 50, 0
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		if v, err := strconv.Atoi(raw); err == nil && v > 0 && v <= 200 {
+			limit = v
+		}
+	}
+	if raw := r.URL.Query().Get("offset"); raw != "" {
+		if v, err := strconv.Atoi(raw); err == nil && v >= 0 {
+			offset = v
+		}
+	}
+	items, total, enabled, err := s.st.PoolChaptersPage(bookValue, view, limit, offset)
 	if err != nil {
 		s.writeErr(w, http.StatusInternalServerError, "读取章节失败")
 		return
 	}
-	out := map[string]any{"chapters": items, "book_id": bookValue, "account_id": view}
+	out := map[string]any{
+		"chapters": items, "total": total, "enabled": enabled,
+		"limit": limit, "offset": offset,
+		"book_id": bookValue, "account_id": view,
+	}
 
 	if r.URL.Query().Get("refresh") == "1" {
 		if acc, err := s.resolveAccount(view); err == nil && view > 0 {
 			if ck, err := s.accountCookies(acc); err == nil {
 				ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 				defer cancel()
-				if chs, err := s.wc.ChapterInfos(ctx, ck, bookValue); err == nil {
+				if chs, err := s.chapterInfos(ctx, view, ck, bookValue); err == nil {
 					total := len(chs)
 					priced := 0
 					unpaid := make(map[string]bool, 16)
@@ -570,7 +584,7 @@ func (s *Server) handlePoolBookPrune(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
-	chs, err := s.wc.ChapterInfos(ctx, ck, bookValue)
+	chs, err := s.chapterInfos(ctx, acc.ID, ck, bookValue)
 	if err != nil {
 		s.writeErr(w, http.StatusBadGateway, "拉取官方目录失败："+err.Error())
 		return
@@ -859,7 +873,7 @@ func (s *Server) handlePoolTemplate(w http.ResponseWriter, r *http.Request) {
 			s.writeErr(w, http.StatusInternalServerError, "清除默认模板失败")
 			return
 		}
-		s.writeJSON(w, http.StatusOK, map[string]any{"ok": true, "cleared": true})
+		s.writeJSON(w, http.StatusOK, map[string]any{"ok": true, "cleared": true, "template": ""})
 		return
 	}
 	normalized, err := validateDefaultTemplate(*body.Template)
@@ -871,7 +885,7 @@ func (s *Server) handlePoolTemplate(w http.ResponseWriter, r *http.Request) {
 		s.writeErr(w, http.StatusInternalServerError, "保存默认模板失败")
 		return
 	}
-	s.writeJSON(w, http.StatusOK, map[string]any{"ok": true, "cleared": false})
+	s.writeJSON(w, http.StatusOK, map[string]any{"ok": true, "cleared": false, "template": normalized})
 }
 
 func kindLabel(kind string) string {
@@ -879,4 +893,37 @@ func kindLabel(kind string) string {
 		return "章节池"
 	}
 	return "书池"
+}
+
+// chapterInfoTTL keeps repeated shelf audits, imports and chapter-drawer
+// refreshes from hitting the rate-limited TOC endpoint again. The cache is
+// scoped by account because paid/unpaid flags are account-specific.
+const chapterInfoTTL = 10 * time.Minute
+
+func (s *Server) chapterInfos(ctx context.Context, accountID int64, ck map[string]string, bookID string) ([]weread.Chapter, error) {
+	key := fmt.Sprintf("%d:%s", accountID, bookID)
+	if accountID > 0 {
+		s.chapterMu.Lock()
+		if s.chapterCache == nil {
+			s.chapterCache = map[string]chapterCacheEntry{}
+		}
+		entry, ok := s.chapterCache[key]
+		s.chapterMu.Unlock()
+		if ok && time.Now().Before(entry.expires) {
+			return entry.chapters, nil
+		}
+	}
+	chs, err := s.wc.ChapterInfos(ctx, ck, bookID)
+	if err != nil {
+		return nil, err
+	}
+	if accountID > 0 {
+		s.chapterMu.Lock()
+		if s.chapterCache == nil {
+			s.chapterCache = map[string]chapterCacheEntry{}
+		}
+		s.chapterCache[key] = chapterCacheEntry{chapters: chs, expires: time.Now().Add(chapterInfoTTL)}
+		s.chapterMu.Unlock()
+	}
+	return chs, nil
 }

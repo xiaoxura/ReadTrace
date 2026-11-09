@@ -147,6 +147,44 @@ func (s *Store) PoolChaptersOf(bookValue string, accountID int64) ([]PoolItem, e
 	return scanPoolItems(rows)
 }
 
+// PoolChaptersPage returns one page of a book's chapter pool plus total and
+// enabled counts. Pagination keeps multi-thousand-chapter books fast to open.
+func (s *Store) PoolChaptersPage(bookValue string, accountID int64, limit, offset int) ([]PoolItem, int, int, error) {
+	if accountID <= 0 {
+		accountID = s.fallbackAccountID()
+	}
+	if accountID <= 0 {
+		return []PoolItem{}, 0, 0, nil
+	}
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	var total, enabled int
+	if err := s.db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(enabled), 0)
+		FROM pool_items WHERE kind = ? AND book_id = ? AND account_id = ?`,
+		KindChapter, bookValue, accountID).Scan(&total, &enabled); err != nil {
+		return nil, 0, 0, err
+	}
+	rows, err := s.db.Query(poolSelectCols+` WHERE kind = ? AND book_id = ? AND account_id = ?
+		ORDER BY sort_order, id LIMIT ? OFFSET ?`,
+		KindChapter, bookValue, accountID, limit, offset)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	defer rows.Close()
+	items, err := scanPoolItems(rows)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	return items, total, enabled, nil
+}
+
 // ErrPoolItemExists is returned when the same value is added twice (same
 // kind/value/account tuple).
 var ErrPoolItemExists = errors.New("该 ID 已在池中")

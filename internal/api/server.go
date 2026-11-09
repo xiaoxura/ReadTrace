@@ -44,6 +44,14 @@ type Server struct {
 
 	allowedHosts []string                      // optional Host allowlist (DNS-rebinding defense)
 	tz           atomic.Pointer[time.Location] // cached site timezone
+
+	chapterMu    sync.Mutex
+	chapterCache map[string]chapterCacheEntry
+}
+
+type chapterCacheEntry struct {
+	chapters []weread.Chapter
+	expires  time.Time
 }
 
 // New creates the API server. allowedHosts, when non-empty, restricts which
@@ -55,6 +63,7 @@ func New(st *store.Store, eng *engine.Engine, sch *sched.Scheduler, nt *notify.S
 		st: st, eng: eng, sch: sch, nt: nt, wc: wc, log: log,
 		assets: assets, version: version, started: time.Now(),
 		limiter: newLoginLimiter(), allowedHosts: allowedHosts,
+		chapterCache: map[string]chapterCacheEntry{},
 	}
 	if tz, err := time.LoadLocation(strings.TrimSpace(mustSetting(st, keyTimezone))); err == nil {
 		s.tz.Store(tz)

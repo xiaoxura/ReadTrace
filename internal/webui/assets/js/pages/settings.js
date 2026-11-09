@@ -87,16 +87,17 @@ function defaultTemplateHTML(info) {
 
 function wireDefaultTemplate(ctx, host, info = infoCache) {
   $('#save-pool-template', host)?.addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
     const raw = $('#pool-template', host).value.trim();
-    setLoading(e.currentTarget, true);
+    setLoading(btn, true);
     try {
-      await api.poolTemplate(raw);
-      infoCache = { ...infoCache, default_template: raw };
+      const res = await api.poolTemplate(raw);
+      infoCache = { ...infoCache, default_template: res?.template || raw };
       toast(raw ? '账号指纹模板已保存，未配置自身模板的账号将以它为基底' : '账号指纹模板已清空', 'ok');
     } catch (e2) {
       toast(e2.message, 'error');
     } finally {
-      setLoading(e.currentTarget, false);
+      setLoading(btn, false);
     }
   });
   $('#clear-pool-template', host)?.addEventListener('click', async () => {
@@ -159,10 +160,11 @@ function wireAppearance(ctx, host) {
 
 function wireSite(ctx, host, info) {
   $('#save-site', host)?.addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
     const name = $('#site-name', host).value.trim();
     const tz = $('#site-tz', host).value.trim();
     if (!name) { toast('站点名称不能为空', 'warn'); return; }
-    setLoading(e.currentTarget, true);
+    setLoading(btn, true);
     try {
       const res = await api.updateSettings({ site_name: name, timezone: tz });
       state.tz = res.timezone;
@@ -176,7 +178,7 @@ function wireSite(ctx, host, info) {
     } catch (e2) {
       toast(e2.message, 'error');
     } finally {
-      setLoading(e.currentTarget, false);
+      setLoading(btn, false);
     }
   });
 }
@@ -239,8 +241,9 @@ function securityHTML(info) {
 
 function wireSecurity(ctx, host, info) {
   $('#save-check', host)?.addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
     const minutes = Number($('#check-interval', host).value);
-    setLoading(e.currentTarget, true);
+    setLoading(btn, true);
     try {
       await api.updateSettings({ check_interval_minutes: minutes });
       infoCache = { ...infoCache, check_interval: minutes };
@@ -248,18 +251,19 @@ function wireSecurity(ctx, host, info) {
     } catch (e2) {
       toast(e2.message, 'error');
     } finally {
-      setLoading(e.currentTarget, false);
+      setLoading(btn, false);
     }
   });
 
   $('#save-pw', host)?.addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
     const current = $('#pw-current', host).value;
     const next = $('#pw-new', host).value;
     const confirm = $('#pw-confirm', host).value;
     if (!current || !next) { toast('请填写当前密码与新密码', 'warn'); return; }
     if (next.length < 6) { toast('新密码至少 6 位', 'warn'); return; }
     if (next !== confirm) { toast('两次输入的新密码不一致', 'warn'); return; }
-    setLoading(e.currentTarget, true);
+    setLoading(btn, true);
     try {
       await api.changePassword(current, next);
       toast('密码已更新，其他会话已失效', 'ok');
@@ -269,7 +273,7 @@ function wireSecurity(ctx, host, info) {
     } catch (e2) {
       toast(e2.message, 'error');
     } finally {
-      setLoading(e.currentTarget, false);
+      setLoading(btn, false);
     }
   });
 

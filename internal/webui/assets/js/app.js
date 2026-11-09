@@ -261,7 +261,7 @@ function onGlobalEvent(ev) {
       break;
     }
     case 'schedule.fire':
-      toast(`定时任务已触发：${ev.data?.account_name || ''}`, 'info');
+      toast(`定时任务已启动：${ev.data?.account_name || ''}`, 'info');
       break;
     case 'schedule.skip':
       toast(`已跳过定时任务：${ev.data?.reason || ''}`, 'warn');

@@ -63,8 +63,8 @@ export const api = {
     request(`/api/books/${encodeURIComponent(bookId)}?account_id=${accountId}`),
 
   pool: (accountId = 0) => request(`/api/pool?account_id=${accountId}`),
-  poolBookChapters: (bookId, { refresh = false, account_id = 0 } = {}) =>
-    request(`/api/pool/book/${encodeURIComponent(bookId)}/chapters?account_id=${account_id}${refresh ? '&refresh=1' : ''}`),
+  poolBookChapters: (bookId, { refresh = false, account_id = 0, limit = 50, offset = 0 } = {}) =>
+    request(`/api/pool/book/${encodeURIComponent(bookId)}/chapters?account_id=${account_id}&limit=${limit}&offset=${offset}${refresh ? '&refresh=1' : ''}`),
   poolBookPrune: (bookId, account_id = 0) =>
     request(`/api/pool/book/${encodeURIComponent(bookId)}/prune?account_id=${account_id}`, { method: 'POST', body: {} }),
   poolAdd: (kind, value, title = '', accountId = 0, bookId = '') => request('/api/pool/add', { method: 'POST', body: { kind, value, title, account_id: accountId, book_id: bookId } }),

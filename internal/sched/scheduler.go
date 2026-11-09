@@ -290,7 +290,6 @@ func (s *Scheduler) fire(job *scheduleJob) {
 		s.opMu.Unlock()
 		return
 	}
-	now := time.Now().Unix()
 	next := int64(0)
 	if schedParsed, perr := parser.Parse(v.Cron); perr == nil {
 		if nx := schedParsed.Next(time.Now().In(s.Timezone())); !nx.IsZero() {
@@ -300,7 +299,10 @@ func (s *Scheduler) fire(job *scheduleJob) {
 	s.mu.Lock()
 	s.next[id] = next
 	s.mu.Unlock()
-	_ = s.st.SetScheduleTimes(id, now, next)
+	// A trigger attempt is not a run. Keep the previous last_run_at until
+	// engine.Start actually creates a run row; otherwise the UI shows a
+	// "last run" time for a skipped/failed start with no matching record.
+	_ = s.st.SetScheduleTimes(id, v.LastRunAt, next)
 	s.opMu.Unlock()
 
 	acc, err := s.st.GetAccount(v.AccountID)
@@ -312,9 +314,6 @@ func (s *Scheduler) fire(job *scheduleJob) {
 		return
 	}
 
-	s.publish(id, acc.ID, "schedule.fire", map[string]any{
-		"schedule_id": id, "account_id": acc.ID, "account_name": acc.Name, "minutes": v.Minutes,
-	})
 	if s.eng.IsRunning(acc.ID) {
 		s.log.Info("账号已有运行中的任务，跳过定时触发", "account", acc.ID, "schedule", id)
 		s.publish(id, acc.ID, "schedule.skip", map[string]any{
@@ -371,6 +370,15 @@ func (s *Scheduler) fire(job *scheduleJob) {
 		})
 		return
 	}
+	// Only publish fire after a run row actually exists; otherwise the panel
+	// would show "triggered" for a skipped or failed start with no record.
+	if err := s.st.SetScheduleTimes(id, run.StartedAt, next); err != nil {
+		s.log.Warn("记录定时任务启动时间失败", "schedule", id, "err", err)
+	}
+	s.publish(id, acc.ID, "schedule.fire", map[string]any{
+		"schedule_id": id, "account_id": acc.ID, "account_name": acc.Name,
+		"minutes": v.Minutes, "run_id": run.ID,
+	})
 	s.log.Info("定时任务已启动", "schedule", id, "run", run.ID, "account", acc.Name)
 }
 

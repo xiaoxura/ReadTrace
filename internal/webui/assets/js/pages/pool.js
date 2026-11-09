@@ -513,12 +513,18 @@ async function importBooks(selected, { accountOverride = 0, auditMap = null } = 
     } catch (e) {
       failures[b.book_id] = e.message;
     }
+    // 目录接口有风控，连续请求容易让后面的书收到空目录。
+    if (i < selected.length - 1) await new Promise((r) => setTimeout(r, 700));
   }
   bar.style.width = '100%';
   label.textContent = aborted ? '已取消导入' : '导入完成';
   detail.innerHTML = `
     书籍 +${added}（补充信息 ${skipped}） · 章节 +${chapterTotal}${chapterExisted ? `（其中已在池 ${chapterExisted} 条）` : ''} · 异常 ${Object.keys(failures).length}
   `;
+  const failedCount = Object.keys(failures).length;
+  if (failedCount) {
+    toast(`有 ${failedCount} 本书的章节导入失败，关闭弹窗后可在下方重试`, 'warn', 8000);
+  }
 
   const closeBtn = document.createElement('button');
   closeBtn.className = 'btn btn-primary';
@@ -859,15 +865,38 @@ async function openChaptersDrawer(book, accountID) {
     `,
   });
 
-  const load = async () => {
+  let chapterPage = 1;
+  let chapterPageSize = 50;
+  let chapterTotal = 0;
+  let unpaidMap = null;
+  let liveInfo = null;
+  let liveError = '';
+
+  const load = async ({ refresh = false } = {}) => {
     const box = $('[data-chap-body]', mask);
     try {
-      const res = await api.poolBookChapters(book.value, { refresh: true, account_id: accountID });
+      const res = await api.poolBookChapters(book.value, {
+        refresh,
+        account_id: accountID,
+        limit: chapterPageSize,
+        offset: Math.max(0, (chapterPage - 1) * chapterPageSize),
+      });
+      if (refresh) {
+        unpaidMap = res.unpaid || null;
+        liveInfo = res.live || null;
+        liveError = res.live_error || '';
+      }
       const chapters = res.chapters || [];
-      const shown = chapters.slice(0, 300);
+      chapterTotal = Number(res.total ?? chapters.length);
+      const enabledCount = Number(res.enabled ?? chapters.filter((c) => c.enabled).length);
+      const pages = Math.max(1, Math.ceil(chapterTotal / chapterPageSize));
+      if (chapterPage > pages) {
+        chapterPage = pages;
+        return load({ refresh: false });
+      }
       let liveHTML = '';
-      if (res.live) {
-        const { total: lt, priced: lp } = res.live;
+      if (liveInfo) {
+        const { total: lt, priced: lp } = liveInfo;
         const free = lt - lp;
         liveHTML = `
           <div class="note ${lp ? 'warn' : ''}" style="margin-bottom:8px">${icon('book')}<div>
@@ -875,22 +904,22 @@ async function openChaptersDrawer(book, accountID) {
             ${lp ? '付费未购的章节读不开，心跳对这些章节不一定计入；可以点下方「清理付费未购章节」把它们从池中移除。' : '该书目录整体可读。'}
           </div></div>
         `;
-      } else if (res.live_error) {
-        liveHTML = `<div class="hint" style="margin-bottom:8px">官方目录核对失败：${escapeHtml(res.live_error)}</div>`;
+      } else if (liveError) {
+        liveHTML = `<div class="hint" style="margin-bottom:8px">官方目录核对失败：${escapeHtml(liveError)}</div>`;
       }
       box.innerHTML = `
         ${liveHTML}
         <div class="tool-row" style="margin-bottom:8px;align-items:center">
-          <span class="hint">启用 ${chapters.filter((c) => c.enabled).length} / ${chapters.length}</span>
+          <span class="hint">启用 ${enabledCount} / ${chapterTotal} 章</span>
           <span style="flex:1"></span>
         </div>
         <div class="table-wrap" style="max-height:46vh;overflow-y:auto;padding:0 2px">
           <table class="table">
             <thead><tr><th>章节</th><th style="width:76px">字数</th><th style="width:92px">付费</th><th style="width:80px">启用</th><th style="width:56px"></th></tr></thead>
             <tbody>
-              ${shown.map((c) => {
+              ${chapters.map((c) => {
                 const disp = (c.title || '').includes(' · ') ? c.title.split(' · ').slice(1).join(' · ') : (c.title || '(未命名章节)');
-                const unpaid = res.unpaid && c.value ? res.unpaid[c.value] === true : null;
+                const unpaid = unpaidMap && c.value ? unpaidMap[c.value] === true : null;
                 const payBadge = unpaid === true
                   ? '<span class="badge err">付费未购</span>'
                   : unpaid === false
@@ -908,11 +937,22 @@ async function openChaptersDrawer(book, accountID) {
                   <td><button class="btn btn-sm btn-danger" data-chap-del="${c.id}" title="删除章节">${icon('trash')}</button></td>
                 </tr>
               `; }).join('') || '<tr><td colspan="5" class="hint">这本书还没有章节条目。点下方按钮从官网补拉可读章节，或手动添加章节 ID。</td></tr>'}
-              ${chapters.length > shown.length ? `<tr><td colspan="5" class="hint">已显示前 300 条，其余 ${chapters.length - 300} 条仍在池中参与轮换抽取。</td></tr>` : ''}
             </tbody>
           </table>
         </div>
+        ${chapterTotal ? pagerHTML(chapterTotal, chapterPage, chapterPageSize) : ''}
       `;
+      bindPager(box, {
+        onPage: (delta) => {
+          chapterPage = Math.max(1, chapterPage + delta);
+          load();
+        },
+        onSize: (size) => {
+          chapterPageSize = size;
+          chapterPage = 1;
+          load();
+        },
+      });
       $$('[data-chap-enabled]', box).forEach((cb) => cb.addEventListener('change', async () => {
         try {
           await api.poolUpdate(cb.dataset.chapEnabled, { enabled: cb.checked });
@@ -931,10 +971,10 @@ async function openChaptersDrawer(book, accountID) {
       box.innerHTML = `<div class="note warn">${icon('alert')}<div>章节加载失败：${escapeHtml(e.message)}</div></div>`;
     }
   };
-  await load();
+  await load({ refresh: true });
 
   $('[data-chap-bulk]', mask).addEventListener('click', () => {
-    bulkImportDialog('chapter', () => { load(); refreshPoolData(); }, accountID, book.value);
+    bulkImportDialog('chapter', () => { load({ refresh: true }); refreshPoolData(); }, accountID, book.value);
   });
 
   $('[data-chap-prune]', mask).addEventListener('click', async (e) => {
@@ -977,7 +1017,7 @@ async function openChaptersDrawer(book, accountID) {
       const fails = res.failures || {};
       if (fails[book.value]) toast(`补拉失败：${fails[book.value]}`, 'warn', 7000);
       else toast(`已补拉 ${n} 个章节`, 'ok');
-      load();
+      load({ refresh: true });
       refreshPoolData();
     } catch (e2) { toast(e2.message, 'error'); }
     finally { setLoading(btn, false); }

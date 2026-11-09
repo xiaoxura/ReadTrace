@@ -438,9 +438,6 @@ export function editAccountDialog(acc, { onDone } = {}) {
   let book = { id: acc.book_id || '', title: acc.book_title || '' };
   let poolBooks = null; // 该账号视角的启用书籍，加载后缓存
 
-  const channelOptions = state.channels.map((c) =>
-    `<option value="${c.id}" ${acc.push_channel_id === c.id ? 'selected' : ''}>${escapeHtml(c.name)}</option>`).join('');
-
   const { mask, close } = openModal({
     title: `编辑「${acc.name}」`,
     subtitle: `ID #${escapeHtml(acc.seq)} · 这些设置只影响该账号`,
@@ -500,15 +497,7 @@ export function editAccountDialog(acc, { onDone } = {}) {
       <div class="section-title">阅读内容</div>
       <div data-mode-extra></div>
 
-      <div class="section-title">问题提醒</div>
-      <div class="field">
-        <label class="label" for="acc-channel">问题提醒渠道</label>
-        <select class="select" id="acc-channel" data-channel>
-          <option value="0">不提醒</option>
-          ${channelOptions}
-        </select>
-        <div class="hint">仅在自动重试后仍失败或确认登录失效时提醒；正常完成和手动停止保持安静。渠道可在「推送」页面添加。</div>
-      </div>`,
+    `,
     footer: `<button class="btn btn-danger" data-delete>${icon('trash')}删除账号</button>
       <span style="flex:1"></span>
       <button class="btn btn-ghost" data-cancel>取消</button>
@@ -570,18 +559,22 @@ export function editAccountDialog(acc, { onDone } = {}) {
       book = v ? { id: v, title: (hit && hit.title) || book.title || '' } : { id: '', title: '' };
     });
     $('[data-save-payload]', modeExtra)?.addEventListener('click', async (e) => {
+      const btn = e.currentTarget;
       const val = $('[data-payload]', modeExtra).value.trim();
       if (!val) { toast('请粘贴 curl 或请求体', 'warn'); return; }
-      setLoading(e.currentTarget, true);
+      setLoading(btn, true);
       try {
         await api.savePayload(acc.id, val.startsWith('{') ? { payload: val } : { curl: val });
         acc.has_payload = true;
+        // 重新渲染会更新“已保存”状态，但不要让用户刚粘贴的内容消失。
         renderModeExtra();
+        const box = $('[data-payload]', modeExtra);
+        if (box) box.value = val;
         toast('模板已保存，该账号所有模式都会用它作为请求基底', 'ok');
       } catch (err) {
         toast(err.message, 'error');
       } finally {
-        setLoading(e.currentTarget, false);
+        setLoading(btn, false);
       }
     });
     $('[data-clear-payload]', modeExtra)?.addEventListener('click', async () => {
@@ -612,6 +605,7 @@ export function editAccountDialog(acc, { onDone } = {}) {
   $('[data-cancel]', mask).addEventListener('click', close);
 
   $('[data-save]', mask).addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
     const name = $('[data-name]', mask).value.trim();
     if (!name) {
       toast('账号名称不能为空', 'warn');
@@ -637,14 +631,13 @@ export function editAccountDialog(acc, { onDone } = {}) {
       max_retries: Number($('[data-retries]', mask).value) || 0,
       retry_delay: Number($('[data-retry-delay]', mask).value) || 15,
       mode: $('[data-mode]', mask).value,
-      push_channel_id: Number($('[data-channel]', mask).value) || 0,
       book_id: book.id,
       book_title: book.title,
       // 没换书时保留原有的章节指定；换了书则章节随书重置（可在书池里看章节）。
       chapter_id: book.id === acc.book_id ? acc.chapter_id : '',
       chapter_title: book.id === acc.book_id ? acc.chapter_title : '',
     };
-    setLoading(e.currentTarget, true);
+    setLoading(btn, true);
     try {
       await api.updateAccount(acc.id, patch);
       await refreshAccounts();
@@ -654,7 +647,7 @@ export function editAccountDialog(acc, { onDone } = {}) {
     } catch (err) {
       toast(err.message, 'error');
     } finally {
-      setLoading(e.currentTarget, false);
+      setLoading(btn, false);
     }
   });
 
