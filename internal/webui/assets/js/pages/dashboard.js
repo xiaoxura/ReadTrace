@@ -16,6 +16,9 @@ import {
 const RING_SIZE = 132;
 const RING_STROKE = 9;
 const RING_C = (2 * Math.PI * (RING_SIZE - RING_STROKE)) / 2;
+// 活跃账号超过该数量时，「正在阅读」区从完整大卡切换为紧凑行：
+// 每个 hero 大卡约 300px 高，数十个账号会把统计内容顶出几屏之外。
+const HERO_LIMIT = 3;
 
 export async function renderDashboard(ctx) {
   const { root } = ctx;
@@ -37,12 +40,17 @@ export async function renderDashboard(ctx) {
   state.tz = data.timezone || state.tz;
 
   const logs = new Map();
-  await Promise.all((data.active || []).map(async (p) => {
-    try {
-      const res = await api.runLogs(p.run_id, { tail: true, limit: 5 });
-      logs.set(p.run_id, res.logs || []);
-    } catch { /* ignore */ }
-  }));
+  // 紧凑列表（超过 HERO_LIMIT 个活跃账号）不展示每卡实时日志，
+  // 也就不为它们各自拉取 tail 日志，免得首屏 N 个并行请求。
+  const activeCount = (data.active || []).length;
+  if (activeCount && activeCount <= HERO_LIMIT) {
+    await Promise.all((data.active || []).map(async (p) => {
+      try {
+        const res = await api.runLogs(p.run_id, { tail: true, limit: 5 });
+        logs.set(p.run_id, res.logs || []);
+      } catch { /* ignore */ }
+    }));
+  }
   if (!ctx.isActive()) return;
 
   root.innerHTML = pageHTML(data, logs, accountId);
@@ -77,7 +85,10 @@ function pageHTML(data, logs, accountId) {
     ? accountSelectHTML(accountId, { includeAll: true, id: 'dash-filter', style: 'width:auto;min-width:130px' })
     : '';
 
-  const activeHTML = (data.active || []).map((p) => activeHero(p, logs.get(p.run_id) || [])).join('');
+  const activeList = data.active || [];
+  const activeHTML = activeList.length > HERO_LIMIT
+    ? activeListHTML(activeList)
+    : activeList.map((p) => activeHero(p, logs.get(p.run_id) || [])).join('');
 
   return `
     ${pageHeaderHTML({
@@ -216,8 +227,40 @@ function recentHTML(data) {
   </article>`;
 }
 
-function activeHero(p, logs) {
-  const pct = p.target ? Math.min(100, (p.elapsed / p.target) * 100) : 0;
+// activeListHTML 活跃账号超过 HERO_LIMIT 时的紧凑列表：一行一个账号，
+// 复用 hero 的 data-* 属性口径，applyTick 无需感知两种形态。
+function activeListHTML(list) {
+  const rows = list.map((p) => {
+    const pct = p.target ? Math.min(100, Math.round((p.elapsed / p.target) * 100)) : 0;
+    const remaining = Math.max(0, p.target - p.elapsed);
+    const name = escapeHtml(p.account_name);
+    return `<div class="rm-row" data-run="${p.run_id}" tabindex="0" role="button" aria-label="查看 ${name} 的运行详情">
+      <div class="rm-id" aria-hidden="true"><span class="pulse-dot"></span></div>
+      <div class="rm-main">
+        <div class="rm-name">${name}</div>
+        <div class="rm-progress"><div class="bar"><i data-bar style="width:${pct}%"></i></div><b data-pct>${pct}%</b></div>
+      </div>
+      <div class="rm-numbers">
+        <span>已读 <b data-elapsed>${fmtMinutes(p.elapsed)}</b> 分</span>
+        <span>剩余 <b data-remaining>${fmtMinutes(remaining)}</b> 分</span>
+        <span class="rm-success">成功 <b data-success>${escapeHtml(p.success)}</b> 次</span>
+      </div>
+      <button class="btn btn-sm btn-ghost rm-stop" data-stop="${p.run_id}" aria-label="停止 ${name}">${icon('stop')}停止</button>
+    </div>`;
+  }).join('');
+  return `<article class="card dash-active">
+    <div class="card-head">
+      <div>
+        <div class="card-title">${icon('play')}正在阅读</div>
+        <div class="card-sub">${list.length} 个账号同时运行 · 点行看实时日志，或到「记录」页逐个查看</div>
+      </div>
+      <a class="btn btn-sm btn-ghost" href="#/runs">全部记录</a>
+    </div>
+    <div class="rm-list">${rows}</div>
+  </article>`;
+}
+
+function activeHero(p, logs) {  const pct = p.target ? Math.min(100, (p.elapsed / p.target) * 100) : 0;
   const remaining = Math.max(0, p.target - p.elapsed);
   const logHTML = (logs || []).slice(-4).map((log) => `
     <div class="ln ${escapeHtml(log.level)}"><i>${fmtTime(log.ts, state.tz)}</i>${escapeHtml(log.message)}</div>`).join('');

@@ -67,7 +67,10 @@ export function bindRunRows(root, openRun) {
 }
 
 export function bindStopButtons(root, { onDone } = {}) {
-  $$('[data-stop]', root).forEach((btn) => btn.addEventListener('click', async () => {
+  $$('[data-stop]', root).forEach((btn) => btn.addEventListener('click', async (e) => {
+    // 停止按钮可能嵌在可点击行（总览紧凑运行行/账号列表）里，
+    // 阻止冒泡避免触发行本身的「打开运行详情」。
+    e.stopPropagation();
     setLoading(btn, true);
     try {
       await api.stopRun(Number(btn.dataset.stop));
