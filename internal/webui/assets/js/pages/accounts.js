@@ -157,7 +157,7 @@ function drawCards(ctx) {
         <th style="min-width:260px">账号</th>
         <th style="min-width:300px">阅读目标 / 心跳 / 模板</th>
         <th style="width:150px">阅读</th>
-        <th style="min-width:170px">问题提醒渠道</th>
+        <th style="min-width:170px">提醒渠道</th>
         <th style="width:300px">管理</th>
       </tr></thead>
       <tbody>${list.map((a) => accountCard(a, running.get(a.id))).join('')}</tbody>
@@ -194,13 +194,13 @@ function wireCards(ctx, running) {
 
   bindStopButtons(root, { onDone: () => ctx.reload() });
 
-  // 问题提醒渠道绑定：下拉即选即存，每个账号可绑定不同渠道。
+  // 提醒渠道绑定：下拉即选即存，每个账号可绑定不同渠道（完成 / 失败 / 失效共用）。
   $$('[data-push-channel]', root).forEach((sel) => sel.addEventListener('change', async () => {
     const id = Number(sel.dataset.pushChannel);
     const channelId = Number(sel.value) || 0;
     try {
       await api.updateAccount(id, { push_channel_id: channelId });
-      toast(channelId ? '已绑定问题提醒渠道' : '已关闭问题提醒', 'ok');
+      toast(channelId ? '已绑定提醒渠道' : '已关闭提醒', 'ok');
       await refreshAccounts();
       drawCards(ctx);
     } catch (e) {
@@ -322,8 +322,8 @@ function accountCard(a, active) {
       </div>
     </td>
     <td>
-      <select class="select" data-push-channel="${a.id}" aria-label="问题提醒渠道"
-        style="min-width:150px" title="仅在重试后仍失败或确认登录失效时提醒">
+      <select class="select" data-push-channel="${a.id}" aria-label="提醒渠道"
+        style="min-width:150px" title="绑定提醒渠道：阅读完成（可在设置里关闭）、重试后仍失败、确认登录失效时推送到这里">
         <option value="0" ${!a.push_channel_id ? 'selected' : ''}>不提醒</option>
         ${state.channels.map((c) => `<option value="${c.id}" ${a.push_channel_id === c.id ? 'selected' : ''}>${escapeHtml(c.name)}</option>`).join('')}
       </select>

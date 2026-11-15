@@ -121,6 +121,9 @@ func SignPayload(template map[string]any, now, last time.Time, rnd *rand.Rand) m
 		out[k] = v
 	}
 
+	// rt 是上报给微信读书的「本次心跳覆盖的阅读秒数」，服务端按它的整数
+	// 累加阅读时长。保持向下取整（与官方网页端一致，不虚报每一拍）；因
+	// 整数截断而少报的部分由引擎按「已上报总和」补足（见引擎的 credited）。
 	rt := int(now.Sub(last).Seconds())
 	if rt < 1 {
 		rt = 1

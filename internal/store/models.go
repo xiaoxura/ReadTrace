@@ -29,6 +29,10 @@ type Account struct {
 	Running               bool   `json:"running"`
 	CreatedAt             int64  `json:"created_at"`
 	UpdatedAt             int64  `json:"updated_at"`
+
+	// NotifyOnSuccess 控制「阅读完成」是否也推送到上面绑定的渠道（默认开启）。
+	// 最终失败与确认登录失效的提醒不受它影响。
+	NotifyOnSuccess bool `json:"notify_on_success"`
 }
 
 // Run is one reading session.

@@ -46,6 +46,62 @@ func legacyPoolDB(t *testing.T, uniqueConstraint string) (string, *secure.Box) {
 	return path, box
 }
 
+// TestMigrateNotifyOnSuccessDefaultsOn：0.2.2 之前的库没有 notify_on_success
+// 列，升级时补列并默认开启——老账号升级后也应能收到「阅读完成」回执。
+func TestMigrateNotifyOnSuccessDefaultsOn(t *testing.T) {
+	dir := t.TempDir()
+	box, err := secure.New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "legacy.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(schema); err != nil {
+		t.Fatal(err)
+	}
+	// 还原成旧表结构：删掉本版新增的列。
+	if _, err := db.Exec(`ALTER TABLE accounts DROP COLUMN notify_on_success`); err != nil {
+		db.Close()
+		t.Skipf("当前 SQLite 不支持 DROP COLUMN，跳过老库模拟: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO accounts
+		(seq, name, vid, nickname, avatar, status, last_error, last_check_at,
+		 default_minutes, daily_goal_minutes, tick_seconds, read_speed, max_retries, retry_delay,
+		 book_id, book_title, chapter_id, chapter_title, mode, push_channel_id, created_at, updated_at)
+		VALUES (0, '老账号', '', '', '', 'active', '', 0, 30, 30, 30, 300, 5, 30, '', '', '', '', 'sequence', 0, 100, 100)`); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := Open(path, box)
+	if err != nil {
+		t.Fatalf("升级老库失败: %v", err)
+	}
+	defer st.Close()
+	acc, err := st.GetAccount(1)
+	if err != nil || acc == nil {
+		t.Fatalf("GetAccount: %v %v", acc, err)
+	}
+	if !acc.NotifyOnSuccess {
+		t.Fatal("老账号升级后「阅读完成推送」应默认开启")
+	}
+	// 关闭后仍可正常写入（列已就位，不再是默认值）。
+	acc.NotifyOnSuccess = false
+	if err := st.UpdateAccount(*acc); err != nil {
+		t.Fatal(err)
+	}
+	again, err := st.GetAccount(1)
+	if err != nil || again == nil || again.NotifyOnSuccess {
+		t.Fatalf("关闭完成推送未落库: %+v err=%v", again, err)
+	}
+}
+
 func TestMigrateLegacyPoolUniqueKeyPreservesMetadata(t *testing.T) {
 	for _, coexist := range []bool{false, true} {
 		name := "legacy_only"

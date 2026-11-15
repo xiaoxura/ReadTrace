@@ -32,7 +32,7 @@ import (
 	"readtrace/internal/weread"
 )
 
-var version = "0.2.1"
+var version = "0.2.2"
 
 func main() {
 	addr := flag.String("addr", envAny([]string{"READTRACE_ADDR", "WXREAD_ADDR"}, "127.0.0.1:8720"), "监听地址，例如 127.0.0.1:8720 或 0.0.0.0:8720")

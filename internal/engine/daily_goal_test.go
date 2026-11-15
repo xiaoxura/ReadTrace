@@ -176,6 +176,75 @@ func TestFinalNotificationOnlyForTerminalFailureAndNewExpiry(t *testing.T) {
 	}
 }
 
+// TestSuccessNotificationFollowsAccountSwitch：完成推送是账号级开关（默认
+// 开启）——开关打开且绑定渠道时，正常完成发一条「阅读完成」；关闭后恢复
+// 安静。失败/失效提醒不受该开关影响（见上一个用例）。
+func TestSuccessNotificationFollowsAccountSwitch(t *testing.T) {
+	st := testEngineStore(t)
+	ch := &store.PushChannel{Name: "local", Type: "ntfy", Enabled: true,
+		Config: map[string]string{"server": "http://localhost", "topic": "test"}}
+	if err := st.CreatePushChannel(ch); err != nil {
+		t.Fatal(err)
+	}
+	id, err := st.CreateAccount(store.Account{Name: "done", PushChannelID: ch.ID, NotifyOnSuccess: true}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acc, err := st.GetAccount(id)
+	if err != nil || acc == nil {
+		t.Fatalf("GetAccount: %v", err)
+	}
+	if !acc.NotifyOnSuccess {
+		t.Fatal("notify_on_success 没有落库")
+	}
+	sent := make(chan string, 4)
+	nt := notify.New()
+	nt.HTTP.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		sent <- r.Header.Get("Title")
+		return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(""))}, nil
+	})
+	e := New(st, nil, nt, NewHub(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	finalize := func(status string) {
+		t.Helper()
+		r := &store.Run{AccountID: id, Status: "running", PlanSeconds: 60, StartedAt: time.Now().Unix()}
+		if err := st.CreateRun(r); err != nil {
+			t.Fatal(err)
+		}
+		ar := &activeRun{runID: r.ID, accountID: id, account: acc.Name, target: 60}
+		e.finalize(ar, acc, status, "", &tickState{elapsed: 60, success: 2}, 60)
+	}
+	finalize("success")
+	select {
+	case title := <-sent:
+		if title != "微信读书 · 阅读完成" {
+			t.Fatalf("完成推送标题 = %q", title)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("正常完成没有推送")
+	}
+	acc.NotifyOnSuccess = false
+	if err := st.UpdateAccount(*acc); err != nil {
+		t.Fatal(err)
+	}
+	finalize("success")
+	select {
+	case title := <-sent:
+		t.Fatalf("关闭完成推送后仍然发送 %q", title)
+	case <-time.After(30 * time.Millisecond):
+	}
+	// 手动停止保持安静，与开关键无关。
+	acc.NotifyOnSuccess = true
+	if err := st.UpdateAccount(*acc); err != nil {
+		t.Fatal(err)
+	}
+	finalize("stopped")
+	select {
+	case title := <-sent:
+		t.Fatalf("手动停止不应推送 %q", title)
+	case <-time.After(30 * time.Millisecond):
+	}
+}
+
 func TestConcurrentStartsCannotClaimSameSevenSeconds(t *testing.T) {
 	st, e, acc := goalEngine(t, 1)
 	addGoalHistory(t, st, acc.ID, 53, "stopped")

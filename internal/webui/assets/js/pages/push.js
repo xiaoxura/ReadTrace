@@ -79,12 +79,12 @@ export async function renderPush(ctx) {
       <article class="card"><div class="empty" style="padding:54px 20px">
         <div class="empty-ico" style="width:60px;height:60px;border-radius:18px">${icon('bell')}</div>
         <h3>还没有推送渠道</h3>
-        <p>阅读重试后仍失败或确认登录失效时，可通过微信、Telegram 等渠道收到提醒。</p>
+        <p>阅读完成、重试后仍失败或确认登录失效时，可通过微信、Telegram 等渠道收到提醒。</p>
         <button class="btn btn-primary" id="empty-add">${icon('plus')}添加第一个渠道</button>
       </div></article>`}
 
     <div class="note" style="margin-top:16px">${icon('shield')}
-      <div>推送配置（Token、SPT 等）使用本机密钥加密存储。测试消息会立即发送，请确认渠道配置正确。</div>
+      <div>推送配置（Token、SPT 等）使用本机密钥加密存储。为账号绑定渠道后，阅读完成（账号级开关，默认开启）与失败/失效都会推送到这里；测试消息会立即发送。</div>
     </div>
   `;
   if (!ctx.isActive()) return;

@@ -526,6 +526,12 @@ export function editAccountDialog(acc, { onDone } = {}) {
         </div>
       </div>
 
+      <div class="field">
+        <label class="label">阅读完成推送</label>
+        <label class="check"><span class="switch"><input type="checkbox" data-notify-success ${acc.notify_on_success === false ? '' : 'checked'}><i></i></span> 完成一轮阅读后，向该账号绑定的提醒渠道发送结果</label>
+        <div class="hint">默认开启，可在账号列表右侧为它选择「提醒渠道」；手动停止不推送，最终失败与登录失效始终提醒。</div>
+      </div>
+
       <div class="section-title">阅读内容</div>
       <div data-mode-extra></div>
 
@@ -741,6 +747,7 @@ export function editAccountDialog(acc, { onDone } = {}) {
       max_retries: Number($('[data-retries]', mask).value) || 0,
       retry_delay: Number($('[data-retry-delay]', mask).value) || 15,
       mode: $('[data-mode]', mask).value,
+      notify_on_success: $('[data-notify-success]', mask).checked,
       book_id: book.id,
       book_title: book.title,
       // 没换书时保留原有的章节指定；换了书则章节随书重置（可在书池里看章节）。
@@ -999,7 +1006,7 @@ export function pushChannelDialog({ channel = null, onDone } = {}) {
         <label class="check"><span class="switch"><input type="checkbox" data-enabled ${channel?.enabled === false ? '' : 'checked'}><i></i></span> 启用该渠道</label>
       </div>
       <div class="section-title" style="text-transform:none;letter-spacing:0">消息模板 <span style="color:var(--muted);font-size:11px;font-weight:500">可选，留空用默认文案</span></div>
-      <div class="note" style="margin-bottom:12px">${icon('info')}<div>自动提醒仅用于重试后仍失败或确认登录失效；成功模板保留兼容，正常完成不自动推送。留空使用默认文案。可用变量：{{account}}、{{plan}}、{{elapsed}}、{{status}}、{{error}}、{{success}}、{{failed}}、{{time}}。</div></div>
+      <div class="note" style="margin-bottom:12px">${icon('info')}<div>自动提醒覆盖：<b>阅读完成</b>（账号级开关，默认开启）、重试后仍失败、确认登录失效；手动停止不推送。留空使用默认文案。可用变量：{{account}}、{{plan}}、{{elapsed}}、{{status}}、{{error}}、{{success}}、{{failed}}、{{time}}。</div></div>
       ${TEMPLATE_KINDS.map(([k, label, defTitle, defBody]) => `
         <div class="field">
           <label class="label">${label} · 标题</label>

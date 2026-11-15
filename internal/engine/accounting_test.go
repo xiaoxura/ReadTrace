@@ -182,10 +182,13 @@ func TestFullRunElapsedMatchesWallClock(t *testing.T) {
 		if got.ElapsedSeconds != 60 {
 			t.Fatalf("elapsed = %d, want capped at plan 60", got.ElapsedSeconds)
 		}
-		// 计账 ≈ 墙钟：60 s 的目标不应跑超过 ~1.2 倍墙钟（抖动 + 封顶 +
-		// 取整余量），也不能凭空少记（elapsed ≤ 墙钟 + 1）。
-		if wall < 58 || wall > 74 {
-			t.Fatalf("run took %d s of wall clock for a 60 s plan, want ≈60 s", wall)
+		// 本地计账仍是真实墙钟：记录值等于计划 60 s，不能凭空多记
+		// （elapsed ≤ 墙钟 + 1），也不允许少跑（墙钟 ≥ 60）。
+		// 墙钟上限放宽到 100 s：为了让服务端按整数 rt 累计到的时长也够
+		// 60 s，引擎会多跑几拍补足每拍不足 1 秒的截断损耗；这里 TickSeconds=5
+		// 把损耗比例放大到约 10%（默认 30 秒心跳只有 1.7%，约 30 秒）。
+		if wall < 58 || wall > 100 {
+			t.Fatalf("run took %d s of wall clock for a 60 s plan", wall)
 		}
 		if got.ElapsedSeconds > wall+1 {
 			t.Fatalf("elapsed %d exceeds covered wall %d", got.ElapsedSeconds, wall)
@@ -465,6 +468,79 @@ func TestProgressWriteFailureWarnsButKeepsRunning(t *testing.T) {
 		// 一次跨静默重发，正好 2 条（60~65s 的长运行会跨到第三个窗口）。
 		if warns != 2 {
 			t.Fatalf("progress warn count = %d, want rate-limited 2; log:\n%s", warns, logBuf.String())
+		}
+	})
+}
+
+// TestReportedReadTimeCoversPlan 回归「设 30 分钟、微信读书手机端只显示
+// 29 分钟」：服务端按每次心跳上报的整数 rt 累计阅读时长，而 rt 逐拍向下
+// 取整，30 分钟会累计少报约 30 秒，手机端按分钟截断就只剩 29。引擎因此
+// 以「已上报 rt 总和」为停止条件（再加少量余量）多跑一小段补足；这里用
+// 虚拟时钟完整跑一遍 30 分钟计划，断言客户端实际收到的 rt 总和 ≥ 计划秒数，
+// 且本地记录仍是计划的 1800 秒（不会把补跑的时间算进统计）。
+func TestReportedReadTimeCoversPlan(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		st := testEngineStore(t)
+		id, err := st.CreateAccount(store.Account{Name: "plan", Mode: "custom", BookID: "book",
+			DefaultMinutes: 30, DailyGoalMinutes: 30, TickSeconds: 30},
+			map[string]string{"wr_skey": "key"}, map[string]any{"b": "book", "c": "chapter"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		addReadablePoolChapter(t, st, id, "book", "chapter")
+		acc, err := st.GetAccount(id)
+		if err != nil || acc == nil {
+			t.Fatalf("GetAccount: %v", err)
+		}
+
+		var reported atomic.Int64
+		client := weread.NewClient()
+		client.HTTP.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			headers := http.Header{}
+			body := `{"succ":1,"synckey":1}`
+			if r.URL.Path == "/web/login/renewal" {
+				headers.Set("Set-Cookie", "wr_skey=new")
+			} else {
+				var p map[string]any
+				_ = json.NewDecoder(r.Body).Decode(&p)
+				if rt, ok := p["rt"].(float64); ok {
+					reported.Add(int64(rt))
+				}
+			}
+			return &http.Response{StatusCode: 200, Header: headers,
+				Body: io.NopCloser(strings.NewReader(body))}, nil
+		})
+		e := New(st, client, nil, NewHub(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+		t.Cleanup(e.StopAll)
+		sub, ch := e.hub.Subscribe()
+		defer e.hub.Unsubscribe(sub)
+
+		run, err := e.Start(acc, 30, "manual")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for {
+			select {
+			case ev := <-ch:
+				if ev.Type == "run.end" {
+					goto done
+				}
+			case <-time.After(2 * time.Minute):
+				t.Fatal("30 分钟计划没有在虚拟时钟内结束")
+			}
+		}
+	done:
+		got, err := st.GetRun(run.ID)
+		if err != nil || got == nil {
+			t.Fatalf("GetRun: %v %v", got, err)
+		}
+		if got.Status != "success" || got.ElapsedSeconds != 1800 {
+			t.Fatalf("run = %+v, want success / 1800s", got)
+		}
+		if sum := reported.Load(); sum < int64(got.PlanSeconds) {
+			t.Fatalf("累计上报 rt = %d 秒 < 计划 %d 秒：微信端会显示不足时长", sum, got.PlanSeconds)
+		} else {
+			t.Logf("30 分钟计划累计上报 %d 秒（计划 %d，补偿余量 %d 秒）", sum, got.PlanSeconds, sum-int64(got.PlanSeconds))
 		}
 	})
 }

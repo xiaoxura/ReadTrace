@@ -113,7 +113,21 @@ type tickState struct {
 	covered  time.Duration
 	settleAt time.Time
 	cap      time.Duration
+
+	// credited 是已成功上报给微信读书的整数 rt 之和（秒）。服务端按每次
+	// 心跳的 rt 累加阅读时长，而 rt 向下取整到整秒：30 秒的心跳每拍少报
+	// 不足 1 秒，30 分钟累计约少 30 秒，微信端按分钟截断就只显示 29 分钟。
+	// 停止条件因此以「已上报总和」为准并留 readCreditMargin 余量，多跑
+	// 一小段把截断损耗补回来。
+	credited int
+	// topUpLogged 保证「本地已读满了、还在补微信端计时」只提示一次。
+	topUpLogged bool
 }
+
+// readCreditMargin 是补足计划时长时额外多上报的秒数，用来覆盖首个心跳
+// （只报准备时间、可能不被服务端计入）与整分钟截断的损耗，避免恰好
+// 30:00 被显示成 29:59。取值远小于一个心跳间隔，不会让显示多出一分钟。
+const readCreditMargin = 10
 
 // settleTick 把「上次结算点 → now」的真实墙钟差计入 tick 的累计阅读时长，
 // 并重新给出 int 精度的 elapsed。结算边界：
@@ -882,7 +896,11 @@ func (e *Engine) session(ar *activeRun, acc *store.Account, ck weread.Cookies,
 		e.logLine(ar, "warn", "登录状态刷新失败，继续使用现有 Cookie："+err.Error())
 	}
 
-	for tick.elapsed < ar.target {
+	// 停止条件同时看两条口径：
+	//   - elapsed（覆盖的墙钟）达到计划，保证页面与统计口径不超发；
+	//   - credited（已上报的 rt 总和）达到计划 + 余量，保证微信服务端
+	//     累计到的时长不会被逐拍取整吃掉（30 分钟只显示 29 分钟）。
+	for tick.elapsed < ar.target || tick.credited < ar.target+readCreditMargin {
 		if ar.ctx.Err() != nil {
 			finishS("stopped", "", false)
 			return
@@ -943,6 +961,11 @@ func (e *Engine) session(ar *activeRun, acc *store.Account, ck weread.Cookies,
 			}
 			ar.pageCurrent, ar.pagePending = ar.pagePending, nil
 			tick.success++
+			// 记录本次心跳实际报给服务端的整数 rt：停止条件要按「已上报
+			// 总和」补足计划，而不是只看本地墙钟（见 tickState.credited）。
+			if rt, ok := numeric(payload["rt"]); ok && rt > 0 {
+				tick.credited += rt
+			}
 			// 缺陷 04：按「上次结算点 → 本次成功心跳」的真实墙钟差计账，
 			// 不再预记尚未经历的完整间隔。请求从早先记录的 now 发出，
 			// requestDur 是本次成功请求自身消耗的时间。
@@ -959,6 +982,13 @@ func (e *Engine) session(ar *activeRun, acc *store.Account, ck weread.Cookies,
 			e.update(ar, tick.elapsed, tick.success, tick.failed, "running")
 			e.logLine(ar, "info", fmt.Sprintf("第 %d 次成功 · %s · 已读 %s / %s · synckey=%d",
 				tick.tickIndex, reading, humanMinutes(tick.elapsed), humanMinutes(ar.target), res.SyncKey))
+			// 本地墙钟已满、但上报总和还没补足时明确提示一次：否则页面会
+			// 在 100% 上停留一小段，看起来像卡住（默认 30 秒心跳约多跑一拍）。
+			if !tick.topUpLogged && tick.elapsed >= ar.target && tick.credited < ar.target+readCreditMargin {
+				tick.topUpLogged = true
+				e.logLine(ar, "info", fmt.Sprintf("本地已读已满 %s，继续补足微信端计时（已上报 %s / %s）",
+					humanMinutes(ar.target), humanMinutes(tick.credited), humanMinutes(ar.target)))
+			}
 			// 结算节奏（缺陷 04）：本步只补「interval − 本次成功请求耗时」，
 			// 让相邻两次结算之间实际经过的墙钟约等于一个 interval（而不是
 			// interval + 请求耗时），运行仍按墙钟长跑正常收敛。抖动交给
@@ -1145,8 +1175,15 @@ func (e *Engine) finalize(ar *activeRun, acc *store.Account, inStatus, errMsg st
 	}
 	e.hub.Publish(Event{Type: "run.end", RunID: ar.runID, AccountID: acc.ID, TS: time.Now().Unix(), Data: endData})
 
-	if status == "failed" && acc.PushChannelID > 0 && (errMsg != "登录已失效，请重新扫码登录" || ar.newExpiry) {
-		go e.notifyResult(acc, ar, status, errMsg, elapsed)
+	// 成功完成时按账号开关推送（默认开启）：定时任务跑完后用户需要一条
+	// 结果回执；失败/失效仍然必发，手动停止保持安静（status=stopped）。
+	if acc.PushChannelID > 0 {
+		switch {
+		case status == "failed" && (errMsg != "登录已失效，请重新扫码登录" || ar.newExpiry):
+			go e.notifyResult(acc, ar, status, errMsg, elapsed)
+		case status == "success" && acc.NotifyOnSuccess:
+			go e.notifyResult(acc, ar, status, errMsg, elapsed)
+		}
 	}
 }
 
@@ -1512,12 +1549,18 @@ func (e *Engine) applyPagePayload(ar *activeRun, p map[string]any, rnd *rand.Ran
 }
 
 func (e *Engine) notifyResult(acc *store.Account, ar *activeRun, status, errMsg string, elapsed int) {
+	if e.nt == nil {
+		return
+	}
 	ch, err := e.st.GetPushChannel(acc.PushChannelID)
 	if err != nil || ch == nil {
 		return
 	}
 	kind, title := notify.KindFailed, "微信读书 · 阅读失败"
-	if ar.newExpiry {
+	switch {
+	case status == "success":
+		kind, title = notify.KindSuccess, "微信读书 · 阅读完成"
+	case ar.newExpiry:
 		kind, title = notify.KindExpired, "微信读书 · 账号失效"
 	}
 	vars := map[string]string{

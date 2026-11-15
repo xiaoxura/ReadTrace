@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS accounts (
 	chapter_title    TEXT NOT NULL DEFAULT '',
 	mode             TEXT NOT NULL DEFAULT 'stable',
 	push_channel_id  INTEGER NOT NULL DEFAULT 0,
+	notify_on_success INTEGER NOT NULL DEFAULT 1,
 	created_at       INTEGER NOT NULL,
 	updated_at       INTEGER NOT NULL
 );
@@ -264,6 +265,10 @@ func migrate(db *sql.DB) error {
 	}
 	// 每分钟阅读字数：顺序书单的章节切换节奏按它折算。老库补列默认 300。
 	if _, err := addColumnIfMissing(tx, "accounts", "read_speed", `INTEGER NOT NULL DEFAULT 300`); err != nil {
+		return err
+	}
+	// 阅读完成推送：老库补列默认 1（开启），与「账号级开关、默认开启」一致。
+	if _, err := addColumnIfMissing(tx, "accounts", "notify_on_success", `INTEGER NOT NULL DEFAULT 1`); err != nil {
 		return err
 	}
 	// 稳定模板模式已移除：旧账号统一归入顺序书单。

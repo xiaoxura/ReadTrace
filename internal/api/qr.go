@@ -259,6 +259,7 @@ func (m *qrManager) bind(f *qrFlow, res *weread.LoginPoll) {
 		DailyGoalMinutes: 30,
 		TickSeconds:      30,
 		Mode:             "sequence",
+		NotifyOnSuccess:  true,
 		LastCheckAt:      time.Now().Unix(),
 	}, map[string]string(ck), nil)
 	if err != nil {

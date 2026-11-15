@@ -58,10 +58,10 @@ func TestCustomPageProgressCommitsOnlyAfterSuccess(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		// 缺陷 04：目标 60s、首个成功心跳计账≈0，之后每步覆盖 0.9~1.0 个
-		// interval，因此需要 2~3 次成功才达标（旧语义预记完整间隔，2 次即
-		// 定死达标）；加失败的第一页共 3~4 页请求。
-		if got.Status != "success" || len(pages) < 3 || len(pages) > 4 {
+		// 缺陷 04：目标 60s、首个成功心跳只上报准备时间（≈1 秒），之后每步
+		// 覆盖约一个 interval；再加上「已上报总和补足计划」的 10 秒余量与
+		// 30 秒心跳粒度，需要 3~4 次成功才达标。加失败的第一页共 4~5 页请求。
+		if got.Status != "success" || len(pages) < 3 || len(pages) > 5 {
 			t.Fatalf("run=%+v pages=%+v", got, pages)
 		}
 		// 失败的第一页与首次成功复用同一 page candidate；之后的每个成功

@@ -198,8 +198,8 @@ func (s *Server) handleAccountImport(w http.ResponseWriter, r *http.Request) {
 		Status: status, LastError: validateErrString(validateErr), LastCheckAt: time.Now().Unix(),
 		DefaultMinutes: 30, DailyGoalMinutes: 30, TickSeconds: 30, Mode: "sequence",
 		ReadSpeed: createReadSpeed,
-		// 新账号默认：阅读失败自动重试 5 次，间隔 30 秒。
-		MaxRetries: 5, RetryDelay: 30,
+		// 新账号默认：阅读失败自动重试 5 次，间隔 30 秒；阅读完成后也推送结果。
+		MaxRetries: 5, RetryDelay: 30, NotifyOnSuccess: true,
 	}, map[string]string(ck), payload)
 	if err != nil {
 		s.writeErr(w, http.StatusInternalServerError, "创建账号失败："+err.Error())
@@ -240,6 +240,7 @@ func (s *Server) handleAccountUpdate(w http.ResponseWriter, r *http.Request) {
 		ChapterTitle     *string `json:"chapter_title"`
 		Mode             *string `json:"mode"`
 		PushChannelID    *int64  `json:"push_channel_id"`
+		NotifyOnSuccess  *bool   `json:"notify_on_success"`
 	}
 	if !s.decode(w, r, &body) {
 		return
@@ -333,6 +334,9 @@ func (s *Server) handleAccountUpdate(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		acc.PushChannelID = *body.PushChannelID
+	}
+	if body.NotifyOnSuccess != nil {
+		acc.NotifyOnSuccess = *body.NotifyOnSuccess
 	}
 	if err := s.st.UpdateAccount(*acc); err != nil {
 		s.writeErr(w, http.StatusInternalServerError, "保存账号失败")
