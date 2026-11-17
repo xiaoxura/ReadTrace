@@ -2,7 +2,7 @@ import { api } from '../api.js';
 import { state, refreshAccounts } from '../state.js';
 import { icon } from '../icons.js';
 import { runDetailDrawer, startRunDialog } from '../components.js';
-import { renderError, skeletonHTML, runRowHTML, bindRunRows, bindStopButtons, bindRunStateRefresh } from '../helpers.js';
+import { renderError, skeletonHTML, tableSkeletonHTML, runRowHTML, bindRunRows, bindStopButtons, bindRunStateRefresh } from '../helpers.js';
 import { $, $$, escapeHtml, fmtMinutes, pageHeaderHTML, toast, setLoading } from '../util.js';
 
 // 服务端分页（缺陷 18）：每页 300 条由服务端按 offset 切出（GET /api/runs
@@ -19,7 +19,7 @@ export function nextAccountFilter(nextId, accounts) {
 
 export async function renderRuns(ctx) {
   const { root } = ctx;
-  root.innerHTML = skeletonHTML(['height:70px;width:45%', 'height:300px']);
+  root.innerHTML = tableSkeletonHTML({ titleWidth: 80, rows: 7 });
 
   if (!state.accounts.length) {
     try { await refreshAccounts(); } catch { /* ignore */ }

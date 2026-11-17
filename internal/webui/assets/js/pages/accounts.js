@@ -4,7 +4,7 @@ import { icon } from '../icons.js';
 import {
   qrLoginDialog, importAccountDialog, editAccountDialog, startRunDialog, runDetailDrawer, avatarHTML,
 } from '../components.js';
-import { renderError, skeletonHTML, bindStopButtons } from '../helpers.js';
+import { renderError, skeletonHTML, cardListSkeletonHTML, bindStopButtons } from '../helpers.js';
 import {
   $, $$, escapeHtml, relTime, statusBadge, toast, confirmDialog, fmtDuration, fmtMinutes, pageHeaderHTML,
 } from '../util.js';
@@ -17,7 +17,7 @@ let accQuery = '';
 
 export async function renderAccounts(ctx) {
   const { root } = ctx;
-  root.innerHTML = skeletonHTML(['height:44px;width:60%', 'height:200px']);
+  root.innerHTML = cardListSkeletonHTML({ titleWidth: 80, count: 4 });
 
   try {
     await refreshAccounts();

@@ -3,7 +3,7 @@ import { state, refreshAccounts, refreshSchedules } from '../state.js';
 import { icon } from '../icons.js';
 import { addScheduleDialog } from '../components.js';
 import {
-  renderError, skeletonHTML, bindCountdown, bindEnabledToggle,
+  renderError, skeletonHTML, tableSkeletonHTML, bindCountdown, bindEnabledToggle,
 } from '../helpers.js';
 import {
   $, $$, escapeHtml, humanCron, fmtClock, relativeSeconds, relTime, confirmDialog, toast,
@@ -12,7 +12,7 @@ import {
 
 export async function renderSchedules(ctx) {
   const { root } = ctx;
-  root.innerHTML = skeletonHTML(['height:70px;width:45%', 'height:260px']);
+  root.innerHTML = tableSkeletonHTML({ titleWidth: 90, rows: 4 });
 
   try {
     if (!state.accounts.length) await refreshAccounts();

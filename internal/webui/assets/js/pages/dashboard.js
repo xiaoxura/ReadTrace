@@ -6,7 +6,7 @@ import {
   startRunDialog, qrLoginDialog, importAccountDialog, runDetailDrawer, accountSelectHTML,
 } from '../components.js';
 import {
-  renderError, skeletonHTML, runRowHTML, bindRunRows, bindStopButtons, bindCountdown,
+  renderError, skeletonHTML, dashboardSkeletonHTML, runRowHTML, bindRunRows, bindStopButtons, bindCountdown,
 } from '../helpers.js';
 import {
   $, $$, escapeHtml, fmtMinutes, fmtTime, fmtDuration, humanCron,
@@ -22,7 +22,7 @@ const HERO_LIMIT = 3;
 
 export async function renderDashboard(ctx) {
   const { root } = ctx;
-  root.innerHTML = skeletonHTML(['height:64px;width:58%', 'height:170px', 'height:96px', 'height:240px']);
+  root.innerHTML = dashboardSkeletonHTML();
 
   const saved = Number(sessionStorage.getItem('wxread-dash-account') || 0);
   const accountId = state.accounts.some((a) => a.id === saved) ? saved : 0;
